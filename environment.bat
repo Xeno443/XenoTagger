@@ -1,7 +1,13 @@
 @echo off
 set "DIR=%~dp0system"
-ECHO Setting up portable environment using %DIR% ...
 set "PATH=%DIR%\git\bin;%DIR%\python;%DIR%\python\Scripts;%PATH%"
+
+set "GIT_BRANCH="
+for /f "delims=" %%b in ('git -C "%~dp0." rev-parse --abbrev-ref HEAD 2^>nul') do set "GIT_BRANCH=%%b"
+if not defined GIT_BRANCH set "GIT_BRANCH=unknown"
+
+ECHO Setting up portable environment using %DIR% (branch: %GIT_BRANCH%) ...
+title portable-env [%GIT_BRANCH%]
 
 if exist "%~dp0environment-local.bat" (
     call "%~dp0environment-local.bat"
