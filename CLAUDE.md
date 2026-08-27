@@ -1,7 +1,7 @@
 # portable-env
 
 A from-scratch, portable Python + Git toolchain for Windows, built as a common
-base that different tool-specific branches extend (e.g. an sd-webui branch,
+base that different tool-specific branches extend (e.g. a webui branch,
 a comfyui branch, etc.).
 
 ## Branch model
@@ -13,6 +13,38 @@ distribution model (git clone, manual archive download, ...). Those
 distribution-management scripts (branch switching, self-updating) are
 intentionally NOT part of the common base — they depend on how a given
 branch's tool is obtained, which varies per branch.
+
+## Worktrees
+
+Branches are worked on as separate `git worktree` checkouts, not by
+switching branches back and forth in one folder. Reason: `system\` is
+several gigabytes and gitignored (see Conventions below), and different
+branches can need conflicting installed packages (e.g. different PyTorch
+builds) — a plain branch switch wouldn't touch `system\` at all (it's
+untracked), so each branch needs its own independent copy on disk rather
+than sharing or rebuilding one every time you switch.
+
+Convention: sibling directories, never nested inside another worktree
+(nesting would put the linked worktree's `.git` file inside the parent's
+working tree, where git would see it as untracked embedded-repo clutter
+needing its own ignore rule). Named `portable-env-<branch>`:
+
+- `portable-env` — the main worktree (holds the real `.git`), branch `main`
+- `portable-env-webui` — linked worktree, branch `webui`
+
+Run `git worktree list` from any of them for the current, authoritative set
+— don't trust this list to stay up to date. To add another: `git worktree
+add -b <branch> ../portable-env-<branch> main` (new branch) or `git worktree
+add ../portable-env-<branch> <branch>` (branch already exists).
+
+Each worktree needs `setup-env.bat` run in it once to build its own
+`system\`. A coding-assistant session started in one worktree's folder is a
+separate session from one started in another's — they share git history but
+nothing else (not chat context, not `system\`, not gitignored files like
+this repo's old session-handoff notes). This file is the shared context
+between them: every worktree gets whatever version of it its branch last
+merged from `main`, so keep it current rather than relying on a session
+handoff that only the worktree it was written in will ever see.
 
 ## Common base
 
@@ -40,7 +72,7 @@ branch's tool is obtained, which varies per branch.
 ## Branch discipline
 
 This repo uses long-lived branches for different use cases (main = common
-base, sd-webui = SD WebUI variant, etc.). Each branch should only ADD files
+base, webui = SD WebUI variant, etc.). Each branch should only ADD files
 on top of main, never modify files that originated on main (setup-env.bat,
 environment.bat, CLAUDE.md, .gitignore).
 
