@@ -41,6 +41,25 @@ current image, then stop before the next one; single-image has no next
 item to gracefully stop before, so this click is intentionally a no-op
 buffer against a stray double-click); second click force-aborts.
 
+On the Single-image tab specifically, Caption and Interrupt each get
+their OWN gr.Column (single_run_col/single_interrupt_col) rather than
+sharing one - swapping which Column is visible, not the buttons inside
+them. This is a layout fix, not just the concurrency one above: Gradio
+gives every gr.Row() its own independent flex computation with no shared
+alignment across separate Rows (it's not a table), so the row above
+(image | caption box) and this button row only ever lined up because both
+happened to be simple two-Column shapes computing the same coincidental
+50/50 split. A CSS-based single-Column stack (Interrupt absolutely/grid
+positioned over Caption) was tried first and worked functionally, but the
+Column's own default padding/gap - which a bare Button in the original
+layout never had - broke that coincidental alignment, through several
+rounds of trying to CSS-patch it back. Two separate Columns, each either
+visible or not, sidesteps the whole problem: at any moment exactly two of
+the three Columns (Caption, Interrupt, Save caption) are visible, always
+that same plain "Row of two Columns" shape confirmed to align correctly -
+whichever two they happen to be. See ui_css.py's own note on the
+abandoned CSS approach for the full story.
+
 Because button state is normally only pushed by whichever specific
 browser connection's generator is actively running (run_single_ui /
 run_batch_ui's own yields), a reloaded page or a second browser tab would
@@ -245,35 +264,62 @@ def _operation_status_text() -> str:
         return op.label
 
 
+def _interrupt_label_state(op: Optional["_Operation"], kind: str) -> tuple[str, bool]:
+    """(label, interactive) for `kind`'s Interrupt button, given the
+    active operation (or None). Used by _operation_button_states, which
+    has to derive this fresh from scratch since it isn't the one that
+    just clicked Interrupt - interrupt_single_ui/interrupt_batch_ui don't
+    need this themselves, they already know which of the two states just
+    happened from _operation_interrupt_click's own return value."""
+    if op is None or op.kind != kind:
+        return "Interrupt", True
+    if op.abort_requested:
+        return "Interrupting...", False
+    if op.stop_requested:
+        return "Interrupt (click again to abort now)", True
+    return "Interrupt", True
+
+
 def _operation_button_states():
-    """Ground-truth Run/Interrupt button appearance for both tabs,
-    recomputed fresh from _active_operation every call - not just
-    whatever a single running generator last pushed. Wired into the
-    periodic status timer and page load below, so a reloaded page, a
-    second browser tab, or a missed/delayed update all self-correct
-    within one tick instead of showing stale button state indefinitely.
-    Returns (single_run, single_interrupt, batch_run, batch_interrupt).
+    """Ground-truth Run/Interrupt appearance for both tabs, recomputed
+    fresh from _active_operation every call - not just whatever a single
+    running generator last pushed. Wired into the periodic status timer
+    and page load below, so a reloaded page, a second browser tab, or a
+    missed/delayed update all self-correct within one tick instead of
+    showing stale state indefinitely.
+
+    Both tabs use column-visibility swapping (single_run_col <->
+    single_interrupt_col, batch_run_col <-> batch_interrupt_col - see the
+    Single-image tab and app.py's own module docstring for why: confirmed
+    live that a Row of two plain gr.Column()s aligns correctly with a
+    neighboring row with zero CSS, so toggling which two of N Columns are
+    visible reuses that proven shape instead of hand-tuned CSS. Batch's
+    row has no neighboring row to misalign against, but uses the same
+    pattern anyway for consistency).
+
+    Returns (single_run_btn, single_run_col, single_interrupt_col,
+    single_interrupt_btn, batch_run_btn, batch_run_col,
+    batch_interrupt_col, batch_interrupt_btn).
     """
     with _operation_lock:
         op = _active_operation
-        kinds_state = []
-        for kind in ("single", "batch"):
-            if op is None:
-                kinds_state.append((True, False, "Interrupt", True))  # run_ok, show_interrupt, label, interrupt_ok
-            elif op.kind != kind:
-                kinds_state.append((False, False, "Interrupt", True))
-            elif op.abort_requested:
-                kinds_state.append((False, True, "Interrupting...", False))
-            elif op.stop_requested:
-                kinds_state.append((False, True, "Interrupt (click again to abort now)", True))
-            else:
-                kinds_state.append((False, True, "Interrupt", True))
+        single_blocked = op is not None and op.kind != "single"
+        single_running = op is not None and op.kind == "single"
+        single_label, single_ok = _interrupt_label_state(op, "single")
+        batch_blocked = op is not None and op.kind != "batch"
+        batch_running = op is not None and op.kind == "batch"
+        batch_label, batch_ok = _interrupt_label_state(op, "batch")
 
-    updates = []
-    for run_interactive, show_interrupt, label, interrupt_interactive in kinds_state:
-        updates.append(gr.update(interactive=run_interactive))
-        updates.append(gr.update(visible=show_interrupt, value=label, variant="stop", interactive=interrupt_interactive))
-    return tuple(updates)
+    return (
+        gr.update(interactive=not single_blocked),
+        gr.update(visible=not single_running),
+        gr.update(visible=single_running),
+        gr.update(value=single_label, variant="stop", interactive=single_ok),
+        gr.update(interactive=not batch_blocked),
+        gr.update(visible=not batch_running),
+        gr.update(visible=batch_running),
+        gr.update(value=batch_label, variant="stop", interactive=batch_ok),
+    )
 
 
 def _operation_force_abort() -> None:
@@ -360,28 +406,29 @@ def restart_app_ui() -> None:
 
 # ---------------------------------------------------------------- Single tab
 
-# The Run/Caption button just disables while busy - it never needs a
-# second click to do anything, so it can't get stuck behind Gradio's
-# per-event concurrency limit. Interrupting is a SEPARATE button (see
-# interrupt_single_ui below) with its own fast, non-generator click
-# handler, so it's never "the busy component" and is always clickable
-# immediately - this is the same split Forge/A1111 use (modules/
-# ui_toprow.py: Generate, Interrupt, and Skip are three independent
-# gr.Button()s, not one button that changes what its own click does).
+# Interrupt is a SEPARATE component from single_run_btn on purpose - see
+# the Operation tracking section: an Interrupt sharing the same
+# button/event as the long-running call would sit queued behind it and
+# never actually reach the server while captioning is in flight. It gets
+# its own Column (single_interrupt_col) rather than sharing Caption's, so
+# swapping which one is visible reuses the plain-two-Column-Row shape
+# confirmed to align correctly with the row above - see the Single-image
+# tab and _operation_button_states' docstring for the full story.
 _RUN_IDLE = gr.update(interactive=True)
 _RUN_BUSY = gr.update(interactive=False)
-_INTERRUPT_HIDDEN = gr.update(visible=False, value="Interrupt", variant="stop", interactive=True)
-_INTERRUPT_SHOWN = gr.update(visible=True, value="Interrupt", variant="stop", interactive=True)
+_COL_SHOWN = gr.update(visible=True)
+_COL_HIDDEN = gr.update(visible=False)
+_INTERRUPT_RESET = gr.update(value="Interrupt", variant="stop", interactive=True)
 
 
 def run_single_ui(image_path, trigger_word_override: str):
     blocked = _operation_blocked_by()
     if blocked:
-        yield gr.update(), blocked, gr.update(), gr.update()
+        yield gr.update(), blocked, _RUN_BUSY, gr.update(), gr.update(), gr.update()
         return
 
     if not image_path:
-        yield "", "Please choose an image first.", gr.update(), gr.update()
+        yield "", "Please choose an image first.", gr.update(), gr.update(), gr.update(), gr.update()
         return
 
     _operation_start("single", "Single-image captioning")
@@ -390,20 +437,22 @@ def run_single_ui(image_path, trigger_word_override: str):
         cfg = current_cfg
         base_url = _display_base_url()
         already_up = is_healthy(base_url)
+        running_state = (_RUN_IDLE, _COL_HIDDEN, _COL_SHOWN, _INTERRUPT_RESET)
         if cfg.server_mode == "external":
-            yield "", ("Processing..." if already_up else "Connecting to external server..."), _RUN_BUSY, _INTERRUPT_SHOWN
+            yield "", ("Processing..." if already_up else "Connecting to external server..."), *running_state
         else:
-            yield "", ("Processing..." if already_up else "Starting server (loading model)..."), _RUN_BUSY, _INTERRUPT_SHOWN
+            yield "", ("Processing..." if already_up else "Starting server (loading model)..."), *running_state
 
+        idle_state = (_RUN_IDLE, _COL_SHOWN, _COL_HIDDEN, _INTERRUPT_RESET)
         try:
             client = get_client(cfg)
         except ServerError as exc:
             log.warning("Single-image caption: server error: %s", exc)
-            yield "", f"Server error: {exc}", _RUN_IDLE, _INTERRUPT_HIDDEN
+            yield "", f"Server error: {exc}", *idle_state
             return
 
         if not already_up:
-            yield "", "Processing...", gr.update(), gr.update()
+            yield "", "Processing...", gr.update(), gr.update(), gr.update(), gr.update()
 
         try:
             caption, result = caption_image(
@@ -411,7 +460,7 @@ def run_single_ui(image_path, trigger_word_override: str):
             )
         except ClientError as exc:
             log.warning("Single-image caption failed for %s: %s", image_path, exc)
-            yield "", f"Captioning failed: {exc}", _RUN_IDLE, _INTERRUPT_HIDDEN
+            yield "", f"Captioning failed: {exc}", *idle_state
             return
 
         speed = f", {result.tokens_per_second:.1f} tok/s" if result.tokens_per_second else ""
@@ -437,7 +486,7 @@ def run_single_ui(image_path, trigger_word_override: str):
             status = f"Finished in {result.elapsed_s:.1f}s ({result.completion_tokens} tokens{speed})"
         if result.resize_note:
             status = f"Resized {result.resize_note}. {status}"
-        yield caption, status, _RUN_IDLE, _INTERRUPT_HIDDEN
+        yield caption, status, *idle_state
     finally:
         _operation_end()
 
@@ -544,14 +593,14 @@ def _format_duration(seconds: float) -> str:
 def run_batch_ui(directory_str, recursive, overwrite, trigger_word_override):
     blocked = _operation_blocked_by()
     if blocked:
-        yield blocked, "", None, "", gr.update(), gr.update()
+        yield blocked, "", None, "", _RUN_BUSY, gr.update(), gr.update(), gr.update()
         return
 
     log.info("Batch requested: %s (recursive=%s, overwrite=%s)", directory_str, recursive, overwrite)
     directory = Path(directory_str) if directory_str else None
     if not directory or not directory.is_dir():
         log.warning("Batch: not a directory: %s", directory_str)
-        yield f"Not a directory: {directory_str}", "", None, "", gr.update(), gr.update()
+        yield f"Not a directory: {directory_str}", "", None, "", gr.update(), gr.update(), gr.update(), gr.update()
         return
 
     _operation_start("batch", "Batch captioning")
@@ -559,25 +608,27 @@ def run_batch_ui(directory_str, recursive, overwrite, trigger_word_override):
         cfg = current_cfg
         base_url = _display_base_url()
         already_up = is_healthy(base_url)
+        running_state = (_RUN_IDLE, _COL_HIDDEN, _COL_SHOWN, _INTERRUPT_RESET)
         if cfg.server_mode == "external":
-            yield ("Processing..." if already_up else "Connecting to external server..."), "", None, "", _RUN_BUSY, _INTERRUPT_SHOWN
+            yield ("Processing..." if already_up else "Connecting to external server..."), "", None, "", *running_state
         else:
-            yield ("Processing..." if already_up else "Starting server (loading model)..."), "", None, "", _RUN_BUSY, _INTERRUPT_SHOWN
+            yield ("Processing..." if already_up else "Starting server (loading model)..."), "", None, "", *running_state
 
+        idle_state = (_RUN_IDLE, _COL_SHOWN, _COL_HIDDEN, _INTERRUPT_RESET)
         try:
             client = get_client(cfg)
         except ServerError as exc:
             log.warning("Batch: server error: %s", exc)
-            yield f"Server error: {exc}", "", None, "", _RUN_IDLE, _INTERRUPT_HIDDEN
+            yield f"Server error: {exc}", "", None, "", *idle_state
             return
 
         if not already_up:
-            yield "Processing...", "", None, "", gr.update(), gr.update()
+            yield "Processing...", "", None, "", gr.update(), gr.update(), gr.update(), gr.update()
 
         images = find_images(directory, recursive=recursive)
         if not images:
             log.warning("Batch: no images found in %s", directory)
-            yield "No images found in that directory.", "", None, "", _RUN_IDLE, _INTERRUPT_HIDDEN
+            yield "No images found in that directory.", "", None, "", *idle_state
             return
 
         q: "queue.Queue" = queue.Queue()
@@ -638,11 +689,11 @@ def run_batch_ui(directory_str, recursive, overwrite, trigger_word_override):
                 last_caption = "(truncated - not saved, see .txt.issue)"
             else:
                 last_caption = "(failed - see .txt.issue)"
-            yield status_text, last_file, last_image, last_caption, gr.update(), gr.update()
+            yield status_text, last_file, last_image, last_caption, gr.update(), gr.update(), gr.update(), gr.update()
 
         thread.join()
         if "error" in result_holder:
-            yield f"Unexpected error: {result_holder['error']}", last_file, last_image, last_caption, _RUN_IDLE, _INTERRUPT_HIDDEN
+            yield f"Unexpected error: {result_holder['error']}", last_file, last_image, last_caption, *idle_state
         else:
             r = result_holder["result"]
             total_elapsed = time.monotonic() - start_time
@@ -652,7 +703,7 @@ def run_batch_ui(directory_str, recursive, overwrite, trigger_word_override):
                 f"{r.skipped} skipped, {r.failed} failed "
                 f"in {_format_duration(total_elapsed)}"
             )
-            yield summary, last_file, last_image, last_caption, _RUN_IDLE, _INTERRUPT_HIDDEN
+            yield summary, last_file, last_image, last_caption, *idle_state
     finally:
         _operation_end()
 
@@ -853,21 +904,36 @@ def build_app() -> gr.Blocks:
                     single_caption = gr.Textbox(
                         label="Caption", lines=20, interactive=True
                     )
+            # Confirmed live: a Row of exactly two plain gr.Column()s (no
+            # CSS at all) aligns correctly with Row A above. So instead of
+            # stacking Caption/Interrupt inside one shared Column (which
+            # needed CSS overrides that threw alignment off), each gets
+            # its OWN Column, and it's the whole COLUMN's visibility that
+            # toggles - not just the button inside it. At any moment
+            # exactly two of these three Columns are visible (Caption+Save
+            # idle, Interrupt+Save running) - always that same proven
+            # "Row of two plain Columns" shape, whichever two they are.
             with gr.Row():
-                single_run_btn = gr.Button("Caption", variant="primary")
-                # Separate from single_run_btn on purpose - see the
-                # Operation tracking section: an Interrupt that shares the
-                # same button/event as the long-running call would sit
+                with gr.Column() as single_run_col:
+                    single_run_btn = gr.Button("Caption", variant="primary")
+                # Separate component from single_run_btn on purpose - see
+                # the Operation tracking section: an Interrupt that shares
+                # the same button/event as the long-running call would sit
                 # queued behind it and never actually reach the server
                 # while captioning is in flight.
-                single_interrupt_btn = gr.Button("Interrupt", variant="stop", visible=False)
-                single_save_btn = gr.Button("Save caption", interactive=False)
+                with gr.Column(visible=False) as single_interrupt_col:
+                    single_interrupt_btn = gr.Button("Interrupt", variant="stop")
+                with gr.Column():
+                    single_save_btn = gr.Button("Save caption", interactive=False)
             single_status = gr.Textbox(show_label=False, container=False, interactive=False)
 
             single_run_btn.click(
                 run_single_ui,
                 [single_image, single_trigger],
-                [single_caption, single_status, single_run_btn, single_interrupt_btn],
+                [
+                    single_caption, single_status,
+                    single_run_btn, single_run_col, single_interrupt_col, single_interrupt_btn,
+                ],
             )
             single_interrupt_btn.click(interrupt_single_ui, [], [single_interrupt_btn])
             single_save_btn.click(
@@ -895,9 +961,16 @@ def build_app() -> gr.Blocks:
                         label="Overwrite existing captions", value=cfg.overwrite_existing
                     )
 
+            # Same two-Column swap as the Single-image tab (see that tab
+            # and app.py's own module docstring for why: a Row of two
+            # plain gr.Column()s is the only thing confirmed to align
+            # predictably, no CSS needed) - kept here for consistency even
+            # though this row has no third sibling to misalign against.
             with gr.Row():
-                batch_run_btn = gr.Button("Run batch", variant="primary")
-                batch_interrupt_btn = gr.Button("Interrupt", variant="stop", visible=False)
+                with gr.Column() as batch_run_col:
+                    batch_run_btn = gr.Button("Run batch", variant="primary")
+                with gr.Column(visible=False) as batch_interrupt_col:
+                    batch_interrupt_btn = gr.Button("Interrupt", variant="stop")
 
             with gr.Row():
                 batch_last_image = gr.Image(
@@ -914,7 +987,10 @@ def build_app() -> gr.Blocks:
             batch_run_btn.click(
                 run_batch_ui,
                 [batch_dir, batch_recursive, batch_overwrite, batch_trigger],
-                [batch_status, batch_last_file, batch_last_image, batch_last_caption, batch_run_btn, batch_interrupt_btn],
+                [
+                    batch_status, batch_last_file, batch_last_image, batch_last_caption,
+                    batch_run_btn, batch_run_col, batch_interrupt_col, batch_interrupt_btn,
+                ],
             )
             batch_interrupt_btn.click(interrupt_batch_ui, [], [batch_interrupt_btn])
 
@@ -1065,7 +1141,10 @@ def build_app() -> gr.Blocks:
         )
 
         status_bar = gr.Markdown(get_status_text(), elem_id="status-bar")
-        _run_interrupt_btns = [single_run_btn, single_interrupt_btn, batch_run_btn, batch_interrupt_btn]
+        _run_interrupt_btns = [
+            single_run_btn, single_run_col, single_interrupt_col, single_interrupt_btn,
+            batch_run_btn, batch_run_col, batch_interrupt_col, batch_interrupt_btn,
+        ]
         status_timer = gr.Timer(2.0)
         status_timer.tick(get_status_text, [], [status_bar])
         status_timer.tick(_operation_button_states, [], _run_interrupt_btns)

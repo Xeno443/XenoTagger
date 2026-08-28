@@ -25,4 +25,18 @@ STATUS_BAR_CSS = "#status-bar { text-align: center; }"
 # Went with a plain large `lines=` value on that Textbox instead, in
 # app.py - not perfect (fixed size rather than truly dynamic) but safe.
 
+# NOTE: a CSS-based Forge/A1111-style Generate<->Interrupt swap was tried
+# here and abandoned - stacking Caption and Interrupt in one Column via
+# `position: absolute` (then CSS Grid, once absolute positioning turned
+# out to collapse the Column's height) did make them swap in place with
+# no extra row, but the Column's own default padding/gap - which a bare
+# Button never had - kept throwing off alignment with the row above,
+# through several rounds of trying to compensate for it live. Solved
+# without any CSS instead: Caption and Interrupt now sit in two SEPARATE
+# Columns (see single_run_col/single_interrupt_col in app.py), and it's
+# each Column's own `visible` that toggles - confirmed live that a Row of
+# two plain gr.Column()s (no CSS at all) aligns correctly on its own, so
+# swapping which two of three Columns are shown reuses that proven shape
+# instead of fighting Gradio's layout with hand-tuned CSS.
+
 ALL_CSS = STATUS_BAR_CSS
