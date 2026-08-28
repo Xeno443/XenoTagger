@@ -25,6 +25,7 @@ class BatchResult:
     processed: int = 0
     skipped: int = 0
     failed: int = 0
+    aborted: bool = False
     errors: list[tuple[Path, str]] = field(default_factory=list)
 
 
@@ -43,7 +44,12 @@ def run_batch(
     overwrite: bool = False,
     trigger_word: Optional[str] = None,
     progress_cb: Optional[ProgressCallback] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
 ) -> BatchResult:
+    """should_stop, if given, is checked before each image - returning True
+    stops the batch after whatever image is currently in flight finishes
+    (never mid-request), leaving everything captioned so far in place.
+    """
     directory = Path(directory)
     images = find_images(directory, recursive=recursive)
     result = BatchResult()
@@ -54,6 +60,11 @@ def run_batch(
     )
 
     for i, image_path in enumerate(images, start=1):
+        if should_stop and should_stop():
+            result.aborted = True
+            log.info("Batch stopped by user after %d/%d images", i - 1, total)
+            break
+
         txt_path = image_path.with_suffix(".txt")
         if txt_path.exists() and not overwrite:
             result.skipped += 1
@@ -77,7 +88,8 @@ def run_batch(
                 progress_cb(i, total, image_path, "failed", None)
 
     log.info(
-        "Batch complete: %d captioned, %d skipped, %d failed",
+        "Batch %s: %d captioned, %d skipped, %d failed",
+        "aborted" if result.aborted else "complete",
         result.processed, result.skipped, result.failed,
     )
     return result

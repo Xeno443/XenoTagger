@@ -14,6 +14,8 @@ from collections import deque
 from dataclasses import asdict
 from pathlib import Path
 
+from PIL import Image as PILImage
+
 # Must be set before `import gradio` - some of its telemetry checks read
 # this at import time, not just when building a Blocks instance.
 os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
@@ -263,29 +265,50 @@ def _format_duration(seconds: float) -> str:
     return f"{hours}h {minutes}m"
 
 
+_batch_stop_event = threading.Event()
+
+
+def abort_batch_ui() -> str:
+    log.info("Batch abort requested by user")
+    _batch_stop_event.set()
+    return "Stopping after the current image finishes..."
+
+
 def run_batch_ui(directory_str, recursive, overwrite, trigger_word_override):
     log.info("Batch requested: %s (recursive=%s, overwrite=%s)", directory_str, recursive, overwrite)
     directory = Path(directory_str) if directory_str else None
     if not directory or not directory.is_dir():
         log.warning("Batch: not a directory: %s", directory_str)
-        yield f"Not a directory: {directory_str}", "", ""
+        yield f"Not a directory: {directory_str}", "", None, ""
         return
 
+    cfg = current_cfg
+    base_url = _display_base_url()
+    already_up = is_healthy(base_url)
+    if cfg.server_mode == "external":
+        yield "Processing..." if already_up else "Connecting to external server...", "", None, ""
+    else:
+        yield "Processing..." if already_up else "Starting server (loading model)...", "", None, ""
+
     try:
-        client = get_client(current_cfg)
+        client = get_client(cfg)
     except ServerError as exc:
         log.warning("Batch: server error: %s", exc)
-        yield f"Server error: {exc}", "", ""
+        yield f"Server error: {exc}", "", None, ""
         return
+
+    if not already_up:
+        yield "Processing...", "", None, ""
 
     images = find_images(directory, recursive=recursive)
     if not images:
         log.warning("Batch: no images found in %s", directory)
-        yield "No images found in that directory.", "", ""
+        yield "No images found in that directory.", "", None, ""
         return
 
     q: "queue.Queue" = queue.Queue()
     result_holder = {}
+    _batch_stop_event.clear()
 
     def progress_cb(i, total, path, status, caption):
         q.put((i, total, path, status, caption))
@@ -298,6 +321,7 @@ def run_batch_ui(directory_str, recursive, overwrite, trigger_word_override):
                 overwrite=overwrite,
                 trigger_word=trigger_word_override or None,
                 progress_cb=progress_cb,
+                should_stop=_batch_stop_event.is_set,
             )
         except Exception as exc:  # noqa: BLE001 - surface to UI, don't crash app
             result_holder["error"] = str(exc)
@@ -308,6 +332,7 @@ def run_batch_ui(directory_str, recursive, overwrite, trigger_word_override):
     thread.start()
 
     last_file = ""
+    last_image = None
     last_caption = ""
     while True:
         item = q.get()
@@ -321,25 +346,35 @@ def run_batch_ui(directory_str, recursive, overwrite, trigger_word_override):
         status_text = f"{i}/{total} processed · avg {avg:.1f}s/image · ETA {_format_duration(eta)}"
 
         last_file = path.name
+        try:
+            # Gradio refuses to serve a raw path outside its CWD/temp dir
+            # (InvalidPathError) - batch directories can be anywhere on
+            # disk, so hand it decoded image data instead of a path at all.
+            with PILImage.open(path) as img:
+                last_image = img.copy()
+        except OSError as exc:
+            log.warning("Could not load preview for %s: %s", path, exc)
+            last_image = None
         if status == "ok":
             last_caption = caption or ""
         elif status == "skipped":
             last_caption = "(skipped - caption already exists)"
         else:
             last_caption = "(failed - see console log)"
-        yield status_text, last_file, last_caption
+        yield status_text, last_file, last_image, last_caption
 
     thread.join()
     if "error" in result_holder:
-        yield f"Unexpected error: {result_holder['error']}", last_file, last_caption
+        yield f"Unexpected error: {result_holder['error']}", last_file, last_image, last_caption
     else:
         r = result_holder["result"]
         total_elapsed = time.monotonic() - start_time
+        verb = "Aborted" if r.aborted else "Done"
         summary = (
-            f"Done: {r.processed} captioned, {r.skipped} skipped, {r.failed} failed "
+            f"{verb}: {r.processed} captioned, {r.skipped} skipped, {r.failed} failed "
             f"in {_format_duration(total_elapsed)}"
         )
-        yield summary, last_file, last_caption
+        yield summary, last_file, last_image, last_caption
 
 
 # -------------------------------------------------------------- Settings tab
@@ -541,6 +576,7 @@ def build_app() -> gr.Blocks:
             with gr.Row():
                 batch_dir = gr.Textbox(label="Directory of images", scale=4)
                 batch_browse_btn = gr.Button("Browse...", scale=1)
+
             with gr.Row():
                 batch_trigger = gr.Textbox(
                     label="Trigger word (optional, overrides default)",
@@ -551,18 +587,26 @@ def build_app() -> gr.Blocks:
                     batch_overwrite = gr.Checkbox(
                         label="Overwrite existing captions", value=cfg.overwrite_existing
                     )
-            batch_run_btn = gr.Button("Run batch", variant="primary")
-            batch_status = gr.Textbox(label="Status", interactive=False)
+
             with gr.Row():
-                batch_last_file = gr.Textbox(label="Last file processed", interactive=False)
-                batch_last_caption = gr.Textbox(label="Last caption created", interactive=False)
+                batch_run_btn = gr.Button("Run batch", variant="primary")
+                batch_abort_btn = gr.Button("Abort")
+
+            with gr.Row():
+                batch_last_image = gr.Image(label="Preview", interactive=False, show_label=False)
+                with gr.Column():
+                    batch_last_file = gr.Textbox(label="Last file processed", interactive=False)
+                    batch_last_caption = gr.Textbox(label="Last caption created", interactive=False)
+
+            batch_status = gr.Textbox(show_label=False, container=False, interactive=False)
 
             batch_browse_btn.click(browse_directory_ui, [batch_dir], [batch_dir])
             batch_run_btn.click(
                 run_batch_ui,
                 [batch_dir, batch_recursive, batch_overwrite, batch_trigger],
-                [batch_status, batch_last_file, batch_last_caption],
+                [batch_status, batch_last_file, batch_last_image, batch_last_caption],
             )
+            batch_abort_btn.click(abort_batch_ui, [], [batch_status])
 
         with gr.Tab("Models"):
             gr.Markdown(
