@@ -1,4 +1,12 @@
-"""Headless, unattended batch captioning.
+"""Headless, unattended batch captioning - shares all its core logic
+(core/batch.py's run_batch, core/captioner.py) with the Gradio GUI; this
+file only adds argparse plumbing and console/file logging on top, nothing
+here duplicates what's in core/.
+
+Settings come from the same webui/config/settings.json the GUI reads and
+writes (core/config.py) - most flags below (--recursive, --overwrite,
+--model, --mmproj) are optional per-run overrides layered on top of
+whatever's already saved there, not a separate configuration.
 
 Example:
     system\\python\\python.exe webui\\cli.py --dir D:\\dataset\\images --recursive
@@ -114,11 +122,12 @@ def main(argv=None) -> int:
 
     from core.batch import run_batch
 
-    def on_progress(i, total, path, status, caption):
+    def on_progress(i, total, path, status, caption, resize_note):
+        suffix = f" (resized {resize_note})" if resize_note else ""
         if caption:
-            log.info("[%d/%d] %s: %s -> %s", i, total, status, path.name, caption)
+            log.info("[%d/%d] %s: %s -> %s%s", i, total, status, path.name, caption, suffix)
         else:
-            log.info("[%d/%d] %s: %s", i, total, status, path.name)
+            log.info("[%d/%d] %s: %s%s", i, total, status, path.name, suffix)
 
     try:
         result = run_batch(
@@ -135,8 +144,8 @@ def main(argv=None) -> int:
             managed.stop()
 
     log.info(
-        "Done: %d captioned, %d skipped, %d failed",
-        result.processed, result.skipped, result.failed,
+        "Done: %d captioned, %d truncated, %d skipped, %d failed",
+        result.processed, result.truncated, result.skipped, result.failed,
     )
     for path, err in result.errors:
         log.error("  %s: %s", path, err)

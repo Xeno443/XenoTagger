@@ -6,6 +6,23 @@ Two modes, chosen via AppConfig.server_mode:
     it again when we're done.
   - "external": never manage a process, always talk to external_url
     (which may point at another machine entirely).
+
+ManagedServer.stop()'s terminate()-then-kill() is not just cleanup - it's
+also the only reliable way anywhere in this app to interrupt a request
+that's already in flight. llama-server itself has open upstream bugs
+where it doesn't reliably notice an HTTP client disconnecting and keeps
+generating regardless, so closing our end of the connection alone can't
+be trusted to actually stop server-side work; killing the OS process is
+unconditional and doesn't depend on llama-server cooperating. See
+app.py's Operation-tracking section (_operation_interrupt_click,
+_operation_force_abort) for where this gets invoked as an abort
+mechanism, not just at shutdown.
+
+Only ever manages a process we ourselves started (resolve_server returns
+managed_server=None whenever the server was already running, in either
+mode) - this module will never kill something it didn't launch, on this
+machine or, in external mode, especially not one that may be running on
+a completely different machine.
 """
 
 from __future__ import annotations

@@ -7,6 +7,16 @@ models). So instead of requiring exactly one model file and one mmproj
 file per folder, each main-model quant becomes its own selectable
 ModelVariant, each mmproj file becomes its own selectable MmprojVariant,
 and callers explicitly pair one of each (see resolve_selection below).
+
+Classification is filename-only and cheap: any GGUF file whose name
+contains "mmproj" (case-insensitive) is a projector, anything matching
+IGNORED_SUBSTRINGS is a sidecar to skip, everything else is treated as a
+main model. The expensive part - actually opening a file and parsing its
+GGUF header for architecture/validity - is cached in CACHE_PATH, keyed by
+path/size/mtime, so a folder of multi-gigabyte quants doesn't get
+re-read on every scan_all() call (e.g. every Models-tab Refresh); only
+files that are new or have changed on disk since the last scan pay that
+cost again.
 """
 
 from __future__ import annotations
