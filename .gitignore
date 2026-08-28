@@ -2,3 +2,10 @@ _reference/
 system/
 setup-env-classic.bat
 handoff.md
+llama-cuda/
+webui/models/*
+!webui/models/.gitkeep
+webui/config/settings.json
+webui/config/models_cache.json
+webui/logs/
+__pycache__/
