@@ -93,7 +93,7 @@ import sys
 import threading
 import time
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Optional
 
@@ -106,11 +106,14 @@ os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
 import gradio as gr
 
 from core import config as config_mod
-from core.batch import find_images, run_batch
+from core.batch import ISSUE_SUFFIX, ReviewItem, find_images, run_batch, scan_review_status
 from core.captioner import caption_image
 from core.client import ClientError, LlamaClient
 from core.config import AppConfig
-from core.models import IGNORED_SUBSTRINGS, ModelVariant, MmprojVariant, resolve_selection, scan_all
+from core.models import (
+    IGNORED_SUBSTRINGS, MODELS_DIR, ModelGroup, format_size, group_models,
+    load_curated_models, merge_curated, resolve_selection, scan_all,
+)
 from core.server import LOG_PATH, ManagedServer, ServerError, get_loaded_model_name, is_healthy, resolve_server
 from ui_css import ALL_CSS
 
@@ -281,25 +284,42 @@ def _interrupt_label_state(op: Optional["_Operation"], kind: str) -> tuple[str, 
 
 
 def _operation_button_states():
-    """Ground-truth Run/Interrupt appearance for both tabs, recomputed
+    """Ground-truth Run/Interrupt appearance for all three tabs, recomputed
     fresh from _active_operation every call - not just whatever a single
     running generator last pushed. Wired into the periodic status timer
     and page load below, so a reloaded page, a second browser tab, or a
     missed/delayed update all self-correct within one tick instead of
     showing stale state indefinitely.
 
-    Both tabs use column-visibility swapping (single_run_col <->
-    single_interrupt_col, batch_run_col <-> batch_interrupt_col - see the
-    Single-image tab and app.py's own module docstring for why: confirmed
-    live that a Row of two plain gr.Column()s aligns correctly with a
-    neighboring row with zero CSS, so toggling which two of N Columns are
-    visible reuses that proven shape instead of hand-tuned CSS. Batch's
-    row has no neighboring row to misalign against, but uses the same
-    pattern anyway for consistency).
+    All three use column-visibility swapping (single_run_col <->
+    single_interrupt_col, etc. - see the Single-image tab and app.py's own
+    module docstring for why: confirmed live that a Row of two plain
+    gr.Column()s aligns correctly with a neighboring row with zero CSS, so
+    toggling which two of N Columns are visible reuses that proven shape
+    instead of hand-tuned CSS. Batch/Review's own rows have no neighboring
+    row to misalign against, but use the same pattern anyway for
+    consistency).
+
+    Review recaptioning is its own "review" operation kind, distinct from
+    "single" even though it calls the exact same caption_image() - if it
+    shared the "single" kind, the Single-image tab's own Interrupt would
+    light up whenever Review (not it) was the one running, which would be
+    backwards. A third kind gives it its own correct run/interrupt state
+    while still mutually excluding against the other two for free (the
+    existing "blocked if op.kind != kind" check needs no changes to cover
+    a third kind). Review's other nav (prev/next/table/dir/browse/scan)
+    goes a step further than a plain disabled Run button, though: it's
+    disabled whenever ANYTHING is active anywhere, not just when Review
+    itself is - simplest consistent rule, matching what the user asked
+    for (nothing on the tab should be interactable mid-recaption) without
+    special-casing "safe" vs "unsafe" interactions to allow selectively.
 
     Returns (single_run_btn, single_run_col, single_interrupt_col,
     single_interrupt_btn, batch_run_btn, batch_run_col,
-    batch_interrupt_col, batch_interrupt_btn).
+    batch_interrupt_col, batch_interrupt_btn, review_recaption_col,
+    review_interrupt_col, review_interrupt_btn, review_prev_btn,
+    review_next_btn, review_table, review_dir, review_browse_btn,
+    review_scan_btn).
     """
     with _operation_lock:
         op = _active_operation
@@ -309,6 +329,9 @@ def _operation_button_states():
         batch_blocked = op is not None and op.kind != "batch"
         batch_running = op is not None and op.kind == "batch"
         batch_label, batch_ok = _interrupt_label_state(op, "batch")
+        review_running = op is not None and op.kind == "review"
+        review_label, review_ok = _interrupt_label_state(op, "review")
+        review_nav = _REVIEW_NAV_IDLE if op is None else _REVIEW_NAV_BUSY
 
     return (
         gr.update(interactive=not single_blocked),
@@ -319,6 +342,10 @@ def _operation_button_states():
         gr.update(visible=not batch_running),
         gr.update(visible=batch_running),
         gr.update(value=batch_label, variant="stop", interactive=batch_ok),
+        gr.update(visible=not review_running),
+        gr.update(visible=review_running),
+        gr.update(value=review_label, variant="stop", interactive=review_ok),
+        *review_nav,
     )
 
 
@@ -671,24 +698,29 @@ def run_batch_ui(directory_str, recursive, overwrite, trigger_word_override):
             if resize_note:
                 status_text += f" · resized {resize_note}"
 
-            last_file = path.name
-            try:
-                # Gradio refuses to serve a raw path outside its CWD/temp dir
-                # (InvalidPathError) - batch directories can be anywhere on
-                # disk, so hand it decoded image data instead of a path at all.
-                with PILImage.open(path) as img:
-                    last_image = img.copy()
-            except OSError as exc:
-                log.warning("Could not load preview for %s: %s", path, exc)
-                last_image = None
-            if status == "ok":
-                last_caption = caption or ""
-            elif status == "skipped":
-                last_caption = "(skipped - caption already exists)"
-            elif status == "truncated":
-                last_caption = "(truncated - not saved, see .txt.issue)"
-            else:
-                last_caption = "(failed - see .txt.issue)"
+            # Skipped images were never sent to the model at all (already
+            # captioned) - nothing to preview, so leave the preview
+            # fields showing whatever the last actually-processed image
+            # was instead of decoding and flashing up an unrelated,
+            # untouched file.
+            if status != "skipped":
+                last_file = path.name
+                try:
+                    # Gradio refuses to serve a raw path outside its CWD/
+                    # temp dir (InvalidPathError) - batch directories can
+                    # be anywhere on disk, so hand it decoded image data
+                    # instead of a path at all.
+                    with PILImage.open(path) as img:
+                        last_image = img.copy()
+                except OSError as exc:
+                    log.warning("Could not load preview for %s: %s", path, exc)
+                    last_image = None
+                if status == "ok":
+                    last_caption = caption or ""
+                elif status == "truncated":
+                    last_caption = "(truncated - not saved, see .txt.issue)"
+                else:
+                    last_caption = "(failed - see .txt.issue)"
             yield status_text, last_file, last_image, last_caption, gr.update(), gr.update(), gr.update(), gr.update()
 
         thread.join()
@@ -715,42 +747,225 @@ def interrupt_batch_ui():
     return gr.update(value="Interrupt (click again to abort now)")
 
 
+# ---------------------------------------------------------------- Review tab
+#
+# Browse a directory's images and captions side by side, edit inline, and
+# re-run captioning on just the one currently shown - no automated bad-
+# caption detection (see status column instead), matching how TagGUI and
+# similar tools handle this: a human looks, a human decides.
+#
+# State lives in three gr.State components (Gradio has no server-side
+# per-session storage otherwise): review_items_state (list[ReviewItem],
+# the current directory's scan_review_status() snapshot),
+# review_index_state (int, which item is currently shown, -1 if none),
+# review_loaded_caption_state (str, exactly what was on disk when the
+# CURRENT item was loaded - compared against the live Textbox value to
+# detect a real edit before auto-saving on navigate-away).
+#
+# Recaption is its own "review" operation kind (not reusing "single",
+# even though it's literally the same caption_image() call the
+# Single-image tab makes) - see _operation_button_states' docstring for
+# why a third kind, rather than sharing "single", is actually necessary
+# here. It still mutually-excludes against Single-image/Batch the same
+# way they already exclude each other, for free (all three ultimately
+# share the one llama-server connection). It gets its own Run/Interrupt
+# Column pair (review_recaption_col/review_interrupt_col) built with the
+# exact same proven two-Column-swap pattern used elsewhere.
+
+
+def _review_status_table(items: list[ReviewItem]) -> list[list[str]]:
+    return [[item.path.name, item.status] for item in items]
+
+
+def _review_load(items: list[ReviewItem], index: int):
+    """Returns (image, caption_text, loaded_caption_text) for items[index],
+    or (None, "", "") if index is out of range. loaded_caption_text is
+    exactly what's on disk right now - the baseline later compared against
+    the live Textbox to detect an edit worth auto-saving."""
+    if not items or not (0 <= index < len(items)):
+        return None, "", ""
+    item = items[index]
+    try:
+        with PILImage.open(item.path) as img:
+            image = img.copy()
+    except OSError as exc:
+        log.warning("Review: could not load image %s: %s", item.path, exc)
+        image = None
+    txt_path = item.path.with_suffix(".txt")
+    try:
+        caption = txt_path.read_text(encoding="utf-8") if txt_path.exists() else ""
+    except OSError as exc:
+        log.warning("Review: could not read %s: %s", txt_path, exc)
+        caption = ""
+    return image, caption, caption
+
+
+def _review_maybe_save(items: list[ReviewItem], index: int, loaded_caption: str, current_caption: str) -> None:
+    """Auto-save on navigate-away. Only writes if the caption actually
+    changed AND isn't empty - clearing the box to blank never deletes an
+    existing caption, it just leaves the file untouched (agreed: deleting
+    a caption should be a deliberate act, not an accident from clearing
+    text to retype it - may want an explicit clear/delete action later)."""
+    if not items or not (0 <= index < len(items)):
+        return
+    current = current_caption or ""
+    if current.strip() == "" or current == loaded_caption:
+        return
+    item = items[index]
+    txt_path = item.path.with_suffix(".txt")
+    txt_path.write_text(current, encoding="utf-8")
+    Path(f"{txt_path}{ISSUE_SUFFIX}").unlink(missing_ok=True)
+    item.status = "captioned"
+    log.info("Review: saved caption for %s", item.path)
+
+
+def _review_position_text(items: list[ReviewItem], index: int, prefix: str = "") -> str:
+    if not items:
+        return "No images found."
+    if not (0 <= index < len(items)):
+        return f"{len(items)} image(s) found."
+    item = items[index]
+    return f"{prefix}{index + 1}/{len(items)} — {item.path.name} ({item.status})"
+
+
+def review_scan_ui(directory_str: str):
+    directory = Path(directory_str) if directory_str else None
+    if not directory or not directory.is_dir():
+        log.warning("Review: not a directory: %s", directory_str)
+        return f"Not a directory: {directory_str}", [], -1, "", None, "", _review_status_table([])
+
+    items = scan_review_status(directory)
+    log.info("Review: scanned %s - %d image(s)", directory, len(items))
+    if not items:
+        return f"No images found in {directory}", items, -1, "", None, "", _review_status_table(items)
+
+    image, caption, loaded = _review_load(items, 0)
+    return (
+        _review_position_text(items, 0),
+        items, 0, loaded,
+        image, caption,
+        _review_status_table(items),
+    )
+
+
+def review_prev_ui(items: list[ReviewItem], index: int, loaded_caption: str, current_caption: str):
+    _review_maybe_save(items, index, loaded_caption, current_caption)
+    new_index = max(0, index - 1) if items else -1
+    image, caption, loaded = _review_load(items, new_index)
+    return _review_position_text(items, new_index), items, new_index, loaded, image, caption, _review_status_table(items)
+
+
+def review_next_ui(items: list[ReviewItem], index: int, loaded_caption: str, current_caption: str):
+    _review_maybe_save(items, index, loaded_caption, current_caption)
+    new_index = min(len(items) - 1, index + 1) if items else -1
+    image, caption, loaded = _review_load(items, new_index)
+    return _review_position_text(items, new_index), items, new_index, loaded, image, caption, _review_status_table(items)
+
+
+def review_table_select_ui(
+    items: list[ReviewItem], index: int, loaded_caption: str, current_caption: str, evt: gr.SelectData
+):
+    _review_maybe_save(items, index, loaded_caption, current_caption)
+    row = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
+    image, caption, loaded = _review_load(items, row)
+    return _review_position_text(items, row), items, row, loaded, image, caption, _review_status_table(items)
+
+
+# Mirrors _RUN_IDLE/_RUN_BUSY from the Single-image tab - reused here
+# since Review's nav controls (prev/next/table/dir/browse/scan) need the
+# exact same "disabled while a 'single'-kind operation is running
+# anywhere" treatment as part of the requirement that recaptioning
+# disables the rest of this tab's navigation, not just morph its own
+# button. See _review_nav_state below and _operation_button_states.
+_REVIEW_NAV_BUSY = tuple(gr.update(interactive=False) for _ in range(6))
+_REVIEW_NAV_IDLE = tuple(gr.update(interactive=True) for _ in range(6))
+# 3 (recaption_col, interrupt_col, interrupt_btn) + 6 (_REVIEW_NAV_BUSY/IDLE
+# width) = 9 - must match running_state/idle_state's length below exactly,
+# so it's a named constant rather than a repeated magic number.
+_REVIEW_STATE_NOOP = tuple(gr.update() for _ in range(9))
+
+
+def review_recaption_ui(items: list[ReviewItem], index: int, current_caption: str):
+    if not items or not (0 <= index < len(items)):
+        yield gr.update(), "No image loaded.", *_REVIEW_STATE_NOOP
+        return
+
+    blocked = _operation_blocked_by()
+    if blocked:
+        yield gr.update(), blocked, *_REVIEW_STATE_NOOP
+        return
+
+    item = items[index]
+    _operation_start("review", "Review recaptioning")
+    try:
+        log.info("Review recaption requested: %s", item.path)
+        cfg = current_cfg
+        base_url = _display_base_url()
+        already_up = is_healthy(base_url)
+        running_state = (_COL_HIDDEN, _COL_SHOWN, _INTERRUPT_RESET, *_REVIEW_NAV_BUSY)
+        msg = "Processing..." if already_up else "Starting server (loading model)..."
+        yield current_caption, msg, *running_state
+
+        idle_state = (_COL_SHOWN, _COL_HIDDEN, _INTERRUPT_RESET, *_REVIEW_NAV_IDLE)
+        try:
+            client = get_client(cfg)
+        except ServerError as exc:
+            log.warning("Review recaption: server error: %s", exc)
+            yield current_caption, f"Server error: {exc}", *idle_state
+            return
+
+        if not already_up:
+            yield current_caption, "Processing...", *_REVIEW_STATE_NOOP
+
+        try:
+            caption, result = caption_image(item.path, client, cfg, trigger_word=None)
+        except ClientError as exc:
+            log.warning("Review recaption failed for %s: %s", item.path, exc)
+            yield current_caption, f"Recaptioning failed: {exc}", *idle_state
+            return
+
+        speed = f", {result.tokens_per_second:.1f} tok/s" if result.tokens_per_second else ""
+        note = f"CUT OFF at {result.completion_tokens} tokens{speed}" if result.truncated else f"{result.completion_tokens} tokens{speed}"
+        status = f"Recaptioned in {result.elapsed_s:.1f}s ({note}) — not saved yet, navigate away or edit to keep it"
+        if result.resize_note:
+            status = f"Resized {result.resize_note}. {status}"
+        # Deliberately NOT auto-saved here - populates the box like any
+        # manual edit would, so the usual navigate-away auto-save (and
+        # the "never save an emptied box" rule) applies uniformly whether
+        # the text came from typing or from a fresh model result.
+        yield caption, status, *idle_state
+    finally:
+        _operation_end()
+
+
+def interrupt_review_ui():
+    action = _operation_interrupt_click("review")
+    if action == "aborting":
+        return gr.update(value="Interrupting...", interactive=False)
+    return gr.update(value="Interrupt (click again to abort now)")
+
+
 # -------------------------------------------------------------- Settings tab
-
-def _model_choices(models: list[ModelVariant]) -> list[str]:
-    return [m.name for m in models]
-
-
-def _mmproj_choices(
-    model_name: str, models: list[ModelVariant], mmprojs: list[MmprojVariant]
-) -> list[str]:
-    """mmproj choices for the given model's folder, plus a leading '' (auto)."""
-    model = next((m for m in models if m.name == model_name), None)
-    if model is None:
-        return [""]
-    return [""] + [m.name for m in mmprojs if m.folder == model.folder]
-
-
-def on_model_change_ui(model_name: str):
-    models, mmprojs = scan_all()
-    return gr.update(choices=_mmproj_choices(model_name, models, mmprojs), value="")
-
 
 def save_settings_ui(
     server_mode, server_host, server_port, external_url,
-    model_name, mmproj_name, n_gpu_layers, context_size, extra_server_args,
+    n_gpu_layers, context_size, extra_server_args,
     resize_enabled, resize_target_mp, snap_enabled, snap_multiple,
     prompt_template, temperature, top_p, max_tokens, request_timeout,
     trigger_word, overwrite_existing, recursive_batch, debug_tab_enabled,
 ) -> str:
     global current_cfg
+    # model_name/mmproj_name are deliberately NOT settable from this form -
+    # they live entirely in the Models tab now (models_set_active_ui), so
+    # carry forward whatever's already configured rather than defaulting
+    # to empty just because this form has no field for them.
     current_cfg = AppConfig(
         server_mode=server_mode,
         server_host=server_host,
         server_port=int(server_port),
         external_url=external_url,
-        model_name=model_name or "",
-        mmproj_name=mmproj_name or "",
+        model_name=current_cfg.model_name,
+        mmproj_name=current_cfg.mmproj_name,
         n_gpu_layers=n_gpu_layers.strip() or "auto",
         context_size=int(context_size),
         extra_server_args=extra_server_args,
@@ -777,37 +992,189 @@ def save_settings_ui(
 
 
 # ---------------------------------------------------------------- Models tab
+#
+# One row per model DIRECTORY (core.models.group_models), not one row per
+# quant file - a folder's several quants and mmproj precisions become the
+# two dropdowns' choices for whichever row is currently selected, not
+# separate top-level rows each. Clicking a table row only loads that
+# group's options into the dropdowns for viewing/editing - it does NOT
+# immediately become the active model (switching models means a full
+# llama-server restart + multi-GB reload on the next request, too
+# expensive to trigger from a stray click); only the explicit "Set as
+# active model" button commits a choice, writing straight to
+# settings.json the same way Settings' Save button already does for
+# everything else.
 
-def _md_cell(text: str) -> str:
-    return text.replace("|", "\\|").replace("\n", " ")
+def _models_status_marker(cfg: AppConfig, group: ModelGroup) -> str:
+    if any(q.name == cfg.model_name for q in group.quants):
+        return "✓ active"
+    if group.quants:
+        return ""
+    if group.curated:
+        return "downloadable"
+    return ""
 
 
-def _md_table(headers: list[str], rows: list[list[str]]) -> str:
-    lines = [
-        "| " + " | ".join(headers) + " |",
-        "|" + "|".join(["---"] * len(headers)) + "|",
-    ]
-    lines.extend("| " + " | ".join(_md_cell(c) for c in row) + " |" for row in rows)
-    return "\n".join(lines)
+def _models_table_rows(groups: list[ModelGroup]) -> list[list[str]]:
+    cfg = current_cfg
+    return [[g.name, _models_status_marker(cfg, g)] for g in groups]
 
 
-def _models_table(models: list[ModelVariant]) -> str:
-    rows = [[m.name, "yes" if m.valid else "no", m.architecture or "", m.error or ""] for m in models]
-    return _md_table(["Model", "Valid", "Architecture", "Error"], rows)
+def _models_dropdown_updates(
+    group: Optional[ModelGroup], preferred_quant: Optional[str] = None, preferred_mmproj: Optional[str] = None
+):
+    """(quant_update, mmproj_update) for `group` - both show "N/A" and
+    stay disabled if group is None or has no quants at all (e.g. a folder
+    whose main model download hasn't finished, only its mmproj has);
+    mmproj alone shows "N/A" if the folder has quants but no usable
+    mmproj. Deliberately never uses an empty choices=[] with value=None
+    to mean "nothing selected" - a Dropdown whose value isn't reliably
+    cleared by value=None can be left showing a stale previous value
+    (e.g. "N/A" from a different row) against newly-empty choices, which
+    Gradio then rejects outright ("Value: X is not in the list of
+    choices: []"). Always giving both a real, matching single choice
+    instead sidesteps that regardless of the exact clearing behavior.
+
+    preferred_quant/preferred_mmproj select which of the group's choices
+    to actually show, if given and valid - falls back to the first choice
+    otherwise. Passing these matters: without it, every caller silently
+    means "show the alphabetically-first quant/mmproj", which is wrong
+    for both models_refresh_ui (should show whatever's ACTUALLY
+    configured, cfg.model_name/mmproj_name) and models_set_active_ui
+    (should show whatever was JUST committed) - either defaulting to
+    "first in the list" regardless would visually contradict its own
+    just-reported status text.
+
+    Choices are (label, value) pairs so a not-yet-downloaded curated
+    quant/mmproj can carry a "(download, 6.8 GB)" label while its VALUE
+    stays the same "<folder>/<stem>" shape a real local one would have -
+    that's what lets models_set_active_ui tell the two apart later just by
+    checking whether the value matches a real ModelVariant/MmprojVariant."""
+    if group is None:
+        na = gr.update(choices=["N/A"], value="N/A", interactive=False)
+        return na, na
+
+    quant_pairs = [(q.name, q.name) for q in group.quants]
+    local_quant_names = {q.name for q in group.quants}
+    if group.curated:
+        for cq in group.curated.quants:
+            value = f"{group.folder.name}/{cq.name}"
+            if value not in local_quant_names:
+                quant_pairs.append((f"{cq.name} (download, {format_size(cq.size_bytes)})", value))
+
+    mmproj_pairs = [(m.name, m.name) for m in group.mmprojs]
+    local_mmproj_names = {m.name for m in group.mmprojs}
+    if group.curated:
+        for cm in group.curated.mmprojs:
+            value = f"{group.folder.name}/{cm.name}"
+            if value not in local_mmproj_names:
+                mmproj_pairs.append((f"{cm.name} (download, {format_size(cm.size_bytes)})", value))
+
+    if not quant_pairs:
+        na = gr.update(choices=["N/A"], value="N/A", interactive=False)
+        return na, na
+    quant_values = [v for _, v in quant_pairs]
+    quant_value = preferred_quant if preferred_quant in quant_values else quant_values[0]
+    quant_update = gr.update(choices=quant_pairs, value=quant_value, interactive=True)
+
+    if not mmproj_pairs:
+        mmproj_update = gr.update(choices=["N/A"], value="N/A", interactive=False)
+    else:
+        mmproj_values = [v for _, v in mmproj_pairs]
+        mmproj_value = preferred_mmproj if preferred_mmproj in mmproj_values else mmproj_values[0]
+        mmproj_update = gr.update(choices=mmproj_pairs, value=mmproj_value, interactive=True)
+    return quant_update, mmproj_update
 
 
-def _mmprojs_table(mmprojs: list[MmprojVariant]) -> str:
-    rows = [[m.name, "yes" if m.valid else "no", m.error or ""] for m in mmprojs]
-    return _md_table(["mmproj", "Valid", "Error"], rows)
-
-
-def refresh_models_ui(current_model_name: str):
+def models_refresh_ui():
+    """Rescans webui/models/, rebuilds the grouped table, and re-selects
+    whichever group is currently the active model (if any) so a refresh
+    shows real state instead of resetting the dropdowns to nothing."""
     models, mmprojs = scan_all()
+    groups = merge_curated(group_models(models, mmprojs), load_curated_models())
+    table = _models_table_rows(groups)
+
+    cfg = current_cfg
+    active_group = next((g for g in groups if any(q.name == cfg.model_name for q in g.quants)), None)
+    quant_update, mmproj_update = _models_dropdown_updates(
+        active_group, preferred_quant=cfg.model_name, preferred_mmproj=cfg.mmproj_name
+    )
+    folder_key = str(active_group.folder) if active_group else None
+    status = f"{len(groups)} model folder(s) found." if groups else f"No models found under {MODELS_DIR}."
+
+    return table, groups, folder_key, quant_update, mmproj_update, status
+
+
+def models_table_select_ui(groups: list[ModelGroup], evt: gr.SelectData):
+    row = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
+    if not groups or not (0 <= row < len(groups)):
+        return None, gr.update(), gr.update(), gr.update()
+    group = groups[row]
+    quant_update, mmproj_update = _models_dropdown_updates(group)
+    if not group.quants:
+        if group.curated:
+            note = " — not downloaded yet; pick a quant below to see download info"
+        else:
+            note = " — no model file found (download incomplete?), can't be selected"
+    elif not group.mmprojs:
+        note = " — no mmproj found, can't be selected"
+    else:
+        note = ""
+    return str(group.folder), quant_update, mmproj_update, f"Viewing {group.name}{note}."
+
+
+def models_set_active_ui(groups: list[ModelGroup], quant_name: str, mmproj_name: str):
+    global current_cfg
+    noop_dropdowns = (gr.update(), gr.update())
+    if not quant_name or quant_name == "N/A":
+        return _models_table_rows(groups), *noop_dropdowns, "No model selected — click a row in the table first."
+
+    group = next((g for g in groups if any(q.name == quant_name for q in g.quants)), None)
+    if group is None:
+        # quant_name didn't match any LOCAL ModelVariant - it's a curated
+        # "(download, ...)" choice that isn't on disk yet (see
+        # _models_dropdown_updates: value shape is identical either way,
+        # so this is the only place that actually tells them apart).
+        shown = quant_name.rsplit("/", 1)[-1]
+        return _models_table_rows(groups), *noop_dropdowns, (
+            f"\"{shown}\" isn't downloaded yet - download support is coming soon, "
+            "pick an already-downloaded quant for now."
+        )
+
+    if mmproj_name == "N/A":
+        # "N/A" is the sentinel _models_dropdown_updates uses specifically
+        # for "this folder has no usable mmproj" - not a real empty/auto
+        # value, so it must never be written as if it meant that (would
+        # silently commit an unselectable model, only failing later at
+        # server-start time instead of refusing here where the reason is
+        # actually known).
+        return _models_table_rows(groups), *noop_dropdowns, "This model has no mmproj — can't be set as active."
+    if mmproj_name and not any(m.name == mmproj_name for m in group.mmprojs):
+        shown = mmproj_name.rsplit("/", 1)[-1]
+        return _models_table_rows(groups), *noop_dropdowns, (
+            f"\"{shown}\" isn't downloaded yet - download support is coming soon, "
+            "pick an already-downloaded mmproj for now."
+        )
+    mmproj_value = "" if mmproj_name is None else mmproj_name
+    current_cfg = replace(current_cfg, model_name=quant_name, mmproj_name=mmproj_value)
+    config_mod.save(current_cfg)
+    log.info("Models tab: set active model to %s (mmproj=%s)", quant_name, mmproj_value or "(auto)")
+    mmproj_note = f"mmproj: {mmproj_value}" if mmproj_value else "mmproj: auto-pick largest"
+
+    # Rebuild the dropdowns fresh from the group that was just committed,
+    # rather than leaving whatever was on screen before untouched - that
+    # stale-state gap (a disabled "N/A" mmproj dropdown surviving into a
+    # later action that assumes real choices) is what actually caused the
+    # "value N/A not in choices []" error. `group` is already the right
+    # one, found above.
+    quant_update, mmproj_update = _models_dropdown_updates(
+        group, preferred_quant=quant_name, preferred_mmproj=mmproj_name
+    )
     return (
-        _models_table(models),
-        _mmprojs_table(mmprojs),
-        gr.update(choices=_model_choices(models)),
-        gr.update(choices=_mmproj_choices(current_model_name, models, mmprojs)),
+        _models_table_rows(groups),
+        quant_update, mmproj_update,
+        f"Active model set to {quant_name} ({mmproj_note}). "
+        "Click \"Restart server connection\" below to actually load it.",
     )
 
 
@@ -885,10 +1252,9 @@ def clear_debug_ui() -> tuple[str, str]:
 
 def build_app() -> gr.Blocks:
     cfg = current_cfg
-    models, mmprojs = scan_all()
 
-    with gr.Blocks(title="NLPtagger", analytics_enabled=False) as demo:
-        gr.Markdown("# NLPtagger — LoRA dataset captioning")
+    with gr.Blocks(title="XenoTagger", analytics_enabled=False) as demo:
+        gr.Markdown("# XenoTagger — LoRA dataset captioning")
 
         with gr.Tab("Single image"):
             with gr.Row(equal_height=True):
@@ -994,20 +1360,121 @@ def build_app() -> gr.Blocks:
             )
             batch_interrupt_btn.click(interrupt_batch_ui, [], [batch_interrupt_btn])
 
+        with gr.Tab("Review"):
+            with gr.Row():
+                review_dir = gr.Textbox(label="Directory of images", scale=4)
+                with gr.Column(scale=1, min_width=120):
+                    review_browse_btn = gr.Button("Browse...")
+                    review_scan_btn = gr.Button("Scan")
+
+            with gr.Row(equal_height=True):
+                review_prev_btn = gr.Button("←", scale=1, min_width=60)
+                review_image = gr.Image(
+                    label="Image", interactive=False, show_label=False, buttons=[], scale=8, height=480,
+                )
+                review_next_btn = gr.Button("→", scale=1, min_width=60)
+
+            with gr.Row():
+                with gr.Column() as review_recaption_col:
+                    review_recaption_btn = gr.Button("Recaption")
+                # Separate component from review_recaption_btn on purpose,
+                # same reasoning as every other Interrupt in this app - see
+                # the Operation tracking section.
+                with gr.Column(visible=False) as review_interrupt_col:
+                    review_interrupt_btn = gr.Button("Interrupt", variant="stop")
+
+            review_caption = gr.Textbox(label="Caption", lines=4, interactive=True)
+
+            review_table = gr.Dataframe(
+                headers=["File", "Status"], datatype=["str", "str"],
+                interactive=False, row_count=(0, "dynamic"),
+            )
+
+            review_status = gr.Textbox(show_label=False, container=False, interactive=False)
+
+            # See the Review tab's handler-function docstrings above for
+            # what each of these three actually holds.
+            review_items_state = gr.State([])
+            review_index_state = gr.State(-1)
+            review_loaded_caption_state = gr.State("")
+
+            _review_nav_outputs = [
+                review_status, review_items_state, review_index_state, review_loaded_caption_state,
+                review_image, review_caption, review_table,
+            ]
+            review_browse_btn.click(browse_directory_ui, [review_dir], [review_dir])
+            review_scan_btn.click(review_scan_ui, [review_dir], _review_nav_outputs)
+            review_prev_btn.click(
+                review_prev_ui,
+                [review_items_state, review_index_state, review_loaded_caption_state, review_caption],
+                _review_nav_outputs,
+            )
+            review_next_btn.click(
+                review_next_ui,
+                [review_items_state, review_index_state, review_loaded_caption_state, review_caption],
+                _review_nav_outputs,
+            )
+            review_table.select(
+                review_table_select_ui,
+                [review_items_state, review_index_state, review_loaded_caption_state, review_caption],
+                _review_nav_outputs,
+            )
+            review_recaption_btn.click(
+                review_recaption_ui,
+                [review_items_state, review_index_state, review_caption],
+                [
+                    review_caption, review_status,
+                    review_recaption_col, review_interrupt_col, review_interrupt_btn,
+                    review_prev_btn, review_next_btn, review_table,
+                    review_dir, review_browse_btn, review_scan_btn,
+                ],
+            )
+            review_interrupt_btn.click(interrupt_review_ui, [], [review_interrupt_btn])
+
         with gr.Tab("Models"):
             gr.Markdown(
-                "Every `.gguf` under a `webui/models/<folder>/` is picked up: "
-                "files with \"mmproj\" in the name are projectors, everything "
-                "else is a selectable model quant (pick which mmproj pairs "
-                "with it in Settings). Files matching "
-                f"`{', '.join(IGNORED_SUBSTRINGS)}` "
-                "are ignored (e.g. speculative-decoding draft models)."
+                "Every `.gguf` under a `webui/models/<folder>/` is picked up, "
+                "grouped by folder: files with \"mmproj\" in the name are "
+                "projectors, everything else is a selectable quant. Files "
+                f"matching `{', '.join(IGNORED_SUBSTRINGS)}` are ignored "
+                "(e.g. speculative-decoding draft models). Dropdown choices "
+                "marked \"(download, ...)\" come from the curated list and "
+                "aren't on disk yet - download support is coming soon."
             )
-            gr.Markdown("**Models**")
-            models_table = gr.Markdown(_models_table(models))
-            gr.Markdown("**mmproj files**")
-            mmprojs_table = gr.Markdown(_mmprojs_table(mmprojs))
-            refresh_models_btn = gr.Button("Refresh")
+            models_table = gr.Dataframe(
+                headers=["Model", "Status"], datatype=["str", "str"],
+                interactive=False, row_count=(0, "dynamic"),
+            )
+            with gr.Row():
+                models_quant_dropdown = gr.Dropdown(label="Quant", interactive=False)
+                models_mmproj_dropdown = gr.Dropdown(label="mmproj", interactive=False)
+            with gr.Row():
+                models_set_active_btn = gr.Button("Set as active model", variant="primary")
+                restart_server_btn = gr.Button("Restart server connection")
+                refresh_models_btn = gr.Button("Refresh")
+            models_status = gr.Textbox(show_label=False, container=False, interactive=False)
+
+            # See this tab's own handler-function docstrings above for what
+            # each of these two actually holds.
+            models_groups_state = gr.State([])
+            models_selected_folder_state = gr.State(None)
+
+            _models_scan_outputs = [
+                models_table, models_groups_state, models_selected_folder_state,
+                models_quant_dropdown, models_mmproj_dropdown, models_status,
+            ]
+            refresh_models_btn.click(models_refresh_ui, [], _models_scan_outputs)
+            models_table.select(
+                models_table_select_ui,
+                [models_groups_state],
+                [models_selected_folder_state, models_quant_dropdown, models_mmproj_dropdown, models_status],
+            )
+            models_set_active_btn.click(
+                models_set_active_ui,
+                [models_groups_state, models_quant_dropdown, models_mmproj_dropdown],
+                [models_table, models_quant_dropdown, models_mmproj_dropdown, models_status],
+            )
+            restart_server_btn.click(restart_server_ui, [], [models_status])
 
         with gr.Tab("Settings"):
             with gr.Group():
@@ -1034,17 +1501,7 @@ def build_app() -> gr.Blocks:
                 external_url = gr.Textbox(
                     label="External server URL (external mode)", value=cfg.external_url
                 )
-                with gr.Row():
-                    model_name = gr.Dropdown(
-                        label="Model",
-                        choices=_model_choices(models),
-                        value=cfg.model_name or None,
-                    )
-                    mmproj_name = gr.Dropdown(
-                        label="mmproj (blank = auto-pick largest in model's folder)",
-                        choices=_mmproj_choices(cfg.model_name, models, mmprojs),
-                        value=cfg.mmproj_name or "",
-                    )
+                gr.Markdown("Model/mmproj selection now lives on the **Models** tab.")
                 with gr.Row():
                     n_gpu_layers = gr.Textbox(
                         label="GPU layers ('auto', 'all', or an exact number)",
@@ -1054,7 +1511,7 @@ def build_app() -> gr.Blocks:
                 extra_server_args = gr.Textbox(
                     label="Extra llama-server arguments", value=cfg.extra_server_args
                 )
-                restart_server_btn = gr.Button("Restart server connection")
+                gr.Markdown("\"Restart server connection\" now lives on the **Models** tab.")
 
             with gr.Group():
                 gr.Markdown("### Generation")
@@ -1111,15 +1568,13 @@ def build_app() -> gr.Blocks:
 
             settings_inputs = [
                 server_mode, server_host, server_port, external_url,
-                model_name, mmproj_name, n_gpu_layers, context_size, extra_server_args,
+                n_gpu_layers, context_size, extra_server_args,
                 resize_enabled, resize_target_mp, snap_enabled, snap_multiple,
                 prompt_template, temperature, top_p, max_tokens, request_timeout,
                 trigger_word, overwrite_existing, recursive_batch, debug_tab_enabled,
             ]
             save_settings_btn.click(save_settings_ui, settings_inputs, [settings_status])
-            restart_server_btn.click(restart_server_ui, [], [settings_status])
             restart_app_btn.click(restart_app_ui, [], [])
-            model_name.change(on_model_change_ui, [model_name], [mmproj_name])
 
         with gr.Tab("Debug", visible=cfg.debug_tab_enabled):
             gr.Markdown("**Python debug log**")
@@ -1135,15 +1590,13 @@ def build_app() -> gr.Blocks:
             debug_clear_btn = gr.Button("Clear")
             debug_clear_btn.click(clear_debug_ui, [], [debug_python_box, debug_llama_box])
 
-        refresh_models_btn.click(
-            refresh_models_ui, [model_name],
-            [models_table, mmprojs_table, model_name, mmproj_name],
-        )
-
         status_bar = gr.Markdown(get_status_text(), elem_id="status-bar")
         _run_interrupt_btns = [
             single_run_btn, single_run_col, single_interrupt_col, single_interrupt_btn,
             batch_run_btn, batch_run_col, batch_interrupt_col, batch_interrupt_btn,
+            review_recaption_col, review_interrupt_col, review_interrupt_btn,
+            review_prev_btn, review_next_btn, review_table,
+            review_dir, review_browse_btn, review_scan_btn,
         ]
         status_timer = gr.Timer(2.0)
         status_timer.tick(get_status_text, [], [status_bar])
@@ -1153,6 +1606,7 @@ def build_app() -> gr.Blocks:
             status_timer.tick(get_llama_debug_text, [], [debug_llama_box])
         demo.load(get_status_text, [], [status_bar])
         demo.load(_operation_button_states, [], _run_interrupt_btns)
+        demo.load(models_refresh_ui, [], _models_scan_outputs)
 
     return demo
 

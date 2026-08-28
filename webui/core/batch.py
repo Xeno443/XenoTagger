@@ -68,6 +68,34 @@ def find_images(directory: Path, recursive: bool = False) -> list[Path]:
     )
 
 
+@dataclass
+class ReviewItem:
+    path: Path
+    status: str  # "new" (no .txt, no .issue), "captioned" (.txt exists), "error" (.issue exists)
+
+
+def scan_review_status(directory: Path, recursive: bool = False) -> list[ReviewItem]:
+    """For the Review tab: classifies every image in `directory` by its
+    current on-disk state, using the exact same file-presence rules
+    run_batch() itself uses to decide skip/retry. A pure snapshot, same
+    statelessness as the rest of this module - there's nothing to go
+    stale, just call again after edits or another batch run to get a
+    fresh read."""
+    directory = Path(directory)
+    items = []
+    for image_path in find_images(directory, recursive=recursive):
+        txt_path = image_path.with_suffix(".txt")
+        issue_path = Path(f"{txt_path}{ISSUE_SUFFIX}")
+        if txt_path.exists():
+            status = "captioned"
+        elif issue_path.exists():
+            status = "error"
+        else:
+            status = "new"
+        items.append(ReviewItem(path=image_path, status=status))
+    return items
+
+
 def run_batch(
     directory: Path,
     client: LlamaClient,

@@ -17,6 +17,15 @@ path/size/mtime, so a folder of multi-gigabyte quants doesn't get
 re-read on every scan_all() call (e.g. every Models-tab Refresh); only
 files that are new or have changed on disk since the last scan pay that
 cost again.
+
+Separately, load_curated_models()/merge_curated() fold in
+config/models_source.json - a checked-in (not gitignored, unlike
+CACHE_PATH/settings.json) list of downloadable model families the Models
+tab can advertise even before anything's been downloaded. Merging happens
+at the individual quant/mmproj level within one ModelGroup per family, not
+by hiding a whole row once any one file of that family exists locally -
+otherwise downloading a single quant would make the rest of that family's
+curated quants disappear from the UI.
 """
 
 from __future__ import annotations
@@ -33,6 +42,7 @@ log = logging.getLogger(__name__)
 
 MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
 CACHE_PATH = Path(__file__).resolve().parent.parent / "config" / "models_cache.json"
+MODELS_SOURCE_PATH = Path(__file__).resolve().parent.parent / "config" / "models_source.json"
 
 GGUF_MAGIC = b"GGUF"
 
@@ -196,6 +206,128 @@ def scan_mmproj_variants() -> list[MmprojVariant]:
 
 def mmprojs_for_folder(folder: Path) -> list[MmprojVariant]:
     return [m for m in scan_mmproj_variants() if m.folder == folder]
+
+
+@dataclass
+class ModelGroup:
+    folder: Path
+    name: str  # folder.name - what the Models tab table shows as the row label
+    quants: list[ModelVariant]  # sorted; empty if the folder somehow has no usable model file
+    mmprojs: list[MmprojVariant]  # sorted; empty means this group can't actually be selected
+    curated: Optional["CuratedModel"] = None  # set by merge_curated() below, if a curated entry matches
+
+
+def group_models(models: list[ModelVariant], mmprojs: list[MmprojVariant]) -> list[ModelGroup]:
+    """Regroups scan_all()'s flat per-file lists into one entry per model
+    DIRECTORY, for the Models tab's grouped display - a directory's several
+    quants and mmproj precisions become dropdown choices on that one row,
+    not separate top-level rows each. A folder with quants but no usable
+    mmproj still gets a group rather than being silently dropped, so the
+    Models tab can show it exists and explain why it can't be selected."""
+    folders = sorted(
+        {m.folder for m in models} | {m.folder for m in mmprojs},
+        key=lambda f: f.name.lower(),
+    )
+    return [
+        ModelGroup(
+            folder=folder,
+            name=folder.name,
+            quants=sorted((m for m in models if m.folder == folder), key=lambda m: m.name),
+            mmprojs=sorted((m for m in mmprojs if m.folder == folder), key=lambda m: m.name),
+        )
+        for folder in folders
+    ]
+
+
+@dataclass
+class CuratedQuant:
+    name: str  # bare file stem, e.g. "gemma-4-12b-it-Q4_K_M" - no folder prefix
+    url: str
+    size_bytes: int
+
+
+@dataclass
+class CuratedMmproj:
+    name: str
+    url: str
+    size_bytes: int
+
+
+@dataclass
+class CuratedModel:
+    folder_name: str  # matched against a local ModelGroup's folder.name
+    name: str  # human-readable, for display only
+    description: str
+    source_org: str
+    source_url: str
+    quants: list[CuratedQuant]
+    mmprojs: list[CuratedMmproj]
+
+
+def load_curated_models() -> list[CuratedModel]:
+    """Reads config/models_source.json - checked into git (unlike this
+    module's other two config/*.json files), since it's a shared curated
+    list rather than per-install state. Missing or malformed data degrades
+    to "no curated entries" rather than breaking the Models tab, since this
+    is optional decoration over the real local scan, not load-bearing."""
+    try:
+        raw = json.loads(MODELS_SOURCE_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    except (OSError, json.JSONDecodeError) as exc:
+        log.warning("Could not read %s: %s", MODELS_SOURCE_PATH, exc)
+        return []
+
+    curated: list[CuratedModel] = []
+    for entry in raw.get("models", []):
+        try:
+            curated.append(
+                CuratedModel(
+                    folder_name=entry["folder_name"],
+                    name=entry["name"],
+                    description=entry.get("description", ""),
+                    source_org=entry.get("source_org", ""),
+                    source_url=entry.get("source_url", ""),
+                    quants=[CuratedQuant(**q) for q in entry.get("quants", [])],
+                    mmprojs=[CuratedMmproj(**m) for m in entry.get("mmprojs", [])],
+                )
+            )
+        except (KeyError, TypeError) as exc:
+            log.warning("Skipping malformed entry in %s: %s", MODELS_SOURCE_PATH, exc)
+    return curated
+
+
+def merge_curated(groups: list[ModelGroup], curated: list[CuratedModel]) -> list[ModelGroup]:
+    """Folds curated entries into `groups` by matching folder_name against
+    ModelGroup.folder.name, in place on whichever group already exists -
+    this is what keeps a curated family's remaining quants visible after
+    just one of them gets downloaded (see this module's own docstring). A
+    curated entry with no local folder yet gets a brand-new all-curated
+    group appended (empty quants/mmprojs, so nothing about it is
+    selectable until something's actually downloaded)."""
+    by_folder = {g.folder.name: g for g in groups}
+    result = list(groups)
+    for c in curated:
+        existing = by_folder.get(c.folder_name)
+        if existing is not None:
+            existing.curated = c
+        else:
+            new_group = ModelGroup(
+                folder=MODELS_DIR / c.folder_name, name=c.folder_name,
+                quants=[], mmprojs=[], curated=c,
+            )
+            result.append(new_group)
+            by_folder[c.folder_name] = new_group
+    return sorted(result, key=lambda g: g.name.lower())
+
+
+def format_size(num_bytes: int) -> str:
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024.0:
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024.0
+    return f"{size:.1f} TB"
 
 
 def resolve_selection(cfg: AppConfig) -> tuple[Optional[Path], Optional[Path], Optional[str]]:
