@@ -48,6 +48,25 @@ DEFAULT_PROMPT = (
     "pose, clothing, setting, lighting and style. Do not use markdown."
 )
 
+# Shown as the Markdown note at the top of the Models tab (app.py). Not an
+# AppConfig field - it's not per-user/persisted state, just UI copy kept
+# here so it can be edited without hunting through app.py's Gradio layout
+# code. {ignored_substrings} is filled in at render time from
+# core.models.IGNORED_SUBSTRINGS, so that part always reflects the real,
+# current ignore-list rather than going stale if it's ever changed.
+MODELS_TAB_INTRO = (
+    "Every `.gguf` under a `webui/models/<folder>/` is picked up, "
+    "grouped by folder: files with \"mmproj\" in the name are "
+    "projectors, everything else is a selectable quant. Files "
+    "matching `{ignored_substrings}` are ignored "
+    "(e.g. speculative-decoding draft models). Dropdown choices "
+    "marked \"(download, ...)\" come from the curated list and "
+    "aren't on disk yet - picking one changes the button below to "
+    "\"Download\", which queues it in the background; \"Abort all "
+    "downloads\" stops whatever's in flight and clears the rest of "
+    "the queue."
+)
+
 
 @dataclass
 class AppConfig:

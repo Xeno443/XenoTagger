@@ -41,6 +41,201 @@
           "size_bytes": 175115840
         }
       ]
+    },
+    {
+      "folder_name": "mradermacher-MeroMero-v2-31B-GGUF",
+      "name": "G4 MeroMero v2 31B (mradermacher)",
+      "description": "mradermacher's GGUF quantizations of G4-MeroMero-v2-31B. This folder already has a local Q4_K_M quant and mmproj-Q8_0 downloaded, so this entry doubles as a test of the partial-local-plus-curated merge case, not just the fully-curated one.",
+      "source_org": "mradermacher",
+      "source_url": "https://huggingface.co/mradermacher/G4-MeroMero-v2-31B-GGUF",
+      "quants": [
+        {
+          "name": "G4-MeroMero-v2-31B.Q3_K_M",
+          "url": "https://huggingface.co/mradermacher/G4-MeroMero-v2-31B-GGUF/resolve/main/G4-MeroMero-v2-31B.Q3_K_M.gguf",
+          "size_bytes": 15287108480
+        },
+        {
+          "name": "G4-MeroMero-v2-31B.Q4_K_M",
+          "url": "https://huggingface.co/mradermacher/G4-MeroMero-v2-31B-GGUF/resolve/main/G4-MeroMero-v2-31B.Q4_K_M.gguf",
+          "size_bytes": 18687062912
+        },
+        {
+          "name": "G4-MeroMero-v2-31B.Q5_K_M",
+          "url": "https://huggingface.co/mradermacher/G4-MeroMero-v2-31B-GGUF/resolve/main/G4-MeroMero-v2-31B.Q5_K_M.gguf",
+          "size_bytes": 21845570432
+        },
+        {
+          "name": "G4-MeroMero-v2-31B.Q6_K",
+          "url": "https://huggingface.co/mradermacher/G4-MeroMero-v2-31B-GGUF/resolve/main/G4-MeroMero-v2-31B.Q6_K.gguf",
+          "size_bytes": 25201484672
+        }
+      ],
+      "mmprojs": [
+        {
+          "name": "G4-MeroMero-v2-31B.mmproj-Q8_0",
+          "url": "https://huggingface.co/mradermacher/G4-MeroMero-v2-31B-GGUF/resolve/main/G4-MeroMero-v2-31B.mmproj-Q8_0.gguf",
+          "size_bytes": 809541696
+        },
+        {
+          "name": "G4-MeroMero-v2-31B.mmproj-f16",
+          "url": "https://huggingface.co/mradermacher/G4-MeroMero-v2-31B-GGUF/resolve/main/G4-MeroMero-v2-31B.mmproj-f16.gguf",
+          "size_bytes": 1198956864
+        }
+      ]
+    },
+    {
+      "folder_name": "unsloth-gemma-4-31B-it-GGUF",
+      "name": "Gemma 4 31B Instruct (unsloth)",
+      "description": "Unsloth's GGUF quantizations of Google's Gemma 4 31B instruction-tuned vision model, including their own 'UD' dynamic quants. This folder already has a local UD-Q4_K_XL quant and mmproj-BF16 downloaded.",
+      "source_org": "unsloth",
+      "source_url": "https://huggingface.co/unsloth/gemma-4-31B-it-GGUF",
+      "quants": [
+        {
+          "name": "gemma-4-31B-it-UD-Q3_K_XL",
+          "url": "https://huggingface.co/unsloth/gemma-4-31B-it-GGUF/resolve/main/gemma-4-31B-it-UD-Q3_K_XL.gguf",
+          "size_bytes": 15380222912
+        },
+        {
+          "name": "gemma-4-31B-it-UD-Q4_K_XL",
+          "url": "https://huggingface.co/unsloth/gemma-4-31B-it-GGUF/resolve/main/gemma-4-31B-it-UD-Q4_K_XL.gguf",
+          "size_bytes": 18822970304
+        },
+        {
+          "name": "gemma-4-31B-it-UD-Q5_K_XL",
+          "url": "https://huggingface.co/unsloth/gemma-4-31B-it-GGUF/resolve/main/gemma-4-31B-it-UD-Q5_K_XL.gguf",
+          "size_bytes": 21890429888
+        },
+        {
+          "name": "gemma-4-31B-it-UD-Q6_K_XL",
+          "url": "https://huggingface.co/unsloth/gemma-4-31B-it-GGUF/resolve/main/gemma-4-31B-it-UD-Q6_K_XL.gguf",
+          "size_bytes": 27521338304
+        }
+      ],
+      "mmprojs": [
+        {
+          "name": "mmproj-BF16",
+          "url": "https://huggingface.co/unsloth/gemma-4-31B-it-GGUF/resolve/main/mmproj-BF16.gguf",
+          "size_bytes": 1200726496
+        },
+        {
+          "name": "mmproj-F16",
+          "url": "https://huggingface.co/unsloth/gemma-4-31B-it-GGUF/resolve/main/mmproj-F16.gguf",
+          "size_bytes": 1198957024
+        }
+      ]
+    },
+    {
+      "folder_name": "Huihui-Qwen3-VL-8B-Instruct-abliterated",
+      "name": "Huihui Qwen3-VL 8B Instruct abliterated (mradermacher)",
+      "description": "mradermacher's GGUF quantizations of huihui-ai's abliterated Qwen3-VL 8B. Same file naming/sizes as this folder's existing local Q8_0 quant and mmproj-Q8_0, so this is very likely the same original source already partially downloaded here.",
+      "source_org": "mradermacher",
+      "source_url": "https://huggingface.co/mradermacher/Huihui-Qwen3-VL-8B-Instruct-abliterated-GGUF",
+      "quants": [
+        {
+          "name": "Huihui-Qwen3-VL-8B-Instruct-abliterated.Q4_K_M",
+          "url": "https://huggingface.co/mradermacher/Huihui-Qwen3-VL-8B-Instruct-abliterated-GGUF/resolve/main/Huihui-Qwen3-VL-8B-Instruct-abliterated.Q4_K_M.gguf",
+          "size_bytes": 5027785728
+        },
+        {
+          "name": "Huihui-Qwen3-VL-8B-Instruct-abliterated.Q5_K_M",
+          "url": "https://huggingface.co/mradermacher/Huihui-Qwen3-VL-8B-Instruct-abliterated-GGUF/resolve/main/Huihui-Qwen3-VL-8B-Instruct-abliterated.Q5_K_M.gguf",
+          "size_bytes": 5851114496
+        },
+        {
+          "name": "Huihui-Qwen3-VL-8B-Instruct-abliterated.Q6_K",
+          "url": "https://huggingface.co/mradermacher/Huihui-Qwen3-VL-8B-Instruct-abliterated-GGUF/resolve/main/Huihui-Qwen3-VL-8B-Instruct-abliterated.Q6_K.gguf",
+          "size_bytes": 6725901312
+        },
+        {
+          "name": "Huihui-Qwen3-VL-8B-Instruct-abliterated.Q8_0",
+          "url": "https://huggingface.co/mradermacher/Huihui-Qwen3-VL-8B-Instruct-abliterated-GGUF/resolve/main/Huihui-Qwen3-VL-8B-Instruct-abliterated.Q8_0.gguf",
+          "size_bytes": 8709520384
+        }
+      ],
+      "mmprojs": [
+        {
+          "name": "Huihui-Qwen3-VL-8B-Instruct-abliterated.mmproj-Q8_0",
+          "url": "https://huggingface.co/mradermacher/Huihui-Qwen3-VL-8B-Instruct-abliterated-GGUF/resolve/main/Huihui-Qwen3-VL-8B-Instruct-abliterated.mmproj-Q8_0.gguf",
+          "size_bytes": 752290176
+        },
+        {
+          "name": "Huihui-Qwen3-VL-8B-Instruct-abliterated.mmproj-f16",
+          "url": "https://huggingface.co/mradermacher/Huihui-Qwen3-VL-8B-Instruct-abliterated-GGUF/resolve/main/Huihui-Qwen3-VL-8B-Instruct-abliterated.mmproj-f16.gguf",
+          "size_bytes": 1159030272
+        }
+      ]
+    },
+    {
+      "folder_name": "Huihui-Qwen3.8-27B-abliterated-GGUF",
+      "name": "Huihui Qwen3.8 27B abliterated (huihui-ai)",
+      "description": "huihui-ai's own GGUF quantizations of their abliterated Qwen3.8 27B - the verified-reliable source (see model_notes: huihui-ai's own abliterations are trustworthy, other uploaders' abliterated re-uploads of the same base model may not be). Same UD dynamic-quant tiers as the gemma-4-31B entry.",
+      "source_org": "huihui-ai",
+      "source_url": "https://huggingface.co/huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF",
+      "quants": [
+        {
+          "name": "Huihui-Qwen3.8-27B-abliterated-UD-Q3_K_XL",
+          "url": "https://huggingface.co/huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF/resolve/main/Huihui-Qwen3.8-27B-abliterated-UD-Q3_K_XL.gguf",
+          "size_bytes": 13326125984
+        },
+        {
+          "name": "Huihui-Qwen3.8-27B-abliterated-UD-Q4_K_XL",
+          "url": "https://huggingface.co/huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF/resolve/main/Huihui-Qwen3.8-27B-abliterated-UD-Q4_K_XL.gguf",
+          "size_bytes": 17378626464
+        },
+        {
+          "name": "Huihui-Qwen3.8-27B-abliterated-UD-Q5_K_XL",
+          "url": "https://huggingface.co/huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF/resolve/main/Huihui-Qwen3.8-27B-abliterated-UD-Q5_K_XL.gguf",
+          "size_bytes": 20673612704
+        },
+        {
+          "name": "Huihui-Qwen3.8-27B-abliterated-UD-Q6_K_XL",
+          "url": "https://huggingface.co/huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF/resolve/main/Huihui-Qwen3.8-27B-abliterated-UD-Q6_K_XL.gguf",
+          "size_bytes": 24826588064
+        }
+      ],
+      "mmprojs": [
+        {
+          "name": "mmproj-model-bf16",
+          "url": "https://huggingface.co/huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF/resolve/main/mmproj-model-bf16.gguf",
+          "size_bytes": 931145888
+        }
+      ]
+    },
+    {
+      "folder_name": "Huihui-Qwen3.6-27B-abliterated-GGUF",
+      "name": "Huihui Qwen3.6 27B abliterated, dense (huihui-ai)",
+      "description": "huihui-ai's own GGUF quantizations of their abliterated Qwen3.6 27B dense model - built on the Qwen3.5 early-fusion vision-language foundation. Recommended over the 35B-A3B MoE sibling for caption quality (accuracy on correlated visual details matters more here than raw throughput). No UD dynamic quants for this repo, only plain K-quants.",
+      "source_org": "huihui-ai",
+      "source_url": "https://huggingface.co/huihui-ai/Huihui-Qwen3.6-27B-abliterated-MTP-GGUF",
+      "quants": [
+        {
+          "name": "Huihui-Qwen3.6-27B-abliterated-ggml-model-Q3_K",
+          "url": "https://huggingface.co/huihui-ai/Huihui-Qwen3.6-27B-abliterated-MTP-GGUF/resolve/main/Huihui-Qwen3.6-27B-abliterated-ggml-model-Q3_K.gguf",
+          "size_bytes": 13500735808
+        },
+        {
+          "name": "Huihui-Qwen3.6-27B-abliterated-ggml-model-Q4_K",
+          "url": "https://huggingface.co/huihui-ai/Huihui-Qwen3.6-27B-abliterated-MTP-GGUF/resolve/main/Huihui-Qwen3.6-27B-abliterated-ggml-model-Q4_K.gguf",
+          "size_bytes": 16810713408
+        },
+        {
+          "name": "Huihui-Qwen3.6-27B-abliterated-ggml-model-Q5_K",
+          "url": "https://huggingface.co/huihui-ai/Huihui-Qwen3.6-27B-abliterated-MTP-GGUF/resolve/main/Huihui-Qwen3.6-27B-abliterated-ggml-model-Q5_K.gguf",
+          "size_bytes": 19535700288
+        },
+        {
+          "name": "Huihui-Qwen3.6-27B-abliterated-ggml-model-Q6_K",
+          "url": "https://huggingface.co/huihui-ai/Huihui-Qwen3.6-27B-abliterated-MTP-GGUF/resolve/main/Huihui-Qwen3.6-27B-abliterated-ggml-model-Q6_K.gguf",
+          "size_bytes": 22430998848
+        }
+      ],
+      "mmprojs": [
+        {
+          "name": "mmproj-model-f16",
+          "url": "https://huggingface.co/huihui-ai/Huihui-Qwen3.6-27B-abliterated-MTP-GGUF/resolve/main/mmproj-model-f16.gguf",
+          "size_bytes": 927607136
+        }
+      ]
     }
   ]
 }

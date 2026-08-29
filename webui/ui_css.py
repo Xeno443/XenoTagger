@@ -18,6 +18,17 @@ ruled out and why, when there's genuinely no other way.
 # confirmation this is the standard way Gradio apps do this, not a hack.
 STATUS_BAR_CSS = "#status-bar { text-align: center; }"
 
+# NOTE: centering the Models tab's "A" (active-model star) column was
+# tried and reverted - `#models-table td:first-child { text-align:
+# center; }`. gr.Dataframe has no per-column alignment prop (checked its
+# constructor signature), so CSS looked like the only option, but its
+# rendered DOM turned out to be a div-based virtualized grid, not a real
+# <table>/<td> - grepped the compiled component bundle directly and
+# confirmed zero <td>/<tbody> tags anywhere in it, so the selector was
+# never matching anything. Finding the real hook would need live browser
+# devtools (not available here), same class of limitation as the
+# Interrupt-button saga below - not worth chasing further for this.
+
 # NOTE: a "make the caption box fill remaining space next to the image"
 # rule was attempted here and reverted - it actively broke the Single-image
 # tab's layout (no browser devtools access in this environment to verify

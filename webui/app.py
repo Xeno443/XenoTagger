@@ -110,6 +110,7 @@ from core.batch import ISSUE_SUFFIX, ReviewItem, find_images, run_batch, scan_re
 from core.captioner import caption_image
 from core.client import ClientError, LlamaClient
 from core.config import AppConfig
+from core.downloads import DownloadItem, download_one
 from core.models import (
     IGNORED_SUBSTRINGS, MODELS_DIR, ModelGroup, format_size, group_models,
     load_curated_models, merge_curated, resolve_selection, scan_all,
@@ -137,8 +138,14 @@ _session_lock = threading.RLock()
 
 # Debug tab: captures log output from our own Python code (core.* modules
 # all log via the standard `logging` module, but nothing was ever attached
-# to see it before this) into a bounded in-memory buffer.
+# to see it before this) into a bounded in-memory buffer, AND a plain text
+# file - the buffer is what the Debug tab's textbox polls, the file is for
+# anything that can't/didn't have the tab open when something happened
+# (including, deliberately, a coding assistant working on this repo, which
+# has no way to peek into this process's own live memory - unlike the
+# textbox, a file is something that can just be read after the fact).
 _PY_LOG_BUFFER: deque[str] = deque(maxlen=2000)
+PY_LOG_PATH = Path(__file__).resolve().parent / "logs" / "app.log"
 
 
 class _BufferLogHandler(logging.Handler):
@@ -146,10 +153,34 @@ class _BufferLogHandler(logging.Handler):
         _PY_LOG_BUFFER.append(self.format(record))
 
 
-if current_cfg.debug_tab_enabled:
-    _log_handler = _BufferLogHandler()
-    _log_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
-    logging.getLogger().addHandler(_log_handler)
+def _setup_debug_logging() -> None:
+    """Attaches the buffer + file handlers below, if debug_tab_enabled -
+    called once from main(), deliberately NOT at module import time. This
+    module gets imported directly by ad-hoc test scripts too (this
+    project's normal testing approach this session, e.g. `import app`
+    from a scratch script to exercise a handler function without a live
+    server) - attaching a mode="w" FileHandler at import time meant every
+    such import truncated PY_LOG_PATH out from under whatever the
+    actually-running app process had already written to it. Scoping
+    this to the real entrypoint keeps a plain `import app` side-effect-
+    free on disk."""
+    if not current_cfg.debug_tab_enabled:
+        return
+    log_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+    buffer_handler = _BufferLogHandler()
+    buffer_handler.setFormatter(log_formatter)
+    logging.getLogger().addHandler(buffer_handler)
+
+    # Truncated fresh on every app start, matching core.server's own
+    # LOG_PATH (llama-server.log) convention - this is meant as a live
+    # window into the CURRENT run, not an accumulating history across
+    # restarts (which, this session, happen often during iteration).
+    PY_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    file_handler = logging.FileHandler(PY_LOG_PATH, mode="w", encoding="utf-8")
+    file_handler.setFormatter(log_formatter)
+    logging.getLogger().addHandler(file_handler)
+
     # Deliberately NOT touching the root logger's level. Elevating only our
     # own namespaces to DEBUG (rather than the root, which every library's
     # logger inherits from when it has no level of its own) means Gradio's
@@ -307,19 +338,30 @@ def _operation_button_states():
     backwards. A third kind gives it its own correct run/interrupt state
     while still mutually excluding against the other two for free (the
     existing "blocked if op.kind != kind" check needs no changes to cover
-    a third kind). Review's other nav (prev/next/table/dir/browse/scan)
-    goes a step further than a plain disabled Run button, though: it's
-    disabled whenever ANYTHING is active anywhere, not just when Review
-    itself is - simplest consistent rule, matching what the user asked
-    for (nothing on the tab should be interactable mid-recaption) without
-    special-casing "safe" vs "unsafe" interactions to allow selectively.
+    a third kind).
+
+    review_recaption_btn's own interactive state follows the same
+    "blocked by something else" pattern single_run_btn/batch_run_btn
+    already use - recaptioning genuinely can't run concurrently with
+    Single/Batch (all three share the one llama-server connection), so
+    it needs to be visibly disabled the same way, not just refuse with a
+    message after being clicked.
+
+    Review's OTHER nav (prev/next/table/dir/browse/scan), though, is
+    pure filesystem/UI - scanning or browsing a folder doesn't touch the
+    llama-server at all, so there's no real conflict with a Single/Batch
+    job running elsewhere. It's disabled only while REVIEW ITSELF is
+    recaptioning (op.kind == "review"), not whenever anything anywhere
+    is active - browsing a different, already-tagged folder while a
+    Batch job elsewhere is still running is a normal, useful thing to
+    want to do.
 
     Returns (single_run_btn, single_run_col, single_interrupt_col,
     single_interrupt_btn, batch_run_btn, batch_run_col,
-    batch_interrupt_col, batch_interrupt_btn, review_recaption_col,
-    review_interrupt_col, review_interrupt_btn, review_prev_btn,
-    review_next_btn, review_table, review_dir, review_browse_btn,
-    review_scan_btn).
+    batch_interrupt_col, batch_interrupt_btn, review_recaption_btn,
+    review_recaption_col, review_interrupt_col, review_interrupt_btn,
+    review_prev_btn, review_next_btn, review_table, review_dir,
+    review_browse_btn, review_scan_btn).
     """
     with _operation_lock:
         op = _active_operation
@@ -329,9 +371,10 @@ def _operation_button_states():
         batch_blocked = op is not None and op.kind != "batch"
         batch_running = op is not None and op.kind == "batch"
         batch_label, batch_ok = _interrupt_label_state(op, "batch")
+        review_blocked = op is not None and op.kind != "review"
         review_running = op is not None and op.kind == "review"
         review_label, review_ok = _interrupt_label_state(op, "review")
-        review_nav = _REVIEW_NAV_IDLE if op is None else _REVIEW_NAV_BUSY
+        review_nav = _REVIEW_NAV_BUSY if review_running else _REVIEW_NAV_IDLE
 
     return (
         gr.update(interactive=not single_blocked),
@@ -342,6 +385,7 @@ def _operation_button_states():
         gr.update(visible=not batch_running),
         gr.update(visible=batch_running),
         gr.update(value=batch_label, variant="stop", interactive=batch_ok),
+        gr.update(interactive=not review_blocked),
         gr.update(visible=not review_running),
         gr.update(visible=review_running),
         gr.update(value=review_label, variant="stop", interactive=review_ok),
@@ -422,11 +466,14 @@ def restart_app_ui() -> None:
     Python self-restart trick, so newly-saved settings.json values (or a
     just-toggled Debug tab) take effect without anyone needing a terminal.
     Never returns: the process image is gone the moment execv succeeds, so
-    stop our own managed llama-server first (execv skips atexit entirely).
+    stop our own managed llama-server first (execv skips atexit entirely),
+    and abort any in-flight/queued downloads too - the queue is in-memory
+    only and won't survive this regardless, better to say so cleanly.
     """
     log.info("User triggered app restart from Settings")
     _operation_force_abort()
     _wait_for_operation_to_end()
+    _download_abort_all()
     _stop_managed()
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
@@ -991,6 +1038,195 @@ def save_settings_ui(
     return "Settings saved. Use \"Restart server connection\" if you changed the model or server settings, or restart the app if you changed the Debug tab setting."
 
 
+# ----------------------------------------------------------- Download queue
+#
+# Separate from _active_operation/_operation_lock above on purpose -
+# downloading a curated model shouldn't block captioning with whatever's
+# already loaded, or vice versa, so this gets its own lock and its own
+# single background worker thread rather than reusing that mutex. Not
+# persisted across a restart (in-memory only, by design - nothing here
+# needs to survive the app process ending); restart_app_ui() below calls
+# _download_abort_all() before its os.execv for the same reason
+# _operation_force_abort() gets called there - don't leave a background
+# thread/state hanging into (or racing) the fresh process.
+#
+# The actual transfer (core/downloads.py's download_one) is a plain
+# streaming HTTP GET with no resumability - "Abort all" (or an app
+# restart) simply discards whatever was in flight, and a later re-queue
+# starts over from byte zero.
+
+_download_lock = threading.RLock()
+_download_queue: list[DownloadItem] = []
+_download_current: Optional[DownloadItem] = None
+_download_current_bytes = 0  # bytes written so far for _download_current - see download_one's on_progress
+_download_started_at: Optional[float] = None  # time.monotonic() when _download_current began, for average speed
+_download_abort_requested = False
+_download_worker_thread: Optional[threading.Thread] = None
+_download_needs_refresh = False  # set True whenever a download actually completes - see _download_triggered_refresh_ui
+
+
+def _download_worker() -> None:
+    global _download_current, _download_current_bytes, _download_started_at, _download_needs_refresh
+    while True:
+        with _download_lock:
+            if _download_abort_requested or not _download_queue:
+                _download_current = None
+                return
+            _download_current = _download_queue.pop(0)
+            _download_current_bytes = 0
+            _download_started_at = time.monotonic()
+
+        def on_progress(written: int) -> None:
+            global _download_current_bytes
+            with _download_lock:
+                _download_current_bytes = written
+
+        completed = False
+        try:
+            completed = download_one(_download_current, lambda: _download_abort_requested, on_progress)
+        except Exception:
+            log.exception("Download failed: %s", _download_current.label)
+        with _download_lock:
+            _download_current = None
+            if completed:
+                # Picked up by _download_triggered_refresh_ui on the next
+                # status_timer tick (within ~2s) even if nobody's actively
+                # watching the Models tab or clicking anything right now -
+                # a completed download shouldn't need a manual Refresh
+                # click to actually show up as usable.
+                _download_needs_refresh = True
+            if _download_abort_requested:
+                return
+
+
+def _download_enqueue(items: list[DownloadItem]) -> list[DownloadItem]:
+    """Adds `items` to the queue, skipping any whose dest_path is already
+    queued or currently downloading (e.g. a stray double-click), and
+    (re)starts the worker thread if it isn't already running. Returns
+    only the items actually added, so the caller can report exactly what
+    changed."""
+    global _download_worker_thread, _download_abort_requested
+    added: list[DownloadItem] = []
+    with _download_lock:
+        existing_paths = {i.dest_path for i in _download_queue}
+        if _download_current is not None:
+            existing_paths.add(_download_current.dest_path)
+        for item in items:
+            if item.dest_path not in existing_paths:
+                _download_queue.append(item)
+                existing_paths.add(item.dest_path)
+                added.append(item)
+        if added:
+            _download_abort_requested = False
+            if _download_worker_thread is None or not _download_worker_thread.is_alive():
+                _download_worker_thread = threading.Thread(target=_download_worker, daemon=True)
+                _download_worker_thread.start()
+    return added
+
+
+def _download_abort_all() -> None:
+    global _download_abort_requested
+    with _download_lock:
+        _download_abort_requested = True
+        _download_queue.clear()
+
+
+def _download_status_html() -> Optional[str]:
+    """None means idle - nothing downloading, nothing queued - which the
+    UI uses to hide the download-status row entirely rather than show an
+    empty one. A plain HTML5 <progress> element rather than any hand-
+    rolled div/CSS bar - it needs zero styling of our own to look right
+    and already follows the browser's own light/dark handling, which
+    matters given this project's habit of avoiding custom CSS without a
+    real reason (and the Interrupt-button saga's lesson that CSS here
+    can't actually be visually verified before the user tries it)."""
+    with _download_lock:
+        if _download_current is None and not _download_queue:
+            return None
+
+        html = ""
+        if _download_current is not None:
+            item = _download_current
+            done = _download_current_bytes
+            total = max(item.size_bytes, 1)  # avoid a div-by-zero for a malformed curated size_bytes
+            pct = min(100, int(done * 100 / total))
+            elapsed = max(time.monotonic() - (_download_started_at or time.monotonic()), 0.001)
+            speed = done / elapsed
+            html += (
+                f"<progress value=\"{done}\" max=\"{total}\" style=\"width:100%;\"></progress>"
+                f"<div>{item.label}: {pct}% "
+                f"({format_size(done)} / {format_size(item.size_bytes)}) - {format_size(speed)}/s</div>"
+            )
+        more = len(_download_queue)
+        if more:
+            html += f"<div>{more} more queued</div>"
+        return html
+
+
+def _download_status_ui():
+    """(row_visibility_update, html_update) - wired to the same 2s
+    status_timer as everything else, plus called directly after any
+    action that changes the queue so the row responds immediately
+    instead of waiting for the next tick."""
+    html = _download_status_html()
+    if html is None:
+        return gr.update(visible=False), gr.update(value="")
+    return gr.update(visible=True), gr.update(value=html)
+
+
+# Mirrors models_refresh_ui()'s 7-value return shape (Models tab section
+# below) - the "nothing changed, don't touch anything" return for
+# _download_triggered_refresh_ui when no download has completed since the
+# last tick, so a full models_refresh_ui() re-scan only actually runs
+# when something on disk might really have changed.
+_MODELS_REFRESH_NOOP = tuple(gr.update() for _ in range(7))
+
+
+def _download_triggered_refresh_ui(selected_folder: Optional[str] = None):
+    """Wired to the same 2s status_timer as the download-status row -
+    auto-refreshes the Models tab the moment a queued download actually
+    finishes, so a newly-downloaded quant/mmproj becomes selectable
+    without a manual Refresh click. Matters when several items are
+    queued: the user can set the first one that finishes active while
+    the rest keep downloading in the background, instead of waiting for
+    the whole queue. Cheap when nothing changed - just a lock + flag
+    check, not a re-scan.
+
+    selected_folder (models_selected_folder_state) is passed straight
+    through to models_refresh_ui so this auto-triggered refresh doesn't
+    yank the view back to whatever's currently ACTIVE (or to nothing, if
+    nothing is) - it's specifically an auto-refresh firing on its own
+    schedule, possibly while the user is mid-download-queueing on a
+    model that isn't active yet, so preserving whatever row they're
+    actually looking at matters more here than for a manual Refresh
+    click."""
+    global _download_needs_refresh
+    with _download_lock:
+        needs_refresh = _download_needs_refresh
+        _download_needs_refresh = False
+    if not needs_refresh:
+        return _MODELS_REFRESH_NOOP
+    return models_refresh_ui(selected_folder)
+
+
+def download_abort_all_ui(selected_folder: Optional[str] = None):
+    """Also force-refreshes the Models tab, unlike a plain completed-
+    download tick: if several items were queued and some already
+    finished before this abort, those are real, already-complete
+    downloads that need to show up right away, not whenever the next
+    tick happens to notice. Not used by restart_app_ui(), which calls
+    _download_abort_all() directly - the process is about to be replaced
+    there, so refreshing a UI that's about to vanish would be pointless.
+
+    selected_folder is passed through to models_refresh_ui for the same
+    reason as _download_triggered_refresh_ui above - don't discard
+    whatever row the user's currently viewing just because this refresh
+    was forced rather than the flag-driven kind."""
+    _download_abort_all()
+    row_update, text_update = _download_status_ui()
+    return (*models_refresh_ui(selected_folder), row_update, text_update)
+
+
 # ---------------------------------------------------------------- Models tab
 #
 # One row per model DIRECTORY (core.models.group_models), not one row per
@@ -1003,21 +1239,112 @@ def save_settings_ui(
 # expensive to trigger from a stray click); only the explicit "Set as
 # active model" button commits a choice, writing straight to
 # settings.json the same way Settings' Save button already does for
-# everything else.
+# everything else. That button's own label/behavior is itself decided by
+# _action_mode_for_selection(): "Set as active model" when both the
+# selected quant and mmproj are already local, "Download" when either
+# isn't - see the Download-queue section above for what a "Download"
+# click actually schedules. Its click handler (models_action_ui) always
+# recomputes this fresh from the dropdowns' actual current values, so
+# clicking is correct regardless of what the button currently displays.
+#
+# The label also updates live as you change either dropdown within a row
+# (models_selection_change_ui, wired to both dropdowns' .change() below) -
+# this previously crashed the whole request ("Value: X is not in the list
+# of choices: [...]"): switching table rows reprograms a dropdown's
+# choices AND value in the same event, and a .change() listener on that
+# same dropdown could fire mid-flight with the value it held a moment
+# ago, which Gradio's Dropdown.preprocess() then validated against the
+# already-replaced choices list and rejected - a framework-level check
+# that runs before any of our own code, so no amount of defensive Python
+# here could have caught it. Fixed at the actual source: both dropdowns
+# now have allow_custom_value=True (see their definitions below), which
+# turns "value not in choices" from a hard error into a harmless pass-
+# through - our own handlers already treat an unrecognized value as
+# "nothing usable selected."
 
-def _models_status_marker(cfg: AppConfig, group: ModelGroup) -> str:
-    if any(q.name == cfg.model_name for q in group.quants):
-        return "✓ active"
-    if group.quants:
-        return ""
+_ACTION_BTN_LABELS = {"set_active": "Set as active model", "download": "Download", "disabled": "Set as active model"}
+
+
+def _action_mode_for_selection(
+    group: Optional[ModelGroup], quant_value: Optional[str], mmproj_value: Optional[str]
+) -> str:
+    """"set_active" (both selections already local), "download" (either
+    isn't), or "disabled" (nothing valid selected) - single source of
+    truth for both the action button's label (_models_dropdown_updates)
+    and models_action_ui's click dispatch, so the two can never silently
+    disagree about what a given selection means."""
+    if group is None or not quant_value or quant_value == "N/A" or mmproj_value == "N/A":
+        return "disabled"
+    quant_local = any(q.name == quant_value for q in group.quants)
+    mmproj_local = mmproj_value is None or any(m.name == mmproj_value for m in group.mmprojs)
+    return "set_active" if (quant_local and mmproj_local) else "download"
+
+
+def _action_button_update(mode: str):
+    return gr.update(value=_ACTION_BTN_LABELS[mode], interactive=(mode != "disabled"))
+
+
+def _group_for_quant_value(groups: list[ModelGroup], quant_name: Optional[str]) -> Optional[ModelGroup]:
+    """quant_name is always "<folder_name>/<stem>" (see _models_dropdown_
+    updates) whether it's a local or a not-yet-downloaded curated choice -
+    so the group it belongs to can always be found by folder name alone,
+    without needing to know which case it is first."""
+    if not quant_name or quant_name == "N/A":
+        return None
+    folder_name = quant_name.split("/", 1)[0]
+    return next((g for g in groups if g.name == folder_name), None)
+
+
+def models_selection_change_ui(groups: list[ModelGroup], quant_name: str, mmproj_name: str):
+    """Wired to both dropdowns' .change() - recomputes the action button
+    from _action_mode_for_selection, the same single decision function
+    every other writer (_models_dropdown_updates, models_action_ui) goes
+    through, so this can never disagree with them about what a given
+    selection means. quant_name/mmproj_name may occasionally be a stale
+    value from a split second ago (see allow_custom_value on the
+    dropdowns' definitions) - _group_for_quant_value simply won't find a
+    matching group for a value that no longer belongs to what's on
+    screen, which correctly resolves to "disabled" here rather than
+    crashing or showing something wrong."""
+    group = _group_for_quant_value(groups, quant_name)
+    mode = _action_mode_for_selection(group, quant_name, mmproj_name)
+    return _action_button_update(mode)
+
+
+def _models_star(cfg: AppConfig, group: ModelGroup) -> str:
+    return "★" if any(q.name == cfg.model_name for q in group.quants) else ""
+
+
+def _models_source(group: ModelGroup) -> str:
+    return "Curated" if group.curated else "Manual"
+
+
+def _models_quant_count(group: ModelGroup) -> str:
+    # "n/total" for a curated family (how many of the curated quants are
+    # actually downloaded) - just a plain count for a manual one, since
+    # there's no curated total to compare against.
     if group.curated:
-        return "downloadable"
-    return ""
+        return f"{len(group.quants)}/{len(group.curated.quants)}"
+    return str(len(group.quants))
 
 
 def _models_table_rows(groups: list[ModelGroup]) -> list[list[str]]:
     cfg = current_cfg
-    return [[g.name, _models_status_marker(cfg, g)] for g in groups]
+    return [
+        [_models_star(cfg, g), g.name, _models_source(g), _models_quant_count(g)]
+        for g in groups
+    ]
+
+
+def _local_choice_label(name: str, path: Path) -> str:
+    """Dropdown label for an already-local quant/mmproj, sized to match
+    a not-yet-downloaded curated choice's "(download, 6.8 GB)" label -
+    so the two look like variations on one format, not two different
+    conventions, when they sit in the same dropdown."""
+    try:
+        return f"{name} ({format_size(path.stat().st_size)})"
+    except OSError:
+        return name
 
 
 def _models_dropdown_updates(
@@ -1049,12 +1376,19 @@ def _models_dropdown_updates(
     quant/mmproj can carry a "(download, 6.8 GB)" label while its VALUE
     stays the same "<folder>/<stem>" shape a real local one would have -
     that's what lets models_set_active_ui tell the two apart later just by
-    checking whether the value matches a real ModelVariant/MmprojVariant."""
+    checking whether the value matches a real ModelVariant/MmprojVariant.
+
+    Also returns a third update, for the action button - computed here
+    via _action_mode_for_selection rather than a Dropdown .change()
+    listener, since this is the one place that already knows exactly
+    which quant/mmproj value ends up selected after the preferred_*
+    fallback logic runs, so there's no second copy of that resolution
+    logic that could silently drift out of sync with this one."""
     if group is None:
         na = gr.update(choices=["N/A"], value="N/A", interactive=False)
-        return na, na
+        return na, na, _action_button_update("disabled")
 
-    quant_pairs = [(q.name, q.name) for q in group.quants]
+    quant_pairs = [(_local_choice_label(q.name, q.model_path), q.name) for q in group.quants]
     local_quant_names = {q.name for q in group.quants}
     if group.curated:
         for cq in group.curated.quants:
@@ -1062,7 +1396,7 @@ def _models_dropdown_updates(
             if value not in local_quant_names:
                 quant_pairs.append((f"{cq.name} (download, {format_size(cq.size_bytes)})", value))
 
-    mmproj_pairs = [(m.name, m.name) for m in group.mmprojs]
+    mmproj_pairs = [(_local_choice_label(m.name, m.mmproj_path), m.name) for m in group.mmprojs]
     local_mmproj_names = {m.name for m in group.mmprojs}
     if group.curated:
         for cm in group.curated.mmprojs:
@@ -1072,45 +1406,66 @@ def _models_dropdown_updates(
 
     if not quant_pairs:
         na = gr.update(choices=["N/A"], value="N/A", interactive=False)
-        return na, na
+        return na, na, _action_button_update("disabled")
     quant_values = [v for _, v in quant_pairs]
     quant_value = preferred_quant if preferred_quant in quant_values else quant_values[0]
     quant_update = gr.update(choices=quant_pairs, value=quant_value, interactive=True)
 
     if not mmproj_pairs:
         mmproj_update = gr.update(choices=["N/A"], value="N/A", interactive=False)
+        mmproj_value = "N/A"
     else:
         mmproj_values = [v for _, v in mmproj_pairs]
         mmproj_value = preferred_mmproj if preferred_mmproj in mmproj_values else mmproj_values[0]
         mmproj_update = gr.update(choices=mmproj_pairs, value=mmproj_value, interactive=True)
-    return quant_update, mmproj_update
+
+    mode = _action_mode_for_selection(group, quant_value, mmproj_value)
+    return quant_update, mmproj_update, _action_button_update(mode)
 
 
-def models_refresh_ui():
+def models_refresh_ui(selected_folder: Optional[str] = None):
     """Rescans webui/models/, rebuilds the grouped table, and re-selects
-    whichever group is currently the active model (if any) so a refresh
-    shows real state instead of resetting the dropdowns to nothing."""
+    a group for the dropdowns - preferring `selected_folder` (the folder
+    the caller was already viewing, typically models_selected_folder_
+    state) if it's given and still a real group, falling back to
+    whichever group is the currently active model, else nothing.
+
+    Preserving the caller's current view like this matters most for the
+    auto-triggered refresh that fires when a background download
+    completes (_download_triggered_refresh_ui) - without it, finishing a
+    download for a model that isn't active yet would silently reset the
+    dropdowns back to whatever WAS active (or to nothing) right out from
+    under the user, mid-download-queueing, regardless of who actually
+    triggered this particular refresh."""
     models, mmprojs = scan_all()
     groups = merge_curated(group_models(models, mmprojs), load_curated_models())
     table = _models_table_rows(groups)
 
     cfg = current_cfg
-    active_group = next((g for g in groups if any(q.name == cfg.model_name for q in g.quants)), None)
-    quant_update, mmproj_update = _models_dropdown_updates(
-        active_group, preferred_quant=cfg.model_name, preferred_mmproj=cfg.mmproj_name
+    view_group = next((g for g in groups if str(g.folder) == selected_folder), None) if selected_folder else None
+    if view_group is not None:
+        is_active_group = any(q.name == cfg.model_name for q in view_group.quants)
+    else:
+        view_group = next((g for g in groups if any(q.name == cfg.model_name for q in g.quants)), None)
+        is_active_group = view_group is not None
+
+    quant_update, mmproj_update, action_update = _models_dropdown_updates(
+        view_group,
+        preferred_quant=cfg.model_name if is_active_group else None,
+        preferred_mmproj=cfg.mmproj_name if is_active_group else None,
     )
-    folder_key = str(active_group.folder) if active_group else None
+    folder_key = str(view_group.folder) if view_group else None
     status = f"{len(groups)} model folder(s) found." if groups else f"No models found under {MODELS_DIR}."
 
-    return table, groups, folder_key, quant_update, mmproj_update, status
+    return table, groups, folder_key, quant_update, mmproj_update, action_update, status
 
 
 def models_table_select_ui(groups: list[ModelGroup], evt: gr.SelectData):
     row = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
     if not groups or not (0 <= row < len(groups)):
-        return None, gr.update(), gr.update(), gr.update()
+        return None, gr.update(), gr.update(), gr.update(), gr.update()
     group = groups[row]
-    quant_update, mmproj_update = _models_dropdown_updates(group)
+    quant_update, mmproj_update, action_update = _models_dropdown_updates(group)
     if not group.quants:
         if group.curated:
             note = " — not downloaded yet; pick a quant below to see download info"
@@ -1120,25 +1475,24 @@ def models_table_select_ui(groups: list[ModelGroup], evt: gr.SelectData):
         note = " — no mmproj found, can't be selected"
     else:
         note = ""
-    return str(group.folder), quant_update, mmproj_update, f"Viewing {group.name}{note}."
+    return str(group.folder), quant_update, mmproj_update, action_update, f"Viewing {group.name}{note}."
 
 
 def models_set_active_ui(groups: list[ModelGroup], quant_name: str, mmproj_name: str):
+    """Only reached via models_action_ui when the current selection is
+    fully local ("set_active" mode) - the refusal branches below are a
+    defensive fallback for a stale/racing click, not the normal path for
+    a not-yet-downloaded pick (that's models_download_ui's job now)."""
     global current_cfg
-    noop_dropdowns = (gr.update(), gr.update())
+    noop = (gr.update(), gr.update(), gr.update())
     if not quant_name or quant_name == "N/A":
-        return _models_table_rows(groups), *noop_dropdowns, "No model selected — click a row in the table first."
+        return _models_table_rows(groups), *noop, "No model selected — click a row in the table first."
 
     group = next((g for g in groups if any(q.name == quant_name for q in g.quants)), None)
     if group is None:
-        # quant_name didn't match any LOCAL ModelVariant - it's a curated
-        # "(download, ...)" choice that isn't on disk yet (see
-        # _models_dropdown_updates: value shape is identical either way,
-        # so this is the only place that actually tells them apart).
         shown = quant_name.rsplit("/", 1)[-1]
-        return _models_table_rows(groups), *noop_dropdowns, (
-            f"\"{shown}\" isn't downloaded yet - download support is coming soon, "
-            "pick an already-downloaded quant for now."
+        return _models_table_rows(groups), *noop, (
+            f"\"{shown}\" isn't downloaded yet - use the Download button, not Set as active."
         )
 
     if mmproj_name == "N/A":
@@ -1148,12 +1502,11 @@ def models_set_active_ui(groups: list[ModelGroup], quant_name: str, mmproj_name:
         # silently commit an unselectable model, only failing later at
         # server-start time instead of refusing here where the reason is
         # actually known).
-        return _models_table_rows(groups), *noop_dropdowns, "This model has no mmproj — can't be set as active."
+        return _models_table_rows(groups), *noop, "This model has no mmproj — can't be set as active."
     if mmproj_name and not any(m.name == mmproj_name for m in group.mmprojs):
         shown = mmproj_name.rsplit("/", 1)[-1]
-        return _models_table_rows(groups), *noop_dropdowns, (
-            f"\"{shown}\" isn't downloaded yet - download support is coming soon, "
-            "pick an already-downloaded mmproj for now."
+        return _models_table_rows(groups), *noop, (
+            f"\"{shown}\" isn't downloaded yet - use the Download button, not Set as active."
         )
     mmproj_value = "" if mmproj_name is None else mmproj_name
     current_cfg = replace(current_cfg, model_name=quant_name, mmproj_name=mmproj_value)
@@ -1167,15 +1520,74 @@ def models_set_active_ui(groups: list[ModelGroup], quant_name: str, mmproj_name:
     # later action that assumes real choices) is what actually caused the
     # "value N/A not in choices []" error. `group` is already the right
     # one, found above.
-    quant_update, mmproj_update = _models_dropdown_updates(
+    quant_update, mmproj_update, action_update = _models_dropdown_updates(
         group, preferred_quant=quant_name, preferred_mmproj=mmproj_name
     )
     return (
         _models_table_rows(groups),
-        quant_update, mmproj_update,
+        quant_update, mmproj_update, action_update,
         f"Active model set to {quant_name} ({mmproj_note}). "
         "Click \"Restart server connection\" below to actually load it.",
     )
+
+
+def models_download_ui(groups: list[ModelGroup], quant_name: str, mmproj_name: str):
+    """Only reached via models_action_ui when the current selection has
+    something not yet local ("download" mode). Queues whichever of
+    quant/mmproj isn't on disk yet - possibly both - and leaves the
+    dropdowns/table alone, since nothing about what's locally available
+    has actually changed yet."""
+    noop = (gr.update(), gr.update(), gr.update())
+    if not quant_name or quant_name == "N/A":
+        return _models_table_rows(groups), *noop, "No model selected — click a row in the table first."
+
+    group = _group_for_quant_value(groups, quant_name)
+    if group is None or group.curated is None:
+        return _models_table_rows(groups), *noop, "Nothing curated to download for this selection."
+
+    to_queue: list[DownloadItem] = []
+    if not any(q.name == quant_name for q in group.quants):
+        stem = quant_name.split("/", 1)[1]
+        cq = next((c for c in group.curated.quants if c.name == stem), None)
+        if cq:
+            to_queue.append(DownloadItem(
+                url=cq.url, dest_path=group.folder / Path(cq.url).name,
+                label=cq.name, size_bytes=cq.size_bytes,
+            ))
+    if mmproj_name not in (None, "N/A") and not any(m.name == mmproj_name for m in group.mmprojs):
+        stem = mmproj_name.split("/", 1)[1]
+        cm = next((c for c in group.curated.mmprojs if c.name == stem), None)
+        if cm:
+            to_queue.append(DownloadItem(
+                url=cm.url, dest_path=group.folder / Path(cm.url).name,
+                label=cm.name, size_bytes=cm.size_bytes,
+            ))
+
+    if not to_queue:
+        return _models_table_rows(groups), *noop, "Already downloaded — nothing to queue."
+
+    added = _download_enqueue(to_queue)
+    if not added:
+        return _models_table_rows(groups), *noop, "Already queued or downloading."
+    labels = ", ".join(i.label for i in added)
+    log.info("Models tab: queued for download: %s", labels)
+    return _models_table_rows(groups), *noop, f"Queued for download: {labels}."
+
+
+def models_action_ui(groups: list[ModelGroup], quant_name: str, mmproj_name: str):
+    """The single "Set as active model"/"Download" button's click target -
+    decides which of the two the current selection actually means (same
+    logic _models_dropdown_updates used to pick the button's label, via
+    _action_mode_for_selection) and dispatches to it, then refreshes the
+    download-status row too in case this action changed the queue."""
+    group = _group_for_quant_value(groups, quant_name)
+    mode = _action_mode_for_selection(group, quant_name, mmproj_name)
+    if mode == "download":
+        table_u, quant_u, mmproj_u, action_u, status = models_download_ui(groups, quant_name, mmproj_name)
+    else:
+        table_u, quant_u, mmproj_u, action_u, status = models_set_active_ui(groups, quant_name, mmproj_name)
+    row_u, text_u = _download_status_ui()
+    return table_u, quant_u, mmproj_u, action_u, status, row_u, text_u
 
 
 # ------------------------------------------------------------------ Status bar
@@ -1242,6 +1654,10 @@ def get_llama_debug_text() -> str:
 
 def clear_debug_ui() -> tuple[str, str]:
     _PY_LOG_BUFFER.clear()
+    try:
+        PY_LOG_PATH.write_text("", encoding="utf-8")
+    except OSError:
+        pass
     if _session.get("managed") is not None:
         try:
             LOG_PATH.write_text("", encoding="utf-8")
@@ -1256,7 +1672,7 @@ def build_app() -> gr.Blocks:
     with gr.Blocks(title="XenoTagger", analytics_enabled=False) as demo:
         gr.Markdown("# XenoTagger — LoRA dataset captioning")
 
-        with gr.Tab("Single image"):
+        with gr.Tab("Single image") as single_tab:
             with gr.Row(equal_height=True):
                 with gr.Column():
                     single_image = gr.Image(
@@ -1311,7 +1727,7 @@ def build_app() -> gr.Blocks:
             )
             single_image.change(clear_single_result_ui, [], [single_caption, single_status])
 
-        with gr.Tab("Batch processing"):
+        with gr.Tab("Batch processing") as batch_tab:
             with gr.Row():
                 batch_dir = gr.Textbox(label="Directory of images", scale=4)
                 batch_browse_btn = gr.Button("Browse...", scale=1)
@@ -1360,7 +1776,7 @@ def build_app() -> gr.Blocks:
             )
             batch_interrupt_btn.click(interrupt_batch_ui, [], [batch_interrupt_btn])
 
-        with gr.Tab("Review"):
+        with gr.Tab("Review") as review_tab:
             with gr.Row():
                 review_dir = gr.Textbox(label="Directory of images", scale=4)
                 with gr.Column(scale=1, min_width=120):
@@ -1387,7 +1803,7 @@ def build_app() -> gr.Blocks:
 
             review_table = gr.Dataframe(
                 headers=["File", "Status"], datatype=["str", "str"],
-                interactive=False, row_count=(0, "dynamic"),
+                interactive=False, row_count=(0, "dynamic"), buttons=[],
             )
 
             review_status = gr.Textbox(show_label=False, container=False, interactive=False)
@@ -1433,25 +1849,32 @@ def build_app() -> gr.Blocks:
 
         with gr.Tab("Models"):
             gr.Markdown(
-                "Every `.gguf` under a `webui/models/<folder>/` is picked up, "
-                "grouped by folder: files with \"mmproj\" in the name are "
-                "projectors, everything else is a selectable quant. Files "
-                f"matching `{', '.join(IGNORED_SUBSTRINGS)}` are ignored "
-                "(e.g. speculative-decoding draft models). Dropdown choices "
-                "marked \"(download, ...)\" come from the curated list and "
-                "aren't on disk yet - download support is coming soon."
+                config_mod.MODELS_TAB_INTRO.format(ignored_substrings=", ".join(IGNORED_SUBSTRINGS))
             )
             models_table = gr.Dataframe(
-                headers=["Model", "Status"], datatype=["str", "str"],
+                headers=["A", "Model", "Source", "Quants"], datatype=["str", "str", "str", "str"],
                 interactive=False, row_count=(0, "dynamic"),
             )
             with gr.Row():
-                models_quant_dropdown = gr.Dropdown(label="Quant", interactive=False)
-                models_mmproj_dropdown = gr.Dropdown(label="mmproj", interactive=False)
+                # allow_custom_value=True is load-bearing, not cosmetic: it
+                # skips Gradio's strict "submitted value must be in the
+                # current choices" check, which otherwise crashes the whole
+                # request when a table-row switch reprograms these dropdowns'
+                # choices at the same moment a .change() event from the old
+                # row is still in flight (see the Models tab handlers' own
+                # comment block below for the full story). Our own handlers
+                # already treat an unrecognized value as "not selected" -
+                # this only removes Gradio's redundant, crash-prone copy of
+                # that same check.
+                models_quant_dropdown = gr.Dropdown(label="Quant", interactive=False, allow_custom_value=True)
+                models_mmproj_dropdown = gr.Dropdown(label="mmproj", interactive=False, allow_custom_value=True)
             with gr.Row():
-                models_set_active_btn = gr.Button("Set as active model", variant="primary")
+                models_action_btn = gr.Button("Set as active model", variant="primary", interactive=False)
                 restart_server_btn = gr.Button("Restart server connection")
                 refresh_models_btn = gr.Button("Refresh")
+            with gr.Row(visible=False) as download_status_row:
+                download_status_text = gr.HTML(container=False, scale=4)
+                download_abort_btn = gr.Button("Abort all downloads", scale=1)
             models_status = gr.Textbox(show_label=False, container=False, interactive=False)
 
             # See this tab's own handler-function docstrings above for what
@@ -1461,20 +1884,41 @@ def build_app() -> gr.Blocks:
 
             _models_scan_outputs = [
                 models_table, models_groups_state, models_selected_folder_state,
-                models_quant_dropdown, models_mmproj_dropdown, models_status,
+                models_quant_dropdown, models_mmproj_dropdown, models_action_btn, models_status,
             ]
-            refresh_models_btn.click(models_refresh_ui, [], _models_scan_outputs)
+            refresh_models_btn.click(models_refresh_ui, [models_selected_folder_state], _models_scan_outputs)
             models_table.select(
                 models_table_select_ui,
                 [models_groups_state],
-                [models_selected_folder_state, models_quant_dropdown, models_mmproj_dropdown, models_status],
+                [
+                    models_selected_folder_state, models_quant_dropdown, models_mmproj_dropdown,
+                    models_action_btn, models_status,
+                ],
             )
-            models_set_active_btn.click(
-                models_set_active_ui,
+            models_action_btn.click(
+                models_action_ui,
                 [models_groups_state, models_quant_dropdown, models_mmproj_dropdown],
-                [models_table, models_quant_dropdown, models_mmproj_dropdown, models_status],
+                [
+                    models_table, models_quant_dropdown, models_mmproj_dropdown, models_action_btn, models_status,
+                    download_status_row, download_status_text,
+                ],
             )
             restart_server_btn.click(restart_server_ui, [], [models_status])
+            download_abort_btn.click(
+                download_abort_all_ui,
+                [models_selected_folder_state],
+                [*_models_scan_outputs, download_status_row, download_status_text],
+            )
+            models_quant_dropdown.change(
+                models_selection_change_ui,
+                [models_groups_state, models_quant_dropdown, models_mmproj_dropdown],
+                [models_action_btn],
+            )
+            models_mmproj_dropdown.change(
+                models_selection_change_ui,
+                [models_groups_state, models_quant_dropdown, models_mmproj_dropdown],
+                [models_action_btn],
+            )
 
         with gr.Tab("Settings"):
             with gr.Group():
@@ -1501,7 +1945,6 @@ def build_app() -> gr.Blocks:
                 external_url = gr.Textbox(
                     label="External server URL (external mode)", value=cfg.external_url
                 )
-                gr.Markdown("Model/mmproj selection now lives on the **Models** tab.")
                 with gr.Row():
                     n_gpu_layers = gr.Textbox(
                         label="GPU layers ('auto', 'all', or an exact number)",
@@ -1511,7 +1954,6 @@ def build_app() -> gr.Blocks:
                 extra_server_args = gr.Textbox(
                     label="Extra llama-server arguments", value=cfg.extra_server_args
                 )
-                gr.Markdown("\"Restart server connection\" now lives on the **Models** tab.")
 
             with gr.Group():
                 gr.Markdown("### Generation")
@@ -1577,7 +2019,7 @@ def build_app() -> gr.Blocks:
             restart_app_btn.click(restart_app_ui, [], [])
 
         with gr.Tab("Debug", visible=cfg.debug_tab_enabled):
-            gr.Markdown("**Python debug log**")
+            gr.Markdown(f"**Python debug log** (also written to `{PY_LOG_PATH}`)")
             debug_python_box = gr.Textbox(
                 lines=18, max_lines=18, interactive=False, show_label=False,
                 value=get_python_debug_text(),
@@ -1594,19 +2036,33 @@ def build_app() -> gr.Blocks:
         _run_interrupt_btns = [
             single_run_btn, single_run_col, single_interrupt_col, single_interrupt_btn,
             batch_run_btn, batch_run_col, batch_interrupt_col, batch_interrupt_btn,
-            review_recaption_col, review_interrupt_col, review_interrupt_btn,
+            review_recaption_btn, review_recaption_col, review_interrupt_col, review_interrupt_btn,
             review_prev_btn, review_next_btn, review_table,
             review_dir, review_browse_btn, review_scan_btn,
         ]
+        # Switching to any of these tabs remounts their Columns back to
+        # whatever visibility was declared at Blocks-build time, not the
+        # latest server-pushed state - Gradio's own quirk, not something
+        # we did. status_timer already self-corrects that within 2s (see
+        # _operation_button_states' docstring), but re-running it right on
+        # tab-select too makes the correction immediate instead of a
+        # brief, harmless flash of both Run and Interrupt at once.
+        single_tab.select(_operation_button_states, [], _run_interrupt_btns)
+        batch_tab.select(_operation_button_states, [], _run_interrupt_btns)
+        review_tab.select(_operation_button_states, [], _run_interrupt_btns)
+
         status_timer = gr.Timer(2.0)
         status_timer.tick(get_status_text, [], [status_bar])
         status_timer.tick(_operation_button_states, [], _run_interrupt_btns)
+        status_timer.tick(_download_status_ui, [], [download_status_row, download_status_text])
+        status_timer.tick(_download_triggered_refresh_ui, [models_selected_folder_state], _models_scan_outputs)
         if cfg.debug_tab_enabled:
             status_timer.tick(get_python_debug_text, [], [debug_python_box])
             status_timer.tick(get_llama_debug_text, [], [debug_llama_box])
         demo.load(get_status_text, [], [status_bar])
         demo.load(_operation_button_states, [], _run_interrupt_btns)
-        demo.load(models_refresh_ui, [], _models_scan_outputs)
+        demo.load(models_refresh_ui, [models_selected_folder_state], _models_scan_outputs)
+        demo.load(_download_status_ui, [], [download_status_row, download_status_text])
 
     return demo
 
@@ -1615,6 +2071,7 @@ UI_PORT = 7901
 
 
 def main() -> None:
+    _setup_debug_logging()
     demo = build_app()
     demo.queue()
     demo.launch(server_port=UI_PORT, footer_links=[], css=ALL_CSS)
