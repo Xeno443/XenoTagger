@@ -2,7 +2,7 @@ _reference/
 system/
 setup-env-classic.bat
 handoff.md
-llama-cuda/
+llama/
 webui/models/*
 !webui/models/.gitkeep
 webui/config/settings.json

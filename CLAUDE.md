@@ -40,19 +40,26 @@ they describe a repo structure this one no longer has.
   - `models.py` — discovers/classifies local GGUF models under
     `webui/models/`.
   - `downloads.py` — background curated-model downloader.
+  - `llama_install.py` — installs llama-server.exe (+ matching CUDA
+    runtime where applicable) from ggml-org/llama.cpp's GitHub releases
+    into `llama/` (gitignored, backend-agnostic — one canonical
+    install, not one dir per backend). Backend choices: CUDA 13.3
+    (default)/12.4, ROCm 7.14, CPU — resolved against whichever build
+    GitHub's releases list currently returns first, not a hardcoded
+    build number. Reachable from Settings → Llama in the GUI and from
+    `cli.py --install-llama <backend>`.
 - `webui/config/` — `settings.json` (gitignored, per-machine),
   `models_source.json` (checked in — curated downloadable model list),
   `models_cache.json` (gitignored).
-- `setup-tagger.cmd` — downloads a llama.cpp CUDA build + matching
-  cudart into `llama-cuda/` (gitignored). Hardcodes one CUDA version
-  today (see its own TODO comment — older cards may need a different
-  one; no backend picker yet).
 - `run-tagger.cmd` / `tag-cli.cmd` — launch the GUI / CLI through the
   portable environment.
 - `setup-env.bat` / `environment.bat` — inherited from the portable-env
   base: build/activate the portable Python + Git toolchain under
-  `system\` (gitignored). Still accurate, unrelated to the worktree
-  model that was dropped.
+  `system\` (gitignored), then install `webui/requirements.txt`. Still
+  accurate, unrelated to the worktree model that was dropped.
+  `setup-tagger.cmd` (which used to also install a hardcoded CUDA-only
+  llama.cpp build) is gone — that job moved to `core/llama_install.py`
+  above.
 
 ## VRAM / hardware constraint
 
@@ -116,9 +123,10 @@ replacing an earlier implicit-lazy-start design:
   args changed while managed kill (if owned) and optionally restart per
   the autostart checkbox. A `_config_lock` guards the read-modify-write
   of `current_cfg` + `config_mod.save()`.
-- Installing llama.cpp itself is explicitly **out of scope** for this
-  pass — "not installed" still just points at `setup-tagger.cmd`, no
-  in-UI installer.
+- Installing llama.cpp itself now has an in-UI installer (Settings →
+  Llama, plus `cli.py --install-llama`) — see `core/llama_install.py`
+  under Layout above. This was out of scope for the lifecycle-rewrite
+  pass described in this section and was added afterward.
 
 ## House rules
 
@@ -179,11 +187,10 @@ replacing an earlier implicit-lazy-start design:
   working tree. Review and commit in logical chunks rather than one
   giant commit.
 - **Model management / llama.cpp setup UI**: curated GGUF downloading
-  is built (`core/downloads.py`, `models_source.json`). Applying the
-  same pattern to llama.cpp itself (CUDA/Vulkan/CPU backend picker,
-  `nvidia-smi`-based default) is still just a design sketch, not
-  implemented — `setup-tagger.cmd` remains a hardcoded-CUDA-version
-  manual script.
+  is built (`core/downloads.py`, `models_source.json`). The same
+  pattern is now applied to llama.cpp itself via `core/llama_install.py`
+  (CUDA 13.3/12.4, ROCm, CPU backend picker; no auto-detect heuristic —
+  the dropdown just defaults to CUDA 13.3 and the user picks otherwise).
 - **Hydra tagger integration — not started in this repo.** A second-
   stage Hydra 3.5 (RedRocket) e621-style tag classifier, meant to
   ground NSFW/explicit tagging the VLM alone is weak at, is prototyped

@@ -80,15 +80,21 @@ status_timer that already refreshes the status bar, plus demo.load - so
 any view self-corrects within one tick instead of staying wrong
 indefinitely.
 
-Restart (both restart_server_ui and restart_app_ui) doesn't block just
-because something's running, nor does it silently kill it out from under
-whatever's in flight - it force-aborts (skipping the two-click grace
-period; see _operation_force_abort) and actually waits for that
-operation to finish noticing and clean up (_wait_for_operation_to_end)
-before touching the server. This matters most for restart_app_ui, whose
-os.execv replaces the entire process with zero chance for any cleanup to
-run afterward - waiting first means an interrupted operation gets an
-observable, handled failure instead of just vanishing without a trace.
+restart_app_ui doesn't block just because something's running, nor does
+it silently kill it out from under whatever's in flight - it force-
+aborts (skipping the two-click grace period; see _operation_force_abort)
+and actually waits for that operation to finish noticing and clean up
+(_wait_for_operation_to_end) before touching the server. This matters
+because os.execv replaces the entire process with zero chance for any
+cleanup to run afterward - waiting first means an interrupted operation
+gets an observable, handled failure instead of just vanishing without a
+trace. The Models tab's own "Manage llama server" button used to have an
+in-place equivalent (restart_server_ui, force-abort + stop + refresh
+right there) but is now pure navigation to Settings -> Llama - actually
+stopping/starting only ever happens from that sub-tab's Start/End
+buttons, which are already correctly gated (disabled mid-job, see
+_settings_gating_ui) so there's no force-abort race left for a plain
+redirect to need to guard against.
 """
 
 from __future__ import annotations
@@ -120,6 +126,10 @@ from core.captioner import caption_image
 from core.client import ClientError, LlamaClient
 from core.config import AppConfig
 from core.downloads import DownloadItem, download_one
+from core.llama_install import (
+    BACKENDS as LLAMA_BACKENDS, DEFAULT_BACKEND as LLAMA_DEFAULT_BACKEND,
+    install as llama_install_run, installed_info as llama_installed_info, plan_install as llama_plan_install,
+)
 from core.models import (
     IGNORED_SUBSTRINGS, MODELS_DIR, ModelGroup, format_size, group_models,
     load_curated_models, merge_curated, resolve_selection, scan_all,
@@ -512,6 +522,26 @@ def _on_main_tab_select(evt: gr.SelectData) -> str:
     """Wired to main_tabs.select() - see current_tab_label_state's own
     comment for why this is tracked at all."""
     return evt.value
+
+
+def _goto_llama_settings_ui():
+    """The Models tab's "Manage llama server" button's click target -
+    pure navigation to Settings -> Llama, no server action of its own
+    (see this module's own docstring for why that's safe: the Start/End
+    buttons there are already gated off while a job's running, so this
+    can't be used to bypass anything the way an in-place restart-from-
+    Models-tab could).
+
+    Explicitly asserts every destination (main_tabs, settings_tabs,
+    current_settings_subtab_state, current_tab_label_state) rather than a
+    bare gr.update() no-op on any of them - _refresh_reachability_ui's own
+    docstring covers why a no-op can't be trusted to self-correct a
+    still-pending prior push to a Tabs component's selected=, and
+    current_tab_label_state/current_settings_subtab_state both need to
+    reflect this redirect immediately since neither main_tabs.select() nor
+    settings_tabs.select() reliably fire on a server-pushed switch like
+    this one (see their own comments)."""
+    return gr.update(selected="settings"), gr.update(selected="llama-settings"), "llama-settings", "Settings"
 
 
 def _llama_lifecycle_button_updates(cfg: AppConfig, status: ServerStatus):
@@ -993,25 +1023,6 @@ def get_client(cfg: AppConfig) -> LlamaClient:
         return _session["client"]
 
 
-def restart_server_ui() -> str:
-    log.info("User cleared the server connection from Settings")
-    # If a single-image or batch operation is currently running, force-abort
-    # it now (rather than block this action) and wait for that to actually
-    # finish before touching the server out from under it - see the
-    # Operation tracking section above for why a hard kill is the only
-    # reliable way to interrupt an in-flight request.
-    _operation_force_abort()
-    _wait_for_operation_to_end()
-    _stop_managed()
-    _refresh_reachability_cache()
-    # No more "it'll reconnect on the next request" - lazy-start is
-    # retired from the UI path (see _try_start_managed_llama below),
-    # Single/Batch/Recaption are gated off the moment nothing's reachable,
-    # so an explicit restart is genuinely required now, not just an
-    # available shortcut.
-    return "Server connection cleared. Start it again (managed mode: \"Start llama server\" in Settings)."
-
-
 def _try_start_managed_llama() -> tuple[bool, str]:
     """Attempts to start (or confirm-reuse) the managed llama-server for
     the current config, blocking until ready or failed. Shared by the
@@ -1086,13 +1097,15 @@ def restart_app_ui() -> None:
     just-toggled Debug tab) take effect without anyone needing a terminal.
     Never returns: the process image is gone the moment execv succeeds, so
     stop our own managed llama-server first (execv skips atexit entirely),
-    and abort any in-flight/queued downloads too - the queue is in-memory
-    only and won't survive this regardless, better to say so cleanly.
+    and abort any in-flight/queued downloads or llama.cpp install too -
+    all in-memory only and won't survive this regardless, better to say
+    so cleanly.
     """
     log.info("User triggered app restart from Settings")
     _operation_force_abort()
     _wait_for_operation_to_end()
     _download_abort_all()
+    _install_abort_all()
     _stop_managed()
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
@@ -1836,6 +1849,144 @@ def _download_status_ui():
     return gr.update(visible=True), gr.update(value=html)
 
 
+# --------------------------------------------------------- llama.cpp install
+#
+# A single-operation worker, not a queue (only one llama.cpp install ever
+# makes sense at a time) - its own lock/thread/abort-flag rather than
+# reusing _download_lock above, because an install overwrites the exact
+# binary/DLLs a running llama-server.exe might have open, which is a
+# fundamentally different hazard than a curated model download (which
+# never touches anything currently in use). _llama_install_start_ui
+# refuses to start while the managed port is reachable for exactly this
+# reason.
+
+_install_lock = threading.RLock()
+_install_thread: Optional[threading.Thread] = None
+_install_state = {"phase": "idle", "bytes_done": 0, "bytes_total": 0}
+_install_abort_requested = False
+# One-shot message popped by the next _llama_install_status_ui tick (success
+# or failure) - not left sitting in _install_state, because that would mean
+# every 2s tick after a completed install keeps re-announcing the same
+# message into llama_lifecycle_status, stomping on whatever the Start/End/
+# Verify buttons wrote there in the meantime. Mirrors _download_needs_
+# refresh's single-shot-flag idiom above.
+_install_announce: Optional[str] = None
+
+
+def _install_worker(backend_id: str) -> None:
+    global _install_thread, _install_announce
+    label = LLAMA_BACKENDS[backend_id].label
+
+    def on_progress(written: int) -> None:
+        with _install_lock:
+            _install_state["bytes_done"] = written
+
+    def on_phase(phase: str) -> None:
+        with _install_lock:
+            _install_state["phase"] = phase
+
+    try:
+        plan = llama_plan_install(backend_id)
+        with _install_lock:
+            _install_state["bytes_total"] = plan.total_bytes
+        completed = llama_install_run(
+            plan, should_abort=lambda: _install_abort_requested,
+            on_progress=on_progress, on_phase=on_phase,
+        )
+        message = f"Installed {label} ({plan.build_tag})." if completed else "Install aborted."
+    except Exception as exc:
+        log.exception("llama.cpp install failed (backend=%s)", backend_id)
+        message = f"Install failed: {exc}"
+    with _install_lock:
+        _install_state.update(phase="idle", bytes_done=0, bytes_total=0)
+        _install_announce = message
+        _install_thread = None
+
+
+def _llama_install_start_ui(backend_id: str) -> str:
+    """Kicks off a background install and returns immediately - actual
+    progress/completion is picked up by the status_timer via
+    _llama_install_status_ui below, the same fire-and-forget shape as
+    _download_enqueue's own click handlers."""
+    global _install_thread, _install_abort_requested
+    if not backend_id:
+        return "No backend selected."
+    with _install_lock:
+        if _install_thread is not None and _install_thread.is_alive():
+            return "An install is already in progress."
+    if is_healthy(_managed_base_url(current_cfg)):
+        return "Stop the running llama-server first (\"End llama server\" above) before installing/reinstalling."
+    with _install_lock:
+        _install_abort_requested = False
+        _install_state.update(phase="planning", bytes_done=0, bytes_total=0)
+        _install_thread = threading.Thread(target=_install_worker, args=(backend_id,), daemon=True)
+        _install_thread.start()
+    return f"Installing {LLAMA_BACKENDS[backend_id].label} - resolving latest release..."
+
+
+def _install_abort_all() -> None:
+    """Bare flag-set, no UI return value - mirrors _download_abort_all()
+    above, called both by _llama_install_abort_ui below and by
+    restart_app_ui (which doesn't need or want a UI-facing message, the
+    process is about to be replaced)."""
+    global _install_abort_requested
+    with _install_lock:
+        _install_abort_requested = True
+
+
+def _llama_install_abort_ui() -> str:
+    with _install_lock:
+        if _install_thread is None or not _install_thread.is_alive():
+            return "Nothing to abort."
+    _install_abort_all()
+    return "Aborting install..."
+
+
+def _llama_install_status_ui():
+    """(row_visibility, progress_html, lifecycle_status_update,
+    installed_backend_text_update) - wired to the same 2s status_timer as
+    the download-status row, plus called directly after Install/Abort
+    clicks for immediate feedback. lifecycle_status_update only ever
+    carries a real value on the tick that pops a pending _install_announce
+    (every other tick is a no-op gr.update(), so it never overwrites a
+    Start/End/Verify message that isn't actually stale); installed_backend_
+    text_update is always recomputed fresh from disk - just a marker-file
+    read, cheap enough not to need the same one-shot treatment."""
+    global _install_announce
+    with _install_lock:
+        phase = _install_state["phase"]
+        bytes_done = _install_state["bytes_done"]
+        bytes_total = _install_state["bytes_total"]
+        announce = _install_announce
+        _install_announce = None
+
+    status_update = gr.update(value=announce) if announce is not None else gr.update()
+    installed_update = gr.update(value=_llama_installed_text())
+
+    if phase not in ("planning", "downloading", "extracting"):
+        return gr.update(visible=False), gr.update(value=""), status_update, installed_update
+
+    if phase == "planning":
+        html = "<div>Resolving latest llama.cpp release...</div>"
+    elif phase == "extracting":
+        html = "<div>Extracting...</div>"
+    else:
+        total = max(bytes_total, 1)
+        pct = min(100, int(bytes_done * 100 / total))
+        html = (
+            f"<progress value=\"{bytes_done}\" max=\"{total}\" style=\"width:100%;\"></progress>"
+            f"<div>Downloading: {pct}% ({format_size(bytes_done)} / {format_size(bytes_total)})</div>"
+        )
+    return gr.update(visible=True), gr.update(value=html), status_update, installed_update
+
+
+def _llama_installed_text() -> str:
+    info = llama_installed_info()
+    if info is None:
+        return "Not installed yet."
+    return f"Installed: {info.get('label', info.get('backend_id'))} ({info.get('build_tag')})"
+
+
 # Mirrors models_refresh_ui()'s 7-value return shape (Models tab section
 # below) - the "nothing changed, don't touch anything" return for
 # _download_triggered_refresh_ui when no download has completed since the
@@ -2556,7 +2707,7 @@ def build_app() -> gr.Blocks:
                     models_mmproj_dropdown = gr.Dropdown(label="mmproj", interactive=False, allow_custom_value=True)
                 with gr.Row():
                     models_action_btn = gr.Button("Set as active model", variant="primary", interactive=False)
-                    restart_server_btn = gr.Button("Restart server connection")
+                    restart_server_btn = gr.Button("Manage llama server")
                     refresh_models_btn = gr.Button("Refresh")
                 with gr.Row(visible=False) as download_status_row:
                     download_status_text = gr.HTML(container=False, scale=4)
@@ -2589,7 +2740,6 @@ def build_app() -> gr.Blocks:
                         download_status_row, download_status_text,
                     ],
                 )
-                restart_server_btn.click(restart_server_ui, [], [models_status])
                 download_abort_btn.click(
                     download_abort_all_ui,
                     [models_selected_folder_state],
@@ -2633,6 +2783,17 @@ def build_app() -> gr.Blocks:
                             )
 
                         with gr.Group(visible=(cfg.server_mode == "managed")) as managed_server_group:
+                            installed_backend_text = gr.Markdown(_llama_installed_text())
+                            with gr.Row():
+                                llama_backend_dropdown = gr.Dropdown(
+                                    choices=[(b.label, bid) for bid, b in LLAMA_BACKENDS.items()],
+                                    value=LLAMA_DEFAULT_BACKEND,
+                                    show_label=False, container=False, scale=3,
+                                )
+                                install_llama_btn = gr.Button("Install / Reinstall llama.cpp", scale=2)
+                                abort_install_btn = gr.Button("Abort install", scale=1)
+                            with gr.Row(visible=False) as llama_install_status_row:
+                                llama_install_status_text = gr.HTML(container=False)
                             server_port = gr.Number(label="Port (managed mode)", value=cfg.server_port, precision=0)
                             with gr.Row():
                                 n_gpu_layers = gr.Textbox(
@@ -2709,6 +2870,28 @@ def build_app() -> gr.Blocks:
                             ],
                         )
                         verify_external_btn.click(_verify_external_ui, [external_url], [llama_lifecycle_status])
+
+                        _llama_install_status_outputs = [
+                            llama_install_status_row, llama_install_status_text,
+                            llama_lifecycle_status, installed_backend_text,
+                        ]
+                        install_llama_btn.click(
+                            _llama_install_start_ui, [llama_backend_dropdown], [llama_lifecycle_status]
+                        ).then(_llama_install_status_ui, [], _llama_install_status_outputs)
+                        abort_install_btn.click(
+                            _llama_install_abort_ui, [], [llama_lifecycle_status]
+                        ).then(_llama_install_status_ui, [], _llama_install_status_outputs)
+
+                        # Models tab's "Manage llama server" button - wired here,
+                        # not next to its own declaration, because it targets
+                        # settings_tabs/current_settings_subtab_state, neither
+                        # of which exists yet at that earlier point in the
+                        # layout (both are declared just above, inside this
+                        # same Settings tab).
+                        restart_server_btn.click(
+                            _goto_llama_settings_ui, [],
+                            [main_tabs, settings_tabs, current_settings_subtab_state, current_tab_label_state],
+                        )
 
                     with gr.Tab("Hydra", id="hydra-settings") as hydra_settings_tab:
                         gr.Markdown("Not implemented yet.")
@@ -2851,6 +3034,7 @@ def build_app() -> gr.Blocks:
         )
         status_timer.tick(_download_status_ui, [], [download_status_row, download_status_text])
         status_timer.tick(_download_triggered_refresh_ui, [models_selected_folder_state], _models_scan_outputs)
+        status_timer.tick(_llama_install_status_ui, [], _llama_install_status_outputs)
         if cfg.debug_tab_enabled:
             status_timer.tick(get_python_debug_text, [], [debug_python_box])
             status_timer.tick(get_llama_debug_text, [], [debug_llama_box])
@@ -2877,6 +3061,7 @@ def build_app() -> gr.Blocks:
         demo.load(get_status_text, [], [status_bar])
         demo.load(models_refresh_ui, [models_selected_folder_state], _models_scan_outputs)
         demo.load(_download_status_ui, [], [download_status_row, download_status_text])
+        demo.load(_llama_install_status_ui, [], _llama_install_status_outputs)
         demo.load(_settings_gating_ui, [], _settings_gated_tabs)
         # _update_ui_status reads the reachability cache rather than
         # checking fresh (see its own docstring) - chained after (not a

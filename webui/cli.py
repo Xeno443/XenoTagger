@@ -21,13 +21,19 @@ from pathlib import Path
 
 from core import config as config_mod
 from core.client import LlamaClient
+from core.llama_install import BACKENDS, DEFAULT_BACKEND, install, plan_install
 from core.models import resolve_selection, scan_model_variants
 from core.server import ServerError, resolve_server
 
 
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dir", required=True, help="Directory of images to caption")
+    parser.add_argument(
+        "--install-llama", nargs="?", const=DEFAULT_BACKEND, choices=list(BACKENDS), default=None,
+        help=f"Install llama-server.exe for the given backend and exit (default: {DEFAULT_BACKEND}). "
+             f"Choices: {', '.join(BACKENDS)}",
+    )
+    parser.add_argument("--dir", required=False, help="Directory of images to caption")
     parser.add_argument("--recursive", action="store_true", default=None)
     parser.add_argument("--overwrite", action="store_true", default=None)
     parser.add_argument("--trigger-word", default=None)
@@ -82,10 +88,59 @@ def setup_logging(log_file: str | None, debuglog: str | None, verbose: bool) -> 
         root.addHandler(debug_handler)
 
 
+def _install_llama(log: logging.Logger, backend_id: str) -> int:
+    """Synchronous install (no worker thread needed for a one-shot CLI
+    invocation) - logs progress at INFO on phase changes and roughly
+    every 10% of the download, then returns 0/1. Shares core.llama_install
+    with the GUI's Settings -> Llama installer, so both stay in sync."""
+    try:
+        plan = plan_install(backend_id)
+    except Exception as exc:
+        log.error("Could not resolve a download plan for backend %r: %s", backend_id, exc)
+        return 1
+
+    log.info(
+        "Installing llama.cpp %s (%s), %s ...",
+        plan.build_tag, BACKENDS[backend_id].label, plan.main_asset.filename,
+    )
+
+    last_logged_pct = -1
+
+    def on_progress(written: int) -> None:
+        nonlocal last_logged_pct
+        pct = int(written * 100 / max(plan.total_bytes, 1))
+        if pct >= last_logged_pct + 10:
+            last_logged_pct = pct
+            log.info("Downloading: %d%%", pct)
+
+    def on_phase(phase: str) -> None:
+        log.info("%s ...", phase.capitalize())
+
+    try:
+        completed = install(plan, should_abort=lambda: False, on_progress=on_progress, on_phase=on_phase)
+    except Exception as exc:
+        log.error("Install failed: %s", exc)
+        return 1
+
+    if not completed:
+        log.error("Install did not complete.")
+        return 1
+
+    log.info("llama.cpp installed successfully.")
+    return 0
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     setup_logging(args.log_file, args.debuglog, args.verbose)
     log = logging.getLogger("cli")
+
+    if args.install_llama:
+        return _install_llama(log, args.install_llama)
+
+    if not args.dir:
+        log.error("--dir is required (unless using --install-llama)")
+        return 2
 
     cfg = config_mod.load()
     if args.recursive is not None:

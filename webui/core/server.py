@@ -53,7 +53,7 @@ import requests
 from .config import AppConfig
 
 ROOT_DIR = Path(__file__).resolve().parent.parent.parent
-LLAMA_SERVER_EXE = ROOT_DIR / "llama-cuda" / "llama-server.exe"
+LLAMA_SERVER_EXE = ROOT_DIR / "llama" / "llama-server.exe"
 LOG_PATH = ROOT_DIR / "webui" / "logs" / "llama-server.log"
 
 # Managed mode always binds/talks to localhost - it's a subprocess this
@@ -153,7 +153,8 @@ def _start_process(cfg: AppConfig, model_path: Path, mmproj_path: Path) -> subpr
     if not LLAMA_SERVER_EXE.exists():
         raise ServerError(
             f"llama-server.exe not found at {LLAMA_SERVER_EXE}. "
-            f"Run setup-tagger.cmd first."
+            f"Install it from Settings -> Llama in the GUI, or run "
+            f"`tag-cli.cmd --install-llama <backend>` (see --help)."
         )
 
     argv = [

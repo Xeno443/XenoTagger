@@ -39,8 +39,12 @@ if exist "%SYSTEM_DIR%\git\bin\git.exe" (
     if errorlevel 1 goto :fail
 )
 
+call :install_python_deps
+if errorlevel 1 goto :fail
+
 echo.
-echo Done.
+echo Done. To finish setup, install llama.cpp via the GUI's Settings ^>
+echo Llama tab (run-tagger.cmd), or `tag-cli.cmd --install-llama <backend>`.
 pause
 goto :eof
 
@@ -82,6 +86,16 @@ echo Updating pip and its dependencies ...
 "%PYDIR%\python.exe" -m pip install --upgrade pip setuptools wheel packaging build pyproject_hooks colorama
 if errorlevel 1 (
     echo Failed to update pip.
+    exit /b 1
+)
+exit /b 0
+
+:install_python_deps
+echo.
+echo Installing Python dependencies for the tagger UI ...
+"%PYDIR%\python.exe" -m pip install -r "%ROOT%webui\requirements.txt"
+if errorlevel 1 (
+    echo Failed to install Python dependencies.
     exit /b 1
 )
 exit /b 0
