@@ -115,7 +115,10 @@ from core.models import (
     IGNORED_SUBSTRINGS, MODELS_DIR, ModelGroup, format_size, group_models,
     load_curated_models, merge_curated, resolve_selection, scan_all,
 )
-from core.server import LOG_PATH, ManagedServer, ServerError, get_loaded_model_name, is_healthy, resolve_server
+from core.server import (
+    LOG_PATH, ManagedServer, ServerError, ServerStatus, check_status, get_loaded_model_name, is_healthy,
+    resolve_server,
+)
 from ui_css import ALL_CSS
 
 log = logging.getLogger("app")  # fixed name, not __name__ - which is "__main__"
@@ -199,7 +202,185 @@ def _stop_managed() -> None:
         _session["base_url"] = None
 
 
-atexit.register(_stop_managed)
+# Registered from main() (not here, at module level) - this module gets
+# imported directly by scratch/test scripts too (this project's normal
+# testing approach), and an unconditional atexit.register(_stop_managed)
+# at import time meant any such throwaway script that happened to populate
+# _session (e.g. by calling get_client() directly while testing) would kill
+# a real, wanted llama-server the moment the script's own process exited
+# normally - _stop_managed() has no way to tell "a real app instance is
+# shutting down" apart from "some process that imported this module
+# exited", so the fix is to only ever register the hook in the former
+# case. See _setup_debug_logging()'s docstring for the same lesson
+# learned earlier this session, for a lower-stakes case (log truncation
+# rather than killing a real process).
+
+
+# ------------------------------------------------------- Server reachability
+#
+# "Can Single/Batch/Review's Recaption actually work right now" - a single,
+# always-live condition (not a one-time first-run check), reused by
+# _operation_button_states() below to gate those three actions the same way
+# "something else is running" already gates them, and by the startup check
+# (demo.load, near the bottom of build_app) to decide whether to land on
+# the Single-image tab or on Settings with an explanation.
+#
+# "auto" (managed) mode only needs an installed llama.cpp binary - or an
+# already-running server at the configured host:port, which auto mode is
+# always willing to reuse regardless of who started it. The actual lazy
+# server start (or reuse) on the first real caption request stays exactly
+# as it is, untouched by any of this - this section only reads state, never
+# starts/stops anything (see core.server.check_status). "external" mode has
+# no local fallback we control, so it needs an actual live health check -
+# unlike managed, we can't assume it'll come up later just because it's
+# configured.
+#
+# The mode-level categorization (including the base "controllable" -
+# see core.server.ServerStatus) lives in core/server.py's check_status(),
+# which never starts or stops anything, unlike resolve_server(). It's a
+# real network call though (is_healthy), so it's cached here and
+# refreshed on its own slower timer (see reachability_timer, further
+# down) rather than the fast 2s status_timer that drives everything else -
+# no reason to hit the network that often just to keep a button's
+# interactive state current.
+#
+# Whether the Models tab is actually usable is a stricter, session-aware
+# question check_status() can't answer on its own (it has no idea which
+# server, if any, THIS session started) - see _cached_controllable()
+# below for that narrowing, and _refresh_reachability_ui for how it
+# drives the Models tab itself (disabling it, and evicting the user to
+# Settings if they're on it when that happens).
+
+_reachability_lock = threading.RLock()
+_reachability_cache = ServerStatus(reachable=True, controllable=True, healthy=True)  # optimistic default until the first real check
+
+
+def _refresh_reachability_cache() -> ServerStatus:
+    global _reachability_cache
+    result = check_status(current_cfg)
+    with _reachability_lock:
+        _reachability_cache = result
+    return result
+
+
+def _cached_reachable() -> bool:
+    with _reachability_lock:
+        return _reachability_cache.reachable
+
+
+def _is_server_managed_by_us(base_url: str) -> bool:
+    """True if THIS session started (or is otherwise responsible for
+    stopping) whatever's currently answering at base_url - what the status
+    bar calls "managed" rather than "remote". Session-local only; doesn't
+    know about anything from a previous app run (see core/server.py's
+    docstring on why that's on purpose)."""
+    managed = _session.get("managed")
+    connected = _session.get("client") is not None and _session.get("base_url") == base_url
+    return connected and managed is not None
+
+
+def _cached_controllable() -> bool:
+    """Whether the Models tab should be usable right now - stricter than
+    ServerStatus.controllable's mode-level check (see its docstring):
+    external mode is never controllable, same as before, but a healthy
+    auto-mode server also has to be one THIS session started. A healthy
+    server we merely reused (leftover from a previous run, or started by
+    hand) might be running any model at all, and there's no reliable way
+    to tell - see the module docstring's note on the removed PID-tracking
+    approach - so it's treated the same as external mode: not ours to
+    manage. A not-yet-running auto-mode server stays controllable, since
+    starting it fresh would use whatever we pick."""
+    with _reachability_lock:
+        status = _reachability_cache
+    if not status.controllable:
+        return False
+    cfg = current_cfg
+    if cfg.server_mode == "auto" and status.healthy:
+        base_url = f"http://{cfg.server_host}:{cfg.server_port}"
+        return _is_server_managed_by_us(base_url)
+    return True
+
+
+_last_known_controllable = True  # matches the optimistic cache default above
+_last_known_reachable = True  # matches the optimistic cache default above
+
+
+def _note_controllable_transition(controllable: bool) -> None:
+    """Fires exactly one gr.Info the moment the Models tab becomes
+    unusable (not on every reachability_timer tick for as long as it stays
+    that way), whether that's discovered at startup or later."""
+    global _last_known_controllable
+    if not controllable and _last_known_controllable:
+        gr.Info(
+            "Model management is disabled: the active llama-server isn't one this app "
+            "started, so what it currently has loaded isn't something the Models tab can "
+            "show you or change."
+        )
+    _last_known_controllable = controllable
+
+
+def _note_reachable_transition(reachable: bool, reason: str) -> None:
+    """Fires exactly one gr.Warning the moment Single/Batch/Recaption
+    become unusable (not on every reachability_timer tick for as long as
+    it stays that way), whether that's discovered at startup or later."""
+    global _last_known_reachable
+    if not reachable and _last_known_reachable:
+        gr.Warning(f"No captioning server is reachable - {reason} Set it up on the Settings tab.")
+    _last_known_reachable = reachable
+
+
+def _refresh_reachability_ui(current_tab_label: str):
+    """Wired to reachability_timer.tick(). Refreshes the cache (picked up
+    by the next status_timer tick for Single/Batch/Recaption's own Run/
+    Recaption BUTTON gating, see the cache's own comment above) and
+    separately updates three TABS themselves: Models (disabled unless
+    controllable - see _cached_controllable) and Single-image/Batch
+    processing (disabled unless reachable at all - captioning there is
+    pointless, not just "not ours to redirect", the moment nothing can
+    answer). If the user is on one of these when it becomes disabled,
+    pushes them off to Settings rather than leaving them stranded on a tab
+    they can no longer switch back into. Never touches main_tabs'
+    selection otherwise, so it can't yank anyone off Review mid-task -
+    Review's own filesystem-only nav doesn't need a server at all (see
+    _operation_button_states' docstring), so its tab stays reachable
+    regardless; only its Recaption button is gated, same as Single/Batch's
+    Run buttons."""
+    status = _refresh_reachability_cache()
+    controllable = _cached_controllable()
+    _note_controllable_transition(controllable)
+    _note_reachable_transition(status.reachable, status.reason)
+    models_tab_update = gr.update(interactive=controllable)
+    single_batch_update = gr.update(interactive=status.reachable)
+    push_to_settings = (not controllable and current_tab_label == "Models") or (
+        not status.reachable and current_tab_label in ("Single image", "Batch processing")
+    )
+    tabs_update = gr.update(selected="settings") if push_to_settings else gr.update()
+    return models_tab_update, single_batch_update, single_batch_update, tabs_update
+
+
+def _on_main_tab_select(evt: gr.SelectData) -> str:
+    """Wired to main_tabs.select() - see current_tab_label_state's own
+    comment for why this is tracked at all."""
+    return evt.value
+
+
+def _startup_reachability_ui():
+    """Wired to demo.load() - decides which tab a freshly-loaded page
+    lands on, and the Models/Single-image/Batch-processing tabs' initial
+    interactive state (see _refresh_reachability_ui, which this shares its
+    per-tab logic with). A real (not cached) check, since the optimistic
+    default cache value would otherwise land everyone on Single-image once
+    with everything enabled, even on a machine where nothing's been set up
+    yet."""
+    status = _refresh_reachability_cache()
+    controllable = _cached_controllable()
+    _note_controllable_transition(controllable)
+    _note_reachable_transition(status.reachable, status.reason)
+    models_tab_update = gr.update(interactive=controllable)
+    single_batch_update = gr.update(interactive=status.reachable)
+    if status.reachable:
+        return gr.update(selected="single"), models_tab_update, single_batch_update, single_batch_update
+    return gr.update(selected="settings"), models_tab_update, single_batch_update, single_batch_update
 
 
 # ------------------------------------------------------ Operation tracking
@@ -347,6 +528,15 @@ def _operation_button_states():
     it needs to be visibly disabled the same way, not just refuse with a
     message after being clicked.
 
+    All three Run/Recaption buttons are ALSO blocked when no server is
+    reachable right now (_cached_reachable(), see the Server reachability
+    section above) - starting a caption request when there's nothing to
+    answer it is exactly as pointless as starting a second operation
+    while one's already running, so it's gated the same way. This is why
+    the check is cached rather than computed fresh here: it involves a
+    real network call for external mode, and this function runs on every
+    2s status_timer tick.
+
     Review's OTHER nav (prev/next/table/dir/browse/scan), though, is
     pure filesystem/UI - scanning or browsing a folder doesn't touch the
     llama-server at all, so there's no real conflict with a Single/Batch
@@ -363,15 +553,16 @@ def _operation_button_states():
     review_prev_btn, review_next_btn, review_table, review_dir,
     review_browse_btn, review_scan_btn).
     """
+    reachable = _cached_reachable()
     with _operation_lock:
         op = _active_operation
-        single_blocked = op is not None and op.kind != "single"
+        single_blocked = (op is not None and op.kind != "single") or not reachable
         single_running = op is not None and op.kind == "single"
         single_label, single_ok = _interrupt_label_state(op, "single")
-        batch_blocked = op is not None and op.kind != "batch"
+        batch_blocked = (op is not None and op.kind != "batch") or not reachable
         batch_running = op is not None and op.kind == "batch"
         batch_label, batch_ok = _interrupt_label_state(op, "batch")
-        review_blocked = op is not None and op.kind != "review"
+        review_blocked = (op is not None and op.kind != "review") or not reachable
         review_running = op is not None and op.kind == "review"
         review_label, review_ok = _interrupt_label_state(op, "review")
         review_nav = _REVIEW_NAV_BUSY if review_running else _REVIEW_NAV_IDLE
@@ -1266,13 +1457,23 @@ _ACTION_BTN_LABELS = {"set_active": "Set as active model", "download": "Download
 
 
 def _action_mode_for_selection(
-    group: Optional[ModelGroup], quant_value: Optional[str], mmproj_value: Optional[str]
+    group: Optional[ModelGroup], quant_value: Optional[str], mmproj_value: Optional[str], controllable: bool = True
 ) -> str:
     """"set_active" (both selections already local), "download" (either
-    isn't), or "disabled" (nothing valid selected) - single source of
-    truth for both the action button's label (_models_dropdown_updates)
-    and models_action_ui's click dispatch, so the two can never silently
-    disagree about what a given selection means."""
+    isn't), or "disabled" (nothing valid selected, or controllable is
+    False) - single source of truth for both the action button's label
+    (_models_dropdown_updates) and models_action_ui's click dispatch, so
+    the two can never silently disagree about what a given selection
+    means.
+
+    controllable (see app.py's _cached_controllable) gates the whole
+    Models tab, download included: if the active connection isn't one
+    this app manages, there's no server the user could ever point at
+    something downloaded here either - see _cached_controllable's own
+    docstring for why "not ours" and "might already be running the wrong
+    model" are the same condition."""
+    if not controllable:
+        return "disabled"
     if group is None or not quant_value or quant_value == "N/A" or mmproj_value == "N/A":
         return "disabled"
     quant_local = any(q.name == quant_value for q in group.quants)
@@ -1307,7 +1508,7 @@ def models_selection_change_ui(groups: list[ModelGroup], quant_name: str, mmproj
     screen, which correctly resolves to "disabled" here rather than
     crashing or showing something wrong."""
     group = _group_for_quant_value(groups, quant_name)
-    mode = _action_mode_for_selection(group, quant_name, mmproj_name)
+    mode = _action_mode_for_selection(group, quant_name, mmproj_name, _cached_controllable())
     return _action_button_update(mode)
 
 
@@ -1419,7 +1620,7 @@ def _models_dropdown_updates(
         mmproj_value = preferred_mmproj if preferred_mmproj in mmproj_values else mmproj_values[0]
         mmproj_update = gr.update(choices=mmproj_pairs, value=mmproj_value, interactive=True)
 
-    mode = _action_mode_for_selection(group, quant_value, mmproj_value)
+    mode = _action_mode_for_selection(group, quant_value, mmproj_value, _cached_controllable())
     return quant_update, mmproj_update, _action_button_update(mode)
 
 
@@ -1485,6 +1686,11 @@ def models_set_active_ui(groups: list[ModelGroup], quant_name: str, mmproj_name:
     a not-yet-downloaded pick (that's models_download_ui's job now)."""
     global current_cfg
     noop = (gr.update(), gr.update(), gr.update())
+    if not _cached_controllable():
+        return _models_table_rows(groups), *noop, (
+            "Model selection has no effect right now - connected to a server this app doesn't control "
+            "(external mode, or an unrecognized server already using the managed port)."
+        )
     if not quant_name or quant_name == "N/A":
         return _models_table_rows(groups), *noop, "No model selected — click a row in the table first."
 
@@ -1581,7 +1787,7 @@ def models_action_ui(groups: list[ModelGroup], quant_name: str, mmproj_name: str
     _action_mode_for_selection) and dispatches to it, then refreshes the
     download-status row too in case this action changed the queue."""
     group = _group_for_quant_value(groups, quant_name)
-    mode = _action_mode_for_selection(group, quant_name, mmproj_name)
+    mode = _action_mode_for_selection(group, quant_name, mmproj_name, _cached_controllable())
     if mode == "download":
         table_u, quant_u, mmproj_u, action_u, status = models_download_ui(groups, quant_name, mmproj_name)
     else:
@@ -1600,17 +1806,16 @@ def _display_base_url() -> str:
 
 
 def _server_status_text(base_url: str, healthy: bool) -> str:
-    # Just "managed" (we started it) vs "remote" (already running somewhere
-    # - local-but-not-ours, external mode, doesn't matter which) - the
-    # adjacent "Model: n/a" already covers unhealthy/crashed, so a third
-    # state for that here would just be saying the same thing twice.
+    # Just "managed" (we started it, this session) vs "remote" (already
+    # running somewhere - reused without starting it, or external mode,
+    # doesn't matter which) - the adjacent "Model: n/a" already covers
+    # unhealthy/crashed, so a third state for that here would just be
+    # saying the same thing twice.
     cfg = current_cfg
     if cfg.server_mode == "external":
         return "remote"
 
-    managed = _session.get("managed")
-    connected = _session.get("client") is not None and _session.get("base_url") == base_url
-    if connected and managed is not None:
+    if _is_server_managed_by_us(base_url):
         return "managed"
     return "remote" if healthy else "stopped"
 
@@ -1672,365 +1877,393 @@ def build_app() -> gr.Blocks:
     with gr.Blocks(title="XenoTagger", analytics_enabled=False) as demo:
         gr.Markdown("# XenoTagger — LoRA dataset captioning")
 
-        with gr.Tab("Single image") as single_tab:
-            with gr.Row(equal_height=True):
-                with gr.Column():
-                    single_image = gr.Image(
-                        type="filepath", label="Image", sources=["upload"]
-                    )
-                with gr.Column():
-                    single_trigger = gr.Textbox(
+        # Declared up front, outside main_tabs (rather than down by the
+        # rest of the reachability wiring, where it's used more locally) -
+        # save_settings_btn's click handler, inside the Settings tab body
+        # below, needs it as an input too, see that .then() call. Must NOT
+        # be declared as a direct child of `with gr.Tabs()` even though
+        # gr.State has no DOM footprint of its own and Gradio's own
+        # validation explicitly allows it there (see Tabs.__exit__) -
+        # confirmed live that doing so still corrupts the rendered tab
+        # strip (labels duplicating/shifting on click), so it's declared
+        # here instead, before main_tabs even opens.
+        current_tab_label_state = gr.State("Single image")
+
+        with gr.Tabs() as main_tabs:
+            with gr.Tab("Single image", id="single") as single_tab:
+                with gr.Row(equal_height=True):
+                    with gr.Column():
+                        single_image = gr.Image(
+                            type="filepath", label="Image", sources=["upload"]
+                        )
+                    with gr.Column():
+                        single_trigger = gr.Textbox(
+                            label="Trigger word",
+                            value=cfg.trigger_word,
+                        )
+                        single_caption = gr.Textbox(
+                            label="Caption", lines=20, interactive=True
+                        )
+                # Confirmed live: a Row of exactly two plain gr.Column()s (no
+                # CSS at all) aligns correctly with Row A above. So instead of
+                # stacking Caption/Interrupt inside one shared Column (which
+                # needed CSS overrides that threw alignment off), each gets
+                # its OWN Column, and it's the whole COLUMN's visibility that
+                # toggles - not just the button inside it. At any moment
+                # exactly two of these three Columns are visible (Caption+Save
+                # idle, Interrupt+Save running) - always that same proven
+                # "Row of two plain Columns" shape, whichever two they are.
+                with gr.Row():
+                    with gr.Column() as single_run_col:
+                        single_run_btn = gr.Button("Caption", variant="primary")
+                    # Separate component from single_run_btn on purpose - see
+                    # the Operation tracking section: an Interrupt that shares
+                    # the same button/event as the long-running call would sit
+                    # queued behind it and never actually reach the server
+                    # while captioning is in flight.
+                    with gr.Column(visible=False) as single_interrupt_col:
+                        single_interrupt_btn = gr.Button("Interrupt", variant="stop")
+                    with gr.Column():
+                        single_save_btn = gr.Button("Save caption", interactive=False)
+                single_status = gr.Textbox(show_label=False, container=False, interactive=False)
+
+                single_run_btn.click(
+                    run_single_ui,
+                    [single_image, single_trigger],
+                    [
+                        single_caption, single_status,
+                        single_run_btn, single_run_col, single_interrupt_col, single_interrupt_btn,
+                    ],
+                )
+                single_interrupt_btn.click(interrupt_single_ui, [], [single_interrupt_btn])
+                single_save_btn.click(
+                    save_single_ui, [single_image, single_caption], [single_status]
+                )
+                single_caption.change(
+                    lambda text: gr.update(interactive=bool(text.strip())),
+                    [single_caption], [single_save_btn],
+                )
+                single_image.change(clear_single_result_ui, [], [single_caption, single_status])
+
+            with gr.Tab("Batch processing") as batch_tab:
+                with gr.Row():
+                    batch_dir = gr.Textbox(label="Directory of images", scale=4)
+                    batch_browse_btn = gr.Button("Browse...", scale=1)
+
+                with gr.Row():
+                    batch_trigger = gr.Textbox(
                         label="Trigger word",
                         value=cfg.trigger_word,
                     )
-                    single_caption = gr.Textbox(
-                        label="Caption", lines=20, interactive=True
+                    with gr.Column():
+                        batch_recursive = gr.Checkbox(label="Recursive", value=cfg.recursive_batch)
+                        batch_overwrite = gr.Checkbox(
+                            label="Overwrite existing captions", value=cfg.overwrite_existing
+                        )
+
+                # Same two-Column swap as the Single-image tab (see that tab
+                # and app.py's own module docstring for why: a Row of two
+                # plain gr.Column()s is the only thing confirmed to align
+                # predictably, no CSS needed) - kept here for consistency even
+                # though this row has no third sibling to misalign against.
+                with gr.Row():
+                    with gr.Column() as batch_run_col:
+                        batch_run_btn = gr.Button("Run batch", variant="primary")
+                    with gr.Column(visible=False) as batch_interrupt_col:
+                        batch_interrupt_btn = gr.Button("Interrupt", variant="stop")
+
+                with gr.Row():
+                    batch_last_image = gr.Image(
+                        label="Preview", interactive=False, show_label=False,
+                        buttons=[],
                     )
-            # Confirmed live: a Row of exactly two plain gr.Column()s (no
-            # CSS at all) aligns correctly with Row A above. So instead of
-            # stacking Caption/Interrupt inside one shared Column (which
-            # needed CSS overrides that threw alignment off), each gets
-            # its OWN Column, and it's the whole COLUMN's visibility that
-            # toggles - not just the button inside it. At any moment
-            # exactly two of these three Columns are visible (Caption+Save
-            # idle, Interrupt+Save running) - always that same proven
-            # "Row of two plain Columns" shape, whichever two they are.
-            with gr.Row():
-                with gr.Column() as single_run_col:
-                    single_run_btn = gr.Button("Caption", variant="primary")
-                # Separate component from single_run_btn on purpose - see
-                # the Operation tracking section: an Interrupt that shares
-                # the same button/event as the long-running call would sit
-                # queued behind it and never actually reach the server
-                # while captioning is in flight.
-                with gr.Column(visible=False) as single_interrupt_col:
-                    single_interrupt_btn = gr.Button("Interrupt", variant="stop")
-                with gr.Column():
-                    single_save_btn = gr.Button("Save caption", interactive=False)
-            single_status = gr.Textbox(show_label=False, container=False, interactive=False)
+                    with gr.Column():
+                        batch_last_file = gr.Textbox(label="Last file processed", interactive=False)
+                        batch_last_caption = gr.Textbox(label="Last caption created", interactive=False)
 
-            single_run_btn.click(
-                run_single_ui,
-                [single_image, single_trigger],
-                [
-                    single_caption, single_status,
-                    single_run_btn, single_run_col, single_interrupt_col, single_interrupt_btn,
-                ],
-            )
-            single_interrupt_btn.click(interrupt_single_ui, [], [single_interrupt_btn])
-            single_save_btn.click(
-                save_single_ui, [single_image, single_caption], [single_status]
-            )
-            single_caption.change(
-                lambda text: gr.update(interactive=bool(text.strip())),
-                [single_caption], [single_save_btn],
-            )
-            single_image.change(clear_single_result_ui, [], [single_caption, single_status])
+                batch_status = gr.Textbox(show_label=False, container=False, interactive=False)
 
-        with gr.Tab("Batch processing") as batch_tab:
-            with gr.Row():
-                batch_dir = gr.Textbox(label="Directory of images", scale=4)
-                batch_browse_btn = gr.Button("Browse...", scale=1)
-
-            with gr.Row():
-                batch_trigger = gr.Textbox(
-                    label="Trigger word",
-                    value=cfg.trigger_word,
-                )
-                with gr.Column():
-                    batch_recursive = gr.Checkbox(label="Recursive", value=cfg.recursive_batch)
-                    batch_overwrite = gr.Checkbox(
-                        label="Overwrite existing captions", value=cfg.overwrite_existing
-                    )
-
-            # Same two-Column swap as the Single-image tab (see that tab
-            # and app.py's own module docstring for why: a Row of two
-            # plain gr.Column()s is the only thing confirmed to align
-            # predictably, no CSS needed) - kept here for consistency even
-            # though this row has no third sibling to misalign against.
-            with gr.Row():
-                with gr.Column() as batch_run_col:
-                    batch_run_btn = gr.Button("Run batch", variant="primary")
-                with gr.Column(visible=False) as batch_interrupt_col:
-                    batch_interrupt_btn = gr.Button("Interrupt", variant="stop")
-
-            with gr.Row():
-                batch_last_image = gr.Image(
-                    label="Preview", interactive=False, show_label=False,
-                    buttons=[],
-                )
-                with gr.Column():
-                    batch_last_file = gr.Textbox(label="Last file processed", interactive=False)
-                    batch_last_caption = gr.Textbox(label="Last caption created", interactive=False)
-
-            batch_status = gr.Textbox(show_label=False, container=False, interactive=False)
-
-            batch_browse_btn.click(browse_directory_ui, [batch_dir], [batch_dir])
-            batch_run_btn.click(
-                run_batch_ui,
-                [batch_dir, batch_recursive, batch_overwrite, batch_trigger],
-                [
-                    batch_status, batch_last_file, batch_last_image, batch_last_caption,
-                    batch_run_btn, batch_run_col, batch_interrupt_col, batch_interrupt_btn,
-                ],
-            )
-            batch_interrupt_btn.click(interrupt_batch_ui, [], [batch_interrupt_btn])
-
-        with gr.Tab("Review") as review_tab:
-            with gr.Row():
-                review_dir = gr.Textbox(label="Directory of images", scale=4)
-                with gr.Column(scale=1, min_width=120):
-                    review_browse_btn = gr.Button("Browse...")
-                    review_scan_btn = gr.Button("Scan")
-
-            with gr.Row(equal_height=True):
-                review_prev_btn = gr.Button("←", scale=1, min_width=60)
-                review_image = gr.Image(
-                    label="Image", interactive=False, show_label=False, buttons=[], scale=8, height=480,
-                )
-                review_next_btn = gr.Button("→", scale=1, min_width=60)
-
-            with gr.Row():
-                with gr.Column() as review_recaption_col:
-                    review_recaption_btn = gr.Button("Recaption")
-                # Separate component from review_recaption_btn on purpose,
-                # same reasoning as every other Interrupt in this app - see
-                # the Operation tracking section.
-                with gr.Column(visible=False) as review_interrupt_col:
-                    review_interrupt_btn = gr.Button("Interrupt", variant="stop")
-
-            review_caption = gr.Textbox(label="Caption", lines=4, interactive=True)
-
-            review_table = gr.Dataframe(
-                headers=["File", "Status"], datatype=["str", "str"],
-                interactive=False, row_count=(0, "dynamic"), buttons=[],
-            )
-
-            review_status = gr.Textbox(show_label=False, container=False, interactive=False)
-
-            # See the Review tab's handler-function docstrings above for
-            # what each of these three actually holds.
-            review_items_state = gr.State([])
-            review_index_state = gr.State(-1)
-            review_loaded_caption_state = gr.State("")
-
-            _review_nav_outputs = [
-                review_status, review_items_state, review_index_state, review_loaded_caption_state,
-                review_image, review_caption, review_table,
-            ]
-            review_browse_btn.click(browse_directory_ui, [review_dir], [review_dir])
-            review_scan_btn.click(review_scan_ui, [review_dir], _review_nav_outputs)
-            review_prev_btn.click(
-                review_prev_ui,
-                [review_items_state, review_index_state, review_loaded_caption_state, review_caption],
-                _review_nav_outputs,
-            )
-            review_next_btn.click(
-                review_next_ui,
-                [review_items_state, review_index_state, review_loaded_caption_state, review_caption],
-                _review_nav_outputs,
-            )
-            review_table.select(
-                review_table_select_ui,
-                [review_items_state, review_index_state, review_loaded_caption_state, review_caption],
-                _review_nav_outputs,
-            )
-            review_recaption_btn.click(
-                review_recaption_ui,
-                [review_items_state, review_index_state, review_caption],
-                [
-                    review_caption, review_status,
-                    review_recaption_col, review_interrupt_col, review_interrupt_btn,
-                    review_prev_btn, review_next_btn, review_table,
-                    review_dir, review_browse_btn, review_scan_btn,
-                ],
-            )
-            review_interrupt_btn.click(interrupt_review_ui, [], [review_interrupt_btn])
-
-        with gr.Tab("Models"):
-            gr.Markdown(
-                config_mod.MODELS_TAB_INTRO.format(ignored_substrings=", ".join(IGNORED_SUBSTRINGS))
-            )
-            models_table = gr.Dataframe(
-                headers=["A", "Model", "Source", "Quants"], datatype=["str", "str", "str", "str"],
-                interactive=False, row_count=(0, "dynamic"),
-            )
-            with gr.Row():
-                # allow_custom_value=True is load-bearing, not cosmetic: it
-                # skips Gradio's strict "submitted value must be in the
-                # current choices" check, which otherwise crashes the whole
-                # request when a table-row switch reprograms these dropdowns'
-                # choices at the same moment a .change() event from the old
-                # row is still in flight (see the Models tab handlers' own
-                # comment block below for the full story). Our own handlers
-                # already treat an unrecognized value as "not selected" -
-                # this only removes Gradio's redundant, crash-prone copy of
-                # that same check.
-                models_quant_dropdown = gr.Dropdown(label="Quant", interactive=False, allow_custom_value=True)
-                models_mmproj_dropdown = gr.Dropdown(label="mmproj", interactive=False, allow_custom_value=True)
-            with gr.Row():
-                models_action_btn = gr.Button("Set as active model", variant="primary", interactive=False)
-                restart_server_btn = gr.Button("Restart server connection")
-                refresh_models_btn = gr.Button("Refresh")
-            with gr.Row(visible=False) as download_status_row:
-                download_status_text = gr.HTML(container=False, scale=4)
-                download_abort_btn = gr.Button("Abort all downloads", scale=1)
-            models_status = gr.Textbox(show_label=False, container=False, interactive=False)
-
-            # See this tab's own handler-function docstrings above for what
-            # each of these two actually holds.
-            models_groups_state = gr.State([])
-            models_selected_folder_state = gr.State(None)
-
-            _models_scan_outputs = [
-                models_table, models_groups_state, models_selected_folder_state,
-                models_quant_dropdown, models_mmproj_dropdown, models_action_btn, models_status,
-            ]
-            refresh_models_btn.click(models_refresh_ui, [models_selected_folder_state], _models_scan_outputs)
-            models_table.select(
-                models_table_select_ui,
-                [models_groups_state],
-                [
-                    models_selected_folder_state, models_quant_dropdown, models_mmproj_dropdown,
-                    models_action_btn, models_status,
-                ],
-            )
-            models_action_btn.click(
-                models_action_ui,
-                [models_groups_state, models_quant_dropdown, models_mmproj_dropdown],
-                [
-                    models_table, models_quant_dropdown, models_mmproj_dropdown, models_action_btn, models_status,
-                    download_status_row, download_status_text,
-                ],
-            )
-            restart_server_btn.click(restart_server_ui, [], [models_status])
-            download_abort_btn.click(
-                download_abort_all_ui,
-                [models_selected_folder_state],
-                [*_models_scan_outputs, download_status_row, download_status_text],
-            )
-            models_quant_dropdown.change(
-                models_selection_change_ui,
-                [models_groups_state, models_quant_dropdown, models_mmproj_dropdown],
-                [models_action_btn],
-            )
-            models_mmproj_dropdown.change(
-                models_selection_change_ui,
-                [models_groups_state, models_quant_dropdown, models_mmproj_dropdown],
-                [models_action_btn],
-            )
-
-        with gr.Tab("Settings"):
-            with gr.Group():
-                gr.Markdown("### llama-server")
-                server_mode = gr.Radio(
-                    choices=[
-                        (
-                            "Auto - use an already-running server if there is one; "
-                            "otherwise start llama-server.exe and stop it again when done",
-                            "auto",
-                        ),
-                        (
-                            "External - always connect to a server you start yourself, "
-                            "possibly on a different machine",
-                            "external",
-                        ),
+                batch_browse_btn.click(browse_directory_ui, [batch_dir], [batch_dir])
+                batch_run_btn.click(
+                    run_batch_ui,
+                    [batch_dir, batch_recursive, batch_overwrite, batch_trigger],
+                    [
+                        batch_status, batch_last_file, batch_last_image, batch_last_caption,
+                        batch_run_btn, batch_run_col, batch_interrupt_col, batch_interrupt_btn,
                     ],
-                    value=cfg.server_mode,
-                    label="Server mode",
+                )
+                batch_interrupt_btn.click(interrupt_batch_ui, [], [batch_interrupt_btn])
+
+            with gr.Tab("Review") as review_tab:
+                with gr.Row():
+                    review_dir = gr.Textbox(label="Directory of images", scale=4)
+                    with gr.Column(scale=1, min_width=120):
+                        review_browse_btn = gr.Button("Browse...")
+                        review_scan_btn = gr.Button("Scan")
+
+                with gr.Row(equal_height=True):
+                    review_prev_btn = gr.Button("←", scale=1, min_width=60)
+                    review_image = gr.Image(
+                        label="Image", interactive=False, show_label=False, buttons=[], scale=8, height=480,
+                    )
+                    review_next_btn = gr.Button("→", scale=1, min_width=60)
+
+                with gr.Row():
+                    with gr.Column() as review_recaption_col:
+                        review_recaption_btn = gr.Button("Recaption")
+                    # Separate component from review_recaption_btn on purpose,
+                    # same reasoning as every other Interrupt in this app - see
+                    # the Operation tracking section.
+                    with gr.Column(visible=False) as review_interrupt_col:
+                        review_interrupt_btn = gr.Button("Interrupt", variant="stop")
+
+                review_caption = gr.Textbox(label="Caption", lines=4, interactive=True)
+
+                review_table = gr.Dataframe(
+                    headers=["File", "Status"], datatype=["str", "str"],
+                    interactive=False, row_count=(0, "dynamic"), buttons=[],
+                )
+
+                review_status = gr.Textbox(show_label=False, container=False, interactive=False)
+
+                # See the Review tab's handler-function docstrings above for
+                # what each of these three actually holds.
+                review_items_state = gr.State([])
+                review_index_state = gr.State(-1)
+                review_loaded_caption_state = gr.State("")
+
+                _review_nav_outputs = [
+                    review_status, review_items_state, review_index_state, review_loaded_caption_state,
+                    review_image, review_caption, review_table,
+                ]
+                review_browse_btn.click(browse_directory_ui, [review_dir], [review_dir])
+                review_scan_btn.click(review_scan_ui, [review_dir], _review_nav_outputs)
+                review_prev_btn.click(
+                    review_prev_ui,
+                    [review_items_state, review_index_state, review_loaded_caption_state, review_caption],
+                    _review_nav_outputs,
+                )
+                review_next_btn.click(
+                    review_next_ui,
+                    [review_items_state, review_index_state, review_loaded_caption_state, review_caption],
+                    _review_nav_outputs,
+                )
+                review_table.select(
+                    review_table_select_ui,
+                    [review_items_state, review_index_state, review_loaded_caption_state, review_caption],
+                    _review_nav_outputs,
+                )
+                review_recaption_btn.click(
+                    review_recaption_ui,
+                    [review_items_state, review_index_state, review_caption],
+                    [
+                        review_caption, review_status,
+                        review_recaption_col, review_interrupt_col, review_interrupt_btn,
+                        review_prev_btn, review_next_btn, review_table,
+                        review_dir, review_browse_btn, review_scan_btn,
+                    ],
+                )
+                review_interrupt_btn.click(interrupt_review_ui, [], [review_interrupt_btn])
+
+            with gr.Tab("Models") as models_tab:
+                gr.Markdown(
+                    config_mod.MODELS_TAB_INTRO.format(ignored_substrings=", ".join(IGNORED_SUBSTRINGS))
+                )
+                models_table = gr.Dataframe(
+                    headers=["A", "Model", "Source", "Quants"], datatype=["str", "str", "str", "str"],
+                    interactive=False, row_count=(0, "dynamic"),
                 )
                 with gr.Row():
-                    server_host = gr.Textbox(label="Host (auto mode)", value=cfg.server_host)
-                    server_port = gr.Number(label="Port (auto mode)", value=cfg.server_port, precision=0)
-                external_url = gr.Textbox(
-                    label="External server URL (external mode)", value=cfg.external_url
-                )
+                    # allow_custom_value=True is load-bearing, not cosmetic: it
+                    # skips Gradio's strict "submitted value must be in the
+                    # current choices" check, which otherwise crashes the whole
+                    # request when a table-row switch reprograms these dropdowns'
+                    # choices at the same moment a .change() event from the old
+                    # row is still in flight (see the Models tab handlers' own
+                    # comment block below for the full story). Our own handlers
+                    # already treat an unrecognized value as "not selected" -
+                    # this only removes Gradio's redundant, crash-prone copy of
+                    # that same check.
+                    models_quant_dropdown = gr.Dropdown(label="Quant", interactive=False, allow_custom_value=True)
+                    models_mmproj_dropdown = gr.Dropdown(label="mmproj", interactive=False, allow_custom_value=True)
                 with gr.Row():
-                    n_gpu_layers = gr.Textbox(
-                        label="GPU layers ('auto', 'all', or an exact number)",
-                        value=cfg.n_gpu_layers,
-                    )
-                    context_size = gr.Number(label="Context size", value=cfg.context_size, precision=0)
-                extra_server_args = gr.Textbox(
-                    label="Extra llama-server arguments", value=cfg.extra_server_args
+                    models_action_btn = gr.Button("Set as active model", variant="primary", interactive=False)
+                    restart_server_btn = gr.Button("Restart server connection")
+                    refresh_models_btn = gr.Button("Refresh")
+                with gr.Row(visible=False) as download_status_row:
+                    download_status_text = gr.HTML(container=False, scale=4)
+                    download_abort_btn = gr.Button("Abort all downloads", scale=1)
+                models_status = gr.Textbox(show_label=False, container=False, interactive=False)
+
+                # See this tab's own handler-function docstrings above for what
+                # each of these two actually holds.
+                models_groups_state = gr.State([])
+                models_selected_folder_state = gr.State(None)
+
+                _models_scan_outputs = [
+                    models_table, models_groups_state, models_selected_folder_state,
+                    models_quant_dropdown, models_mmproj_dropdown, models_action_btn, models_status,
+                ]
+                refresh_models_btn.click(models_refresh_ui, [models_selected_folder_state], _models_scan_outputs)
+                models_table.select(
+                    models_table_select_ui,
+                    [models_groups_state],
+                    [
+                        models_selected_folder_state, models_quant_dropdown, models_mmproj_dropdown,
+                        models_action_btn, models_status,
+                    ],
+                )
+                models_action_btn.click(
+                    models_action_ui,
+                    [models_groups_state, models_quant_dropdown, models_mmproj_dropdown],
+                    [
+                        models_table, models_quant_dropdown, models_mmproj_dropdown, models_action_btn, models_status,
+                        download_status_row, download_status_text,
+                    ],
+                )
+                restart_server_btn.click(restart_server_ui, [], [models_status])
+                download_abort_btn.click(
+                    download_abort_all_ui,
+                    [models_selected_folder_state],
+                    [*_models_scan_outputs, download_status_row, download_status_text],
+                )
+                models_quant_dropdown.change(
+                    models_selection_change_ui,
+                    [models_groups_state, models_quant_dropdown, models_mmproj_dropdown],
+                    [models_action_btn],
+                )
+                models_mmproj_dropdown.change(
+                    models_selection_change_ui,
+                    [models_groups_state, models_quant_dropdown, models_mmproj_dropdown],
+                    [models_action_btn],
                 )
 
-            with gr.Group():
-                gr.Markdown("### Generation")
-                prompt_template = gr.Textbox(
-                    label="Prompt template", value=cfg.prompt_template, lines=4
-                )
+            with gr.Tab("Settings", id="settings"):
+                with gr.Tabs():
+                    with gr.Tab("Llama"):
+                        with gr.Group():
+                            server_mode = gr.Radio(
+                                choices=[
+                                    (
+                                        "Managed: the llama server is managed by the UI, model management enabled",
+                                        "auto",
+                                    ),
+                                    (
+                                        "External: the llama server is managed by the user",
+                                        "external",
+                                    ),
+                                ],
+                                value=cfg.server_mode,
+                                label="Server mode",
+                                elem_id="server-mode-radio",
+                            )
+                            with gr.Row():
+                                server_host = gr.Textbox(label="Host (auto mode)", value=cfg.server_host)
+                                server_port = gr.Number(label="Port (auto mode)", value=cfg.server_port, precision=0)
+                            external_url = gr.Textbox(
+                                label="External server URL (external mode)", value=cfg.external_url
+                            )
+                            with gr.Row():
+                                n_gpu_layers = gr.Textbox(
+                                    label="GPU layers ('auto', 'all', or an exact number)",
+                                    value=cfg.n_gpu_layers,
+                                )
+                                context_size = gr.Number(label="Context size", value=cfg.context_size, precision=0)
+                            extra_server_args = gr.Textbox(
+                                label="Extra llama-server arguments", value=cfg.extra_server_args
+                            )
+
+                        with gr.Group():
+                            prompt_template = gr.Textbox(
+                                label="Prompt template", value=cfg.prompt_template, lines=4
+                            )
+                            with gr.Row():
+                                temperature = gr.Slider(0.0, 2.0, value=cfg.temperature, label="Temperature")
+                                top_p = gr.Slider(0.0, 1.0, value=cfg.top_p, label="Top-p")
+                                max_tokens = gr.Number(label="Max tokens", value=cfg.max_tokens, precision=0)
+                            request_timeout = gr.Number(
+                                label="Request timeout (seconds)", value=cfg.request_timeout, precision=0
+                            )
+
+                    with gr.Tab("Hydra"):
+                        gr.Markdown("Not implemented yet.")
+
+                    with gr.Tab("Image resizing"):
+                        with gr.Group():
+                            resize_enabled = gr.Checkbox(
+                                label="Downscale oversized images before sending to the model",
+                                value=cfg.resize_enabled,
+                            )
+                            resize_target_mp = gr.Slider(
+                                0.1, 4.0, value=cfg.resize_target_mp, step=0.1,
+                                label="Target resolution (megapixels)",
+                            )
+                            with gr.Row():
+                                snap_enabled = gr.Checkbox(
+                                    label="Scale to multiple of", value=cfg.snap_enabled,
+                                )
+                                snap_multiple = gr.Number(
+                                    value=cfg.snap_multiple, precision=0, show_label=False,
+                                )
+
+                    with gr.Tab("Captioning defaults"):
+                        with gr.Group():
+                            trigger_word = gr.Textbox(label="Default trigger word", value=cfg.trigger_word)
+                            with gr.Row():
+                                overwrite_existing = gr.Checkbox(
+                                    label="Overwrite existing captions by default", value=cfg.overwrite_existing
+                                )
+                                recursive_batch = gr.Checkbox(
+                                    label="Recursive batch by default", value=cfg.recursive_batch
+                                )
+
+                    with gr.Tab("Debug"):
+                        with gr.Group():
+                            debug_tab_enabled = gr.Checkbox(
+                                label="Enable Debug tab (requires app restart)",
+                                value=cfg.debug_tab_enabled,
+                            )
+
                 with gr.Row():
-                    temperature = gr.Slider(0.0, 2.0, value=cfg.temperature, label="Temperature")
-                    top_p = gr.Slider(0.0, 1.0, value=cfg.top_p, label="Top-p")
-                    max_tokens = gr.Number(label="Max tokens", value=cfg.max_tokens, precision=0)
-                request_timeout = gr.Number(
-                    label="Request timeout (seconds)", value=cfg.request_timeout, precision=0
+                    save_settings_btn = gr.Button("Save settings", variant="primary")
+                    restart_app_btn = gr.Button("Restart app")
+                settings_status = gr.Textbox(show_label=False, container=False, interactive=False)
+
+                settings_inputs = [
+                    server_mode, server_host, server_port, external_url,
+                    n_gpu_layers, context_size, extra_server_args,
+                    resize_enabled, resize_target_mp, snap_enabled, snap_multiple,
+                    prompt_template, temperature, top_p, max_tokens, request_timeout,
+                    trigger_word, overwrite_existing, recursive_batch, debug_tab_enabled,
+                ]
+                save_settings_btn.click(save_settings_ui, settings_inputs, [settings_status]).then(
+                    # Saving can change server_mode (or anything else
+                    # check_status/_cached_controllable/_cached_reachable
+                    # read), and the Models/Single-image/Batch-processing
+                    # tabs' interactive state would otherwise be stale for
+                    # up to 15s until reachability_timer's next tick -
+                    # refresh it immediately instead. current_tab_label_
+                    # state is "Settings" here (this click can only happen
+                    # from the Settings tab), so the push-to-Settings
+                    # branch in _refresh_reachability_ui is always a no-op
+                    # in this context, not a real redirect.
+                    _refresh_reachability_ui, [current_tab_label_state], [models_tab, single_tab, batch_tab, main_tabs],
                 )
+                restart_app_btn.click(restart_app_ui, [], [])
 
-            with gr.Group():
-                gr.Markdown("### Image resizing")
-                resize_enabled = gr.Checkbox(
-                    label="Downscale oversized images before sending to the model",
-                    value=cfg.resize_enabled,
+            with gr.Tab("Debug", visible=cfg.debug_tab_enabled):
+                gr.Markdown(f"**Python debug log** (also written to `{PY_LOG_PATH}`)")
+                debug_python_box = gr.Textbox(
+                    lines=18, max_lines=18, interactive=False, show_label=False,
+                    value=get_python_debug_text(),
                 )
-                resize_target_mp = gr.Slider(
-                    0.1, 4.0, value=cfg.resize_target_mp, step=0.1,
-                    label="Target resolution (megapixels)",
+                gr.Markdown("**llama-server output** (n/a unless started by this app)")
+                debug_llama_box = gr.Textbox(
+                    lines=18, max_lines=18, interactive=False, show_label=False,
+                    value=get_llama_debug_text(),
                 )
-                with gr.Row():
-                    snap_enabled = gr.Checkbox(
-                        label="Scale to multiple of", value=cfg.snap_enabled,
-                    )
-                    snap_multiple = gr.Number(
-                        value=cfg.snap_multiple, precision=0, show_label=False,
-                    )
-
-            with gr.Group():
-                gr.Markdown("### Captioning defaults")
-                trigger_word = gr.Textbox(label="Default trigger word", value=cfg.trigger_word)
-                with gr.Row():
-                    overwrite_existing = gr.Checkbox(
-                        label="Overwrite existing captions by default", value=cfg.overwrite_existing
-                    )
-                    recursive_batch = gr.Checkbox(
-                        label="Recursive batch by default", value=cfg.recursive_batch
-                    )
-
-            with gr.Group():
-                gr.Markdown("### Debug")
-                debug_tab_enabled = gr.Checkbox(
-                    label="Enable Debug tab (requires app restart)",
-                    value=cfg.debug_tab_enabled,
-                )
-
-            save_settings_btn = gr.Button("Save settings", variant="primary")
-            restart_app_btn = gr.Button("Restart app")
-            settings_status = gr.Textbox(label="Status", interactive=False)
-
-            settings_inputs = [
-                server_mode, server_host, server_port, external_url,
-                n_gpu_layers, context_size, extra_server_args,
-                resize_enabled, resize_target_mp, snap_enabled, snap_multiple,
-                prompt_template, temperature, top_p, max_tokens, request_timeout,
-                trigger_word, overwrite_existing, recursive_batch, debug_tab_enabled,
-            ]
-            save_settings_btn.click(save_settings_ui, settings_inputs, [settings_status])
-            restart_app_btn.click(restart_app_ui, [], [])
-
-        with gr.Tab("Debug", visible=cfg.debug_tab_enabled):
-            gr.Markdown(f"**Python debug log** (also written to `{PY_LOG_PATH}`)")
-            debug_python_box = gr.Textbox(
-                lines=18, max_lines=18, interactive=False, show_label=False,
-                value=get_python_debug_text(),
-            )
-            gr.Markdown("**llama-server output** (n/a unless started by this app)")
-            debug_llama_box = gr.Textbox(
-                lines=18, max_lines=18, interactive=False, show_label=False,
-                value=get_llama_debug_text(),
-            )
-            debug_clear_btn = gr.Button("Clear")
-            debug_clear_btn.click(clear_debug_ui, [], [debug_python_box, debug_llama_box])
+                debug_clear_btn = gr.Button("Clear")
+                debug_clear_btn.click(clear_debug_ui, [], [debug_python_box, debug_llama_box])
 
         status_bar = gr.Markdown(get_status_text(), elem_id="status-bar")
         _run_interrupt_btns = [
@@ -2051,6 +2284,14 @@ def build_app() -> gr.Blocks:
         batch_tab.select(_operation_button_states, [], _run_interrupt_btns)
         review_tab.select(_operation_button_states, [], _run_interrupt_btns)
 
+        # Tracks which top-level tab is currently selected (declared up by
+        # main_tabs' own definition, see the comment there) purely so
+        # _refresh_reachability_ui can tell whether the user is on the
+        # Models tab at the moment it needs to be disabled (and if so,
+        # push them off it) without disturbing anyone on any other tab -
+        # see that function's docstring.
+        main_tabs.select(_on_main_tab_select, [], [current_tab_label_state])
+
         status_timer = gr.Timer(2.0)
         status_timer.tick(get_status_text, [], [status_bar])
         status_timer.tick(_operation_button_states, [], _run_interrupt_btns)
@@ -2059,10 +2300,37 @@ def build_app() -> gr.Blocks:
         if cfg.debug_tab_enabled:
             status_timer.tick(get_python_debug_text, [], [debug_python_box])
             status_timer.tick(get_llama_debug_text, [], [debug_llama_box])
+
+        # Separate, slower timer for _refresh_reachability_cache specifically
+        # - it's a real network call (external mode), unlike everything else
+        # status_timer drives, so it doesn't need or want a 2s cadence. Its
+        # result is picked up by the very next status_timer tick afterward
+        # (_operation_button_states reads the cache, doesn't recompute it)
+        # for Single/Batch/Recaption's own Run/Recaption BUTTON gating; the
+        # Models/Single-image/Batch-processing TABS' own interactive state
+        # is set directly below instead, since gating those also needs to
+        # know (and occasionally override) which tab is currently selected
+        # - see _refresh_reachability_ui's docstring.
+        reachability_timer = gr.Timer(15.0)
+        reachability_timer.tick(
+            _refresh_reachability_ui, [current_tab_label_state], [models_tab, single_tab, batch_tab, main_tabs]
+        )
+
         demo.load(get_status_text, [], [status_bar])
-        demo.load(_operation_button_states, [], _run_interrupt_btns)
         demo.load(models_refresh_ui, [models_selected_folder_state], _models_scan_outputs)
         demo.load(_download_status_ui, [], [download_status_row, download_status_text])
+        # _operation_button_states reads the reachability cache rather than
+        # checking fresh (see its own docstring) - chained after (not a
+        # parallel demo.load, which it used to be) specifically so it
+        # always sees a just-refreshed cache, not whatever the optimistic
+        # default happened to still be if this beat _startup_reachability_
+        # ui's real (and slower - a live network call) check to the punch.
+        # That race was real: Single/Batch could show enabled on a fresh
+        # page load against an unreachable server, correcting only once
+        # status_timer's first 2s tick came around, if at all.
+        demo.load(_startup_reachability_ui, [], [main_tabs, models_tab, single_tab, batch_tab]).then(
+            _operation_button_states, [], _run_interrupt_btns
+        )
 
     return demo
 
@@ -2072,6 +2340,7 @@ UI_PORT = 7901
 
 def main() -> None:
     _setup_debug_logging()
+    atexit.register(_stop_managed)
     demo = build_app()
     demo.queue()
     demo.launch(server_port=UI_PORT, footer_links=[], css=ALL_CSS)

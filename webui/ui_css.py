@@ -18,6 +18,17 @@ ruled out and why, when there's genuinely no other way.
 # confirmation this is the standard way Gradio apps do this, not a hack.
 STATUS_BAR_CSS = "#status-bar { text-align: center; }"
 
+# gr.Radio has no orientation/layout parameter (checked its constructor -
+# only choices/value/type/label/etc, nothing about how the choice buttons
+# lay out relative to each other); its choice buttons render inside an
+# internal flex-wrap container with no exposed prop to force one per line.
+# Targets the standard Gradio Radio DOM (same base component CheckboxGroup
+# shares) via this Radio's own elem_id, so it can't affect any other
+# Radio/CheckboxGroup in the app. Unverified against a live render (no
+# browser devtools in this environment - see the Models-table NOTE below
+# for the class of thing that can go wrong here).
+SERVER_MODE_RADIO_CSS = "#server-mode-radio .wrap { flex-direction: column; }"
+
 # NOTE: centering the Models tab's "A" (active-model star) column was
 # tried and reverted - `#models-table td:first-child { text-align:
 # center; }`. gr.Dataframe has no per-column alignment prop (checked its
@@ -50,4 +61,4 @@ STATUS_BAR_CSS = "#status-bar { text-align: center; }"
 # swapping which two of three Columns are shown reuses that proven shape
 # instead of fighting Gradio's layout with hand-tuned CSS.
 
-ALL_CSS = STATUS_BAR_CSS
+ALL_CSS = STATUS_BAR_CSS + "\n" + SERVER_MODE_RADIO_CSS

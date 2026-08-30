@@ -5,7 +5,8 @@ Two modes, chosen via AppConfig.server_mode:
     and never touch it. Otherwise start llama-server.exe ourselves and stop
     it again when we're done.
   - "external": never manage a process, always talk to external_url
-    (which may point at another machine entirely).
+    (which may point at another machine entirely) - this app has no
+    business touching anything there, ever.
 
 ManagedServer.stop()'s terminate()-then-kill() is not just cleanup - it's
 also the only reliable way anywhere in this app to interrupt a request
@@ -23,6 +24,16 @@ managed_server=None whenever the server was already running, in either
 mode) - this module will never kill something it didn't launch, on this
 machine or, in external mode, especially not one that may be running on
 a completely different machine.
+
+(An earlier version of this module tracked spawned PIDs on disk to
+recognize and re-adopt an orphaned llama-server.exe across app restarts -
+removed after concluding the real-world trigger for that orphaning was
+too narrow to justify the added complexity: closing the app's console
+window already reliably kills everything attached to it, including
+llama-server.exe, so the only case that actually left an orphan behind
+was something surgically killing just the Python process without
+touching the window - not normal usage. See check_status() below, which
+stayed, for the separate reachability-gating concern.)
 """
 
 from __future__ import annotations
@@ -31,6 +42,7 @@ import logging
 import shlex
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -47,6 +59,30 @@ log = logging.getLogger(__name__)
 
 class ServerError(RuntimeError):
     pass
+
+
+@dataclass
+class ServerStatus:
+    """Cheap, read-only categorization for UI gating - never starts or
+    stops anything, unlike resolve_server(). reachable: can Single/Batch/
+    Recaption actually caption right now (or, for auto mode, could they
+    once a server lazily starts on the first real request). controllable:
+    can the Models tab's model/mmproj selection have any actual effect at
+    the *mode* level - True for auto mode (we can always start/restart
+    what we want, whether or not anything's running yet), False for
+    external mode (never ours to tell what to load). healthy: is
+    something actually answering right now, as opposed to auto mode's
+    "not running yet, but installed" case (also reachable=True) - kept
+    separate from reachable so a caller can tell those two apart without
+    another network call. app.py additionally narrows controllable by
+    session ownership when healthy is True (see its _cached_controllable):
+    a healthy auto-mode server this app didn't start itself might be
+    running any model at all, which this module has no way to know."""
+
+    reachable: bool
+    controllable: bool
+    healthy: bool
+    reason: str = ""
 
 
 def is_healthy(base_url: str, timeout: float = 1.5) -> bool:
@@ -167,3 +203,34 @@ def resolve_server(
     log.warning("llama-server (pid %s) did not become ready within %.0fs - killing it", process.pid, ready_timeout)
     process.terminate()
     raise ServerError(f"llama-server did not become ready within {ready_timeout}s")
+
+
+def check_status(cfg: AppConfig) -> ServerStatus:
+    """Cheap, read-only categorization - never starts or stops anything
+    (unlike resolve_server, which this deliberately doesn't call). Meant
+    for UI gating: polled periodically and at app startup to decide
+    whether Single/Batch/Recaption should be enabled, and whether the
+    Models tab's model/mmproj selection means anything."""
+    if cfg.server_mode == "external":
+        base_url = cfg.external_url.rstrip("/")
+        healthy = is_healthy(base_url)
+        if healthy:
+            return ServerStatus(reachable=True, controllable=False, healthy=True)
+        return ServerStatus(
+            reachable=False, controllable=False, healthy=False, reason=f"No server responding at {base_url}."
+        )
+
+    # auto/managed - always controllable at the mode level, whether or not
+    # anything's running yet: reusing an already-healthy server or
+    # starting fresh are both things this mode can always eventually do.
+    # (app.py further narrows this when healthy - see ServerStatus's own
+    # docstring.)
+    base_url = f"http://{cfg.server_host}:{cfg.server_port}"
+    if is_healthy(base_url):
+        return ServerStatus(reachable=True, controllable=True, healthy=True)
+    if LLAMA_SERVER_EXE.exists():
+        return ServerStatus(reachable=True, controllable=True, healthy=False)
+    return ServerStatus(
+        reachable=False, controllable=True, healthy=False,
+        reason="llama.cpp isn't installed yet, and nothing is already running locally.",
+    )
