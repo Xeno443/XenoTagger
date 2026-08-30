@@ -3004,6 +3004,14 @@ def build_app() -> gr.Blocks:
         single_tab.select(_update_ui_status, [], _run_interrupt_btns)
         batch_tab.select(_update_ui_status, [], _run_interrupt_btns)
         review_tab.select(_update_ui_status, [], _run_interrupt_btns)
+        # Same remount quirk applied to the Models tab's own table: a
+        # background download finishing while the user is on another tab
+        # gets picked up by _download_triggered_refresh_ui within 2s (its
+        # own docstring), but that server-side update is discarded the
+        # moment the user switches back to Models, same as the Columns
+        # above - so re-run a real rescan right on re-entry too instead of
+        # leaving a stale count until a manual Refresh click.
+        models_tab.select(models_refresh_ui, [models_selected_folder_state], _models_scan_outputs)
         # Tracks which Settings sub-tab was genuinely clicked into, as
         # opposed to whatever settings_tabs is currently displaying (see
         # _on_settings_subtab_select's own docstring for why those two
