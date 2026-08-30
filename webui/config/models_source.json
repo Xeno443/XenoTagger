@@ -202,6 +202,37 @@
       ]
     },
     {
+      "folder_name": "concedo-llama-joycaption-beta-one-hf-llava-mmproj-GGUF",
+      "name": "JoyCaption Beta One 8B, LLaVA (concedo)",
+      "description": "concedo's GGUF quantizations of fancyfeast's llama-joycaption-beta-one-hf-llava, an 8B Llama-based captioning-focused vision-language model in LLaVA format.",
+      "source_org": "concedo",
+      "source_url": "https://huggingface.co/concedo/llama-joycaption-beta-one-hf-llava-mmproj-gguf",
+      "quants": [
+        {
+          "name": "Llama-Joycaption-Beta-One-Hf-Llava-Q4_K",
+          "url": "https://huggingface.co/concedo/llama-joycaption-beta-one-hf-llava-mmproj-gguf/resolve/main/Llama-Joycaption-Beta-One-Hf-Llava-Q4_K.gguf",
+          "size_bytes": 4920735936
+        },
+        {
+          "name": "Llama-Joycaption-Beta-One-Hf-Llava-Q8_0",
+          "url": "https://huggingface.co/concedo/llama-joycaption-beta-one-hf-llava-mmproj-gguf/resolve/main/Llama-Joycaption-Beta-One-Hf-Llava-Q8_0.gguf",
+          "size_bytes": 8540772544
+        },
+        {
+          "name": "Llama-Joycaption-Beta-One-Hf-Llava-F16",
+          "url": "https://huggingface.co/concedo/llama-joycaption-beta-one-hf-llava-mmproj-gguf/resolve/main/Llama-Joycaption-Beta-One-Hf-Llava-F16.gguf",
+          "size_bytes": 16068892864
+        }
+      ],
+      "mmprojs": [
+        {
+          "name": "llama-joycaption-beta-one-llava-mmproj-model-f16",
+          "url": "https://huggingface.co/concedo/llama-joycaption-beta-one-hf-llava-mmproj-gguf/resolve/main/llama-joycaption-beta-one-llava-mmproj-model-f16.gguf",
+          "size_bytes": 877771808
+        }
+      ]
+    },
+    {
       "folder_name": "Huihui-Qwen3.6-27B-abliterated-GGUF",
       "name": "Huihui Qwen3.6 27B abliterated, dense (huihui-ai)",
       "description": "huihui-ai's own GGUF quantizations of their abliterated Qwen3.6 27B dense model - built on the Qwen3.5 early-fusion vision-language foundation. Recommended over the 35B-A3B MoE sibling for caption quality (accuracy on correlated visual details matters more here than raw throughput). No UD dynamic quants for this repo, only plain K-quants.",
