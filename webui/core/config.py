@@ -70,13 +70,19 @@ MODELS_TAB_INTRO = (
 
 @dataclass
 class AppConfig:
-    # Server management: "auto" (start our own if none is running, connect
-    # to an existing one otherwise) or "external" (never manage a process,
-    # always talk to external_url).
-    server_mode: str = "auto"
-    server_host: str = "127.0.0.1"
-    server_port: int = 8080
+    # Server management: "managed" (start our own if none is running,
+    # connect to an existing one otherwise - always on 127.0.0.1, see
+    # core.server.MANAGED_HOST) or "external" (never manage a process,
+    # always talk to external_url, which may point anywhere).
+    server_mode: str = "managed"
+    server_port: int = 8901
     external_url: str = "http://127.0.0.1:8080"
+    # Whether to start the managed server automatically on app launch, if
+    # it's installed but not already running - see app.py's autostart
+    # wiring. Ignored right after switching mode to managed (the user must
+    # start it explicitly at least once, so a stale/wrong model doesn't
+    # silently start loading the moment they flip the radio).
+    autostart_managed_llama: bool = False
 
     # Model selection: "<folder>/<file stem>" of a ModelVariant/MmprojVariant
     # from core.models. Empty mmproj_name means auto-pick the largest mmproj
@@ -145,6 +151,15 @@ def load() -> AppConfig:
         except (OSError, json.JSONDecodeError) as exc:
             log.warning("Could not read %s (%s) - using defaults", SETTINGS_PATH, exc)
             on_disk = {}
+        # server_mode was renamed "auto" -> "managed" - an older
+        # settings.json predating that rename still says "auto".
+        if on_disk.get("server_mode") == "auto":
+            on_disk["server_mode"] = "managed"
+        # server_host was removed (managed mode now always binds
+        # 127.0.0.1 - see core.server.MANAGED_HOST) - drop it explicitly
+        # rather than relying on the generic unknown-key filter below, so
+        # it's clear this one's gone on purpose, not just unrecognized.
+        on_disk.pop("server_host", None)
         defaults.update({k: v for k, v in on_disk.items() if k in defaults})
     else:
         log.debug("No settings.json yet at %s - using built-in defaults", SETTINGS_PATH)

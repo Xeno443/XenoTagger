@@ -3,11 +3,12 @@ and an opt-in Debug tab. The CLI (cli.py) is a separate, independent
 entry point that shares core/ with this file but not this file itself -
 nothing UI-specific belongs in core/.
 
-Two coordination mechanisms guard shared, process-wide state that both
-tabs (and Settings' restart actions) can touch concurrently - both are
-threading.RLock, not a plain Lock, because each has a function that calls
-another lock-holding function of its own while already holding the lock
-(get_client() calls _stop_managed(); a plain Lock would deadlock there):
+Three coordination mechanisms guard shared, process-wide state that both
+tabs (and Settings' restart actions) can touch concurrently - the first
+two are threading.RLock, not a plain Lock, because each has a function
+that calls another lock-holding function of its own while already
+holding the lock (get_client() calls _stop_managed(); a plain Lock would
+deadlock there):
 
   - `_session`/`_session_lock`: which llama-server (if any) we're
     currently managing. Guards against two requests racing in before any
@@ -20,6 +21,14 @@ another lock-holding function of its own while already holding the lock
     what stage of being interrupted is it in. This is also the mutual-
     exclusion gate that stops single-image and batch from running at
     once, since both ultimately share the one llama-server connection.
+
+  - `current_cfg`/`_config_lock` (plain Lock - neither writer calls back
+    into itself or the other while holding it): guards the read-modify-
+    write of current_cfg + config_mod.save() in save_settings_ui() and
+    models_set_active_ui(), the only two places that mutate current_cfg
+    wholesale. Without it, two overlapping saves could each read a stale
+    current_cfg and the second write would silently clobber fields the
+    first one just changed.
 
 The Run/Interrupt buttons are two SEPARATE gr.Button components per tab,
 not one button whose label changes - this was tried first and doesn't
@@ -64,7 +73,7 @@ Because button state is normally only pushed by whichever specific
 browser connection's generator is actively running (run_single_ui /
 run_batch_ui's own yields), a reloaded page or a second browser tab would
 otherwise show stale "idle" buttons even while something is genuinely
-running elsewhere. _operation_button_states() closes that gap: it
+running elsewhere. _update_ui_status() closes that gap: it
 recomputes both tabs' Run/Interrupt appearance fresh from
 _active_operation on every call, and is wired into the same 2-second
 status_timer that already refreshes the status bar, plus demo.load - so
@@ -116,8 +125,8 @@ from core.models import (
     load_curated_models, merge_curated, resolve_selection, scan_all,
 )
 from core.server import (
-    LOG_PATH, ManagedServer, ServerError, ServerStatus, check_status, get_loaded_model_name, is_healthy,
-    resolve_server,
+    LLAMA_SERVER_EXE, LOG_PATH, MANAGED_HOST, ManagedServer, ServerError, ServerStatus, check_status,
+    get_loaded_model_name, is_healthy, resolve_server,
 )
 from ui_css import ALL_CSS
 
@@ -138,6 +147,16 @@ _session = {"managed": None, "client": None, "base_url": None}
 # Reentrant (not a plain Lock) because get_client() calls _stop_managed()
 # internally while already holding it - a plain Lock would deadlock there.
 _session_lock = threading.RLock()
+
+# Guards the read-modify-write of current_cfg + config_mod.save() in
+# save_settings_ui() and models_set_active_ui() - the only two places that
+# mutate current_cfg wholesale. Without it, two overlapping saves (e.g.
+# two browser tabs) could each read a stale current_cfg and the second
+# write would silently clobber fields the first one just changed. Plain
+# Lock, not RLock like the others here - neither function calls back into
+# itself or the other while already holding it, so there's no reentrancy
+# need.
+_config_lock = threading.Lock()
 
 # Debug tab: captures log output from our own Python code (core.* modules
 # all log via the standard `logging` module, but nothing was ever attached
@@ -194,9 +213,28 @@ def _setup_debug_logging() -> None:
 
 
 def _stop_managed() -> None:
+    """The reset below always runs, even if .stop() itself raises (e.g.
+    ManagedServer.stop()'s second process.wait(10) - after the kill() -
+    has no exception handling of its own, so a process that's unusually
+    slow to actually exit could propagate a TimeoutExpired here). Without
+    the try/except, that would skip the reset entirely and leave _session
+    pointing at a stale ManagedServer/base_url - and since
+    _is_server_managed_by_us() only checks whether _session matches a
+    base_url, not whether the object it's holding is still meaningfully
+    "ours," anything ELSE that later answers on that same port (a
+    manually-started server on the same default port, most plausibly)
+    would then be misreported as owned by this session. Reset first,
+    worry about the process separately - our own bookkeeping about what
+    we're responsible for shouldn't stay wrong just because killing it
+    was slow."""
+    global _expected_stop
     with _session_lock:
         if _session["managed"] is not None:
-            _session["managed"].stop()
+            _expected_stop = True
+            try:
+                _session["managed"].stop()
+            except Exception:
+                log.exception("Error stopping managed llama-server - clearing session anyway")
         _session["managed"] = None
         _session["client"] = None
         _session["base_url"] = None
@@ -220,20 +258,21 @@ def _stop_managed() -> None:
 #
 # "Can Single/Batch/Review's Recaption actually work right now" - a single,
 # always-live condition (not a one-time first-run check), reused by
-# _operation_button_states() below to gate those three actions the same way
+# _update_ui_status() below to gate those three actions the same way
 # "something else is running" already gates them, and by the startup check
 # (demo.load, near the bottom of build_app) to decide whether to land on
 # the Single-image tab or on Settings with an explanation.
 #
-# "auto" (managed) mode only needs an installed llama.cpp binary - or an
-# already-running server at the configured host:port, which auto mode is
-# always willing to reuse regardless of who started it. The actual lazy
-# server start (or reuse) on the first real caption request stays exactly
-# as it is, untouched by any of this - this section only reads state, never
-# starts/stops anything (see core.server.check_status). "external" mode has
-# no local fallback we control, so it needs an actual live health check -
-# unlike managed, we can't assume it'll come up later just because it's
-# configured.
+# "managed" mode has no implicit lazy-start anymore - starting the server
+# is always an explicit action (the "Start llama server" button, or
+# autostart at launch - see the server-lifecycle section further down),
+# never a side effect of clicking Caption. So "reachable" here means
+# exactly one thing for both modes: is something actually answering a
+# health check right now. "Installed but not started yet" is just as
+# unusable as "not installed at all" from this section's point of view -
+# see core.server.ServerStatus.installed for how the two get told apart
+# for status-text/button purposes elsewhere. "external" mode has no local
+# fallback we control at all, so it always needs a real live health check.
 #
 # The mode-level categorization (including the base "controllable" -
 # see core.server.ServerStatus) lives in core/server.py's check_status(),
@@ -252,7 +291,7 @@ def _stop_managed() -> None:
 # Settings if they're on it when that happens).
 
 _reachability_lock = threading.RLock()
-_reachability_cache = ServerStatus(reachable=True, controllable=True, healthy=True)  # optimistic default until the first real check
+_reachability_cache = ServerStatus(reachable=True, controllable=True, installed=True)  # optimistic default until the first real check
 
 
 def _refresh_reachability_cache() -> ServerStatus:
@@ -271,62 +310,154 @@ def _cached_reachable() -> bool:
 def _is_server_managed_by_us(base_url: str) -> bool:
     """True if THIS session started (or is otherwise responsible for
     stopping) whatever's currently answering at base_url - what the status
-    bar calls "managed" rather than "remote". Session-local only; doesn't
-    know about anything from a previous app run (see core/server.py's
-    docstring on why that's on purpose)."""
+    bar calls "running" rather than a healthy-but-unowned server. Session-
+    local only; doesn't know about anything from a previous app run (see
+    core/server.py's docstring on why that's on purpose)."""
     managed = _session.get("managed")
     connected = _session.get("client") is not None and _session.get("base_url") == base_url
     return connected and managed is not None
 
 
+def _managed_base_url(cfg: AppConfig) -> str:
+    return f"http://{MANAGED_HOST}:{cfg.server_port}"
+
+
 def _cached_controllable() -> bool:
     """Whether the Models tab should be usable right now - stricter than
     ServerStatus.controllable's mode-level check (see its docstring):
-    external mode is never controllable, same as before, but a healthy
-    auto-mode server also has to be one THIS session started. A healthy
-    server we merely reused (leftover from a previous run, or started by
-    hand) might be running any model at all, and there's no reliable way
-    to tell - see the module docstring's note on the removed PID-tracking
-    approach - so it's treated the same as external mode: not ours to
-    manage. A not-yet-running auto-mode server stays controllable, since
-    starting it fresh would use whatever we pick."""
+    external mode is never controllable, same as before, but a running
+    managed-mode server also has to be one THIS session started. A
+    running server we merely reused (leftover from a previous run, or
+    started by hand) might be running any model at all, and there's no
+    reliable way to tell - see the module docstring's note on the removed
+    PID-tracking approach - so it's treated the same as external mode:
+    not ours to manage. A not-yet-running managed-mode server (that's
+    otherwise installed) stays controllable, since starting it fresh
+    would use whatever we pick."""
     with _reachability_lock:
         status = _reachability_cache
     if not status.controllable:
         return False
     cfg = current_cfg
-    if cfg.server_mode == "auto" and status.healthy:
-        base_url = f"http://{cfg.server_host}:{cfg.server_port}"
-        return _is_server_managed_by_us(base_url)
+    if cfg.server_mode == "managed" and status.reachable:
+        return _is_server_managed_by_us(_managed_base_url(cfg))
     return True
 
 
 _last_known_controllable = True  # matches the optimistic cache default above
-_last_known_reachable = True  # matches the optimistic cache default above
+_last_known_reachable: Optional[bool] = None  # None = no real check has completed yet
+_down_is_crash = False  # persists for a whole down-streak, not just its first tick - see _update_reachability_tracking
+_expected_stop = False  # set by _stop_managed() itself, consumed by _update_reachability_tracking - see both docstrings
 
 
-def _note_controllable_transition(controllable: bool) -> None:
+def _note_controllable_transition(controllable: bool, cfg: AppConfig, status: ServerStatus) -> None:
     """Fires exactly one gr.Info the moment the Models tab becomes
     unusable (not on every reachability_timer tick for as long as it stays
-    that way), whether that's discovered at startup or later."""
+    that way), whether that's discovered at startup or later. Also aborts
+    any in-flight/queued downloads at that same moment (a deliberate
+    reversal of the earlier "let them finish" behavior - decided this
+    session that switching away from a controllable state likely means
+    those downloads are no longer wanted at all) - done here, not gated
+    on which tab the user happens to be viewing, since the download queue
+    itself doesn't care whether Models is the active tab right now.
+
+    The message is picked from cfg/status rather than one fixed string -
+    confirmed live that the "isn't one this app started" wording is
+    flatly wrong for managed-mode-but-nothing-installed: there's no
+    active llama-server to have started or not started in that case, the
+    reachability warning already covers "nothing's set up yet" on its
+    own, so this only needs to add the ownership-specific explanation
+    when there's actually something running to have an opinion about."""
     global _last_known_controllable
     if not controllable and _last_known_controllable:
-        gr.Info(
-            "Model management is disabled: the active llama-server isn't one this app "
-            "started, so what it currently has loaded isn't something the Models tab can "
-            "show you or change."
-        )
+        if cfg.server_mode == "managed" and not status.installed:
+            gr.Info("Model management is disabled: llama.cpp isn't installed yet, so there's nothing to manage.")
+        else:
+            gr.Info(
+                "Model management is disabled: the active llama-server isn't one this app "
+                "started, so what it currently has loaded isn't something the Models tab can "
+                "show you or change."
+            )
+        _download_abort_all()
     _last_known_controllable = controllable
 
 
-def _note_reachable_transition(reachable: bool, reason: str) -> None:
-    """Fires exactly one gr.Warning the moment Single/Batch/Recaption
-    become unusable (not on every reachability_timer tick for as long as
-    it stays that way), whether that's discovered at startup or later."""
-    global _last_known_reachable
-    if not reachable and _last_known_reachable:
-        gr.Warning(f"No captioning server is reachable - {reason} Set it up on the Settings tab.")
-    _last_known_reachable = reachable
+def _update_reachability_tracking(status: ServerStatus, cfg: AppConfig) -> None:
+    """Updates _last_known_reachable/_down_is_crash and fires exactly one
+    popup for a genuinely NEW, UNEXPECTED transition into unreachable -
+    never a repeat every poll while it stays that way, and never at all
+    for a transition _stop_managed() itself caused (see _expected_stop -
+    stopping a server we manage is never a crash by definition, whether
+    that's the explicit End button, a mode switch, or a settings-save
+    that needs to restart it; _stop_managed() is the only thing that ever
+    calls ManagedServer.stop(), so any call to it is inherently
+    deliberate). Must run before _status_label() on the same poll, since
+    the label reads _down_is_crash.
+
+    Three cases on a transition into "not reachable":
+      - was_reachable is True and _expected_stop is False (a real crash:
+        it was answering a moment ago, managed+installed, now isn't, and
+        nothing here asked for that) -> the specific "it may have
+        crashed" warning, and _down_is_crash stays True for the rest of
+        this down-streak (not just this one tick).
+      - was_reachable is True and _expected_stop is True (we stopped it
+        ourselves) -> no warning, _down_is_crash stays False - same
+        "idle" label as a server that was simply never started, not
+        "error".
+      - was_reachable is None (the very first check this process has ever
+        made) -> a freshly-installed-but-never-started managed server is
+        just the normal starting state, not an alarm - no popup at all in
+        that specific case; everything else (not installed, external down
+        from the start) still gets the plain informational warning.
+      - was_reachable is False (already known down, still down) -> no
+        popup, nothing changed.
+    Recovering (reachable again) always clears _down_is_crash and
+    _expected_stop."""
+    global _last_known_reachable, _down_is_crash, _expected_stop
+    was_reachable = _last_known_reachable
+    _last_known_reachable = status.reachable
+    if status.reachable:
+        _down_is_crash = False
+        _expected_stop = False
+        return
+    managed_installed = cfg.server_mode == "managed" and status.installed
+    if was_reachable:
+        expected = _expected_stop
+        _expected_stop = False
+        _down_is_crash = not expected
+        if _down_is_crash:
+            if managed_installed:
+                gr.Warning("The managed llama-server stopped responding - it may have crashed. Restart it from Settings.")
+            else:
+                gr.Warning(f"No captioning server is reachable - {status.reason} Set it up on the Settings tab.")
+    elif was_reachable is None and not managed_installed:
+        gr.Warning(f"No captioning server is reachable - {status.reason} Set it up on the Settings tab.")
+    # was_reachable is False (steady-state down), or None+managed_installed
+    # (fresh idle) - no popup either way.
+
+
+def _status_label(cfg: AppConfig, reachable: bool, installed: bool) -> str:
+    """The status-bar's server-state label. Decoupled from ServerStatus
+    (just the two fields it actually needs) since its one caller,
+    get_status_text(), does its own fresh/uncached health check rather
+    than reading the reachability cache - see that function's own
+    comment on why the status bar's "Model: X" needs to always be fresh,
+    not cached. Reads _down_is_crash (module state, maintained by
+    _update_reachability_tracking() on the separate 8s reachability-cache
+    cycle) rather than tracking its own transition history - sharing that
+    one flag keeps this fast/frequent 2s-driven label consistent with the
+    slower cycle's crash detection instead of re-deciding it twice.
+    external: connected/unreachable. managed: running, N/A (not
+    installed), error (installed, was running, now isn't - likely
+    crashed), or idle (installed, never got started, or cleanly stopped -
+    not alarming)."""
+    if cfg.server_mode == "external":
+        return "connected" if reachable else "unreachable"
+    if reachable:
+        return "running"
+    if not installed:
+        return "N/A"
+    return "error" if _down_is_crash else "idle"
 
 
 def _refresh_reachability_ui(current_tab_label: str):
@@ -342,26 +473,69 @@ def _refresh_reachability_ui(current_tab_label: str):
     they can no longer switch back into. Never touches main_tabs'
     selection otherwise, so it can't yank anyone off Review mid-task -
     Review's own filesystem-only nav doesn't need a server at all (see
-    _operation_button_states' docstring), so its tab stays reachable
-    regardless; only its Recaption button is gated, same as Single/Batch's
-    Run buttons."""
+    _update_ui_status' docstring), so its tab stays reachable regardless;
+    only its Recaption button is gated, same as Single/Batch's Run
+    buttons.
+
+    Also updates current_tab_label_state to "Settings" whenever it
+    redirects there - main_tabs.select() (which is what normally keeps
+    that state current, see _on_main_tab_select) only fires on an actual
+    user click, never on a server-pushed gr.update(selected=...) like the
+    one this function itself issues. Without this, the tracked label
+    would silently go stale the moment THIS function redirects someone,
+    and every later poll would keep reading the pre-redirect tab -
+    confirmed live: this exact gap was yanking users from Settings->Llama
+    to Settings->Debug a few seconds later, via _fallback_tab_safety_ui
+    still seeing the stale "Single image"/"Batch processing" label and
+    concluding they were still stuck on a disabled tab. gr.skip() leaves
+    it untouched on ticks that don't redirect."""
+    cfg = current_cfg
     status = _refresh_reachability_cache()
     controllable = _cached_controllable()
-    _note_controllable_transition(controllable)
-    _note_reachable_transition(status.reachable, status.reason)
+    _note_controllable_transition(controllable, cfg, status)
+    _update_reachability_tracking(status, cfg)
     models_tab_update = gr.update(interactive=controllable)
     single_batch_update = gr.update(interactive=status.reachable)
+    start_btn_update, end_btn_update = _llama_lifecycle_button_updates(cfg, status)
     push_to_settings = (not controllable and current_tab_label == "Models") or (
         not status.reachable and current_tab_label in ("Single image", "Batch processing")
     )
     tabs_update = gr.update(selected="settings") if push_to_settings else gr.update()
-    return models_tab_update, single_batch_update, single_batch_update, tabs_update
+    label_update = "Settings" if push_to_settings else gr.skip()
+    return (
+        models_tab_update, single_batch_update, single_batch_update,
+        start_btn_update, end_btn_update, tabs_update, label_update,
+    )
 
 
 def _on_main_tab_select(evt: gr.SelectData) -> str:
     """Wired to main_tabs.select() - see current_tab_label_state's own
     comment for why this is tracked at all."""
     return evt.value
+
+
+def _llama_lifecycle_button_updates(cfg: AppConfig, status: ServerStatus):
+    """(start_btn_update, end_btn_update) for the Llama settings tab's
+    two lifecycle buttons - shared by _refresh_reachability_ui and
+    _startup_reachability_ui so the two can't disagree. Start is only
+    ever useful in managed mode with something installed but not already
+    running (installed-and-not-running, not installed-and-running or
+    external, where it'd have nothing to do); End only when this session
+    actually owns whatever's currently running - see
+    _is_server_managed_by_us's docstring on why that's the one thing that
+    gates it, not just "something's running".
+
+    Start also tracks Save-settings' primary/orange styling, but only
+    while it's actually clickable - variant, not just interactive, so
+    "ready to click" reads as visually distinct from "nothing to do right
+    now" rather than relying on interactive=False's subtler dimming alone
+    to carry that. End stays plain (like Restart app) regardless of
+    state - it's the less common action, not the one to draw the eye to."""
+    can_start = cfg.server_mode == "managed" and status.installed and not status.reachable
+    start_update = gr.update(interactive=can_start, variant="primary" if can_start else "secondary")
+    owned = cfg.server_mode == "managed" and status.reachable and _is_server_managed_by_us(_managed_base_url(cfg))
+    end_update = gr.update(interactive=owned)
+    return start_update, end_update
 
 
 def _startup_reachability_ui():
@@ -371,16 +545,86 @@ def _startup_reachability_ui():
     per-tab logic with). A real (not cached) check, since the optimistic
     default cache value would otherwise land everyone on Single-image once
     with everything enabled, even on a machine where nothing's been set up
-    yet."""
+    yet. Also sets current_tab_label_state to match wherever it actually
+    lands - the very first value driving every later poll, before any
+    real main_tabs.select() has ever fired (see _refresh_reachability_ui's
+    docstring for why this matters and what silently goes wrong without
+    it)."""
+    cfg = current_cfg
     status = _refresh_reachability_cache()
     controllable = _cached_controllable()
-    _note_controllable_transition(controllable)
-    _note_reachable_transition(status.reachable, status.reason)
+    _note_controllable_transition(controllable, cfg, status)
+    _update_reachability_tracking(status, cfg)
     models_tab_update = gr.update(interactive=controllable)
     single_batch_update = gr.update(interactive=status.reachable)
-    if status.reachable:
-        return gr.update(selected="single"), models_tab_update, single_batch_update, single_batch_update
-    return gr.update(selected="settings"), models_tab_update, single_batch_update, single_batch_update
+    start_btn_update, end_btn_update = _llama_lifecycle_button_updates(cfg, status)
+    tab_target, tab_label = ("single", "Single image") if status.reachable else ("settings", "Settings")
+    return (
+        gr.update(selected=tab_target), models_tab_update, single_batch_update, single_batch_update,
+        start_btn_update, end_btn_update, tab_label,
+    )
+
+
+def _fallback_tab_safety_ui(current_tab_label: str):
+    """Cheap, cache-only 2s-timer safety net: if the user is currently
+    sitting on a tab the cached state says is disabled, push them to
+    Settings -> Debug (the one sub-tab that's never gated on anything -
+    see its own comment) regardless of why. A catch-all in case the
+    primary per-transition push logic in _refresh_reachability_ui/
+    _startup_reachability_ui missed a case - reads the same caches those
+    already refresh, no network call of its own, safe to run this often.
+    Also updates current_tab_label_state to "Settings" when it redirects,
+    same reasoning as _refresh_reachability_ui - a server-pushed tab
+    switch doesn't fire main_tabs.select() on its own."""
+    controllable = _cached_controllable()
+    reachable = _cached_reachable()
+    on_disabled_models = current_tab_label == "Models" and not controllable
+    on_disabled_single_batch = current_tab_label in ("Single image", "Batch processing") and not reachable
+    if on_disabled_models or on_disabled_single_batch:
+        return gr.update(selected="settings"), gr.update(selected="debug-settings"), "Settings"
+    return gr.update(), gr.update(), gr.skip()
+
+
+def _autostart_managed_llama_ui():
+    """Chained onto demo.load AFTER the initial UI has already rendered
+    with tabs correctly enabled/disabled (see the demo.load chain below) -
+    autostart is a background convenience layered on top of that correct
+    initial state, never a substitute for it. Only actually does anything
+    for managed mode, installed, not already running, and the checkbox
+    on - exactly "state 2" (see the state table this was designed
+    against), the one case a user would otherwise have to click Start for
+    themselves. Silent no-op in every other case (external mode, nothing
+    installed, already running, or autostart off) - no popup for "didn't
+    autostart", only for actually doing something. Reads the cache
+    _startup_reachability_ui (immediately before this in the same chain)
+    already refreshed - no extra network call just to decide whether to
+    bother. Also sets current_tab_label_state to "Single image" when it
+    redirects there - same reasoning as the other tab-pushing functions
+    above (a server-pushed switch doesn't fire main_tabs.select() on its
+    own; see _refresh_reachability_ui's docstring for the bug this class
+    of fix addresses)."""
+    cfg = current_cfg
+    noop = (gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.skip())
+    if cfg.server_mode != "managed" or not cfg.autostart_managed_llama:
+        return noop
+    with _reachability_lock:
+        status = _reachability_cache
+    if not status.installed or status.reachable:
+        return noop
+    gr.Info("Starting managed llama-server automatically (autostart is enabled)...")
+    ok, _ = _try_start_managed_llama()
+    if not ok:
+        return noop
+    with _reachability_lock:
+        status = _reachability_cache
+    controllable = _cached_controllable()
+    models_tab_update = gr.update(interactive=controllable)
+    single_batch_update = gr.update(interactive=status.reachable)
+    start_btn_update, end_btn_update = _llama_lifecycle_button_updates(cfg, status)
+    return (
+        models_tab_update, single_batch_update, single_batch_update,
+        start_btn_update, end_btn_update, gr.update(selected="single"), "Single image",
+    )
 
 
 # ------------------------------------------------------ Operation tracking
@@ -481,7 +725,7 @@ def _operation_status_text() -> str:
 
 def _interrupt_label_state(op: Optional["_Operation"], kind: str) -> tuple[str, bool]:
     """(label, interactive) for `kind`'s Interrupt button, given the
-    active operation (or None). Used by _operation_button_states, which
+    active operation (or None). Used by _update_ui_status, which
     has to derive this fresh from scratch since it isn't the one that
     just clicked Interrupt - interrupt_single_ui/interrupt_batch_ui don't
     need this themselves, they already know which of the two states just
@@ -495,7 +739,7 @@ def _interrupt_label_state(op: Optional["_Operation"], kind: str) -> tuple[str, 
     return "Interrupt", True
 
 
-def _operation_button_states():
+def _update_ui_status():
     """Ground-truth Run/Interrupt appearance for all three tabs, recomputed
     fresh from _active_operation every call - not just whatever a single
     running generator last pushed. Wired into the periodic status timer
@@ -584,6 +828,116 @@ def _operation_button_states():
     )
 
 
+def _settings_subtabs_disabled() -> bool:
+    """The one, sole question of whether the four operation-sensitive
+    Settings sub-tabs (Llama, Hydra, Image resizing, Captioning defaults)
+    are currently off-limits - today that's just "is a job running", but
+    kept as its own function (not inlined into _settings_gating_ui or
+    _settings_subtab_entry_ui, both of which call this rather than
+    checking _active_operation themselves) so both of those callers can
+    never drift apart on what "disabled" means, even if a future reason
+    to disable these sub-tabs gets added later - it only has to change
+    here."""
+    with _operation_lock:
+        return _active_operation is not None
+
+
+def _settings_gating_ui():
+    """Disables the operation-sensitive Settings sub-tabs' own
+    clickability (see _settings_subtabs_disabled) while a Single/Batch/
+    Recaption job is actively running, so a job's settings can't change
+    out from under it mid-flight. The Debug sub-tab is deliberately
+    excluded - its one checkbox already needs a full app restart to take
+    effect regardless (see its own comment), so there's nothing it could
+    disrupt by staying editable. Deliberately does NOT touch the fields
+    inside those sub-tabs, only the tabs' own interactive= - see
+    _settings_subtab_entry_ui below for what actually protects someone
+    already sitting on one of these when a job starts (a redirect on
+    next entry, not disabling the fields themselves)."""
+    update = gr.update(interactive=not _settings_subtabs_disabled())
+    return update, update, update, update
+
+
+# gr.SelectData.value for a Tab is ALWAYS its label, never its id -
+# confirmed via gradio/layouts/tabs.py's own EVENTS docstring ("value
+# referring to the label of the Tab"), and via a live debug-log capture
+# that showed "last_chosen=Hydra" (the label) instead of the expected
+# "hydra-settings" (the id). id is otherwise only used for the selected=
+# kwarg when PUSHING a tab switch (gr.Tab's own docstring: "required if
+# you wish to control the selected tab from a predict function") - so
+# without this table, a value read off a real click could never be fed
+# back into gr.update(selected=...) and have it actually match anything.
+# Three of the five sub-tabs (Hydra, Image resizing, Captioning
+# defaults) never had an id at all until this fix, which independently
+# meant they could never have been a valid push target either way - see
+# their own gr.Tab(...) declarations.
+_SETTINGS_SUBTAB_ID_BY_LABEL = {
+    "Llama": "llama-settings",
+    "Hydra": "hydra-settings",
+    "Image resizing": "image-resizing-settings",
+    "Captioning defaults": "captioning-defaults-settings",
+    "Debug": "debug-settings",
+}
+
+
+def _on_settings_subtab_select(evt: gr.SelectData):
+    """Wired to settings_tabs.select() - tracks the sub-tab the user
+    actually, genuinely clicked into (current_settings_subtab_state) as
+    a stable id (see _SETTINGS_SUBTAB_ID_BY_LABEL above - evt.value
+    itself is a label, not usable directly), separately from whatever
+    settings_tabs is currently DISPLAYING. Read by
+    _settings_subtab_entry_ui below.
+
+    Also guards against recording "debug-settings" while the sub-tabs
+    are disabled: it's the only place a real click could land during
+    that window anyway (everything else is unclickable), so there's
+    nothing informative to record, and gr.skip() leaves whatever was
+    genuinely there before (e.g. "hydra-settings") untouched. This
+    guard's real necessity - i.e. whether a select event ever actually
+    fires here that ISN'T a genuine click, such as a side effect of
+    _settings_subtab_entry_ui's own redirect - was never independently
+    confirmed; it's kept as cheap, harmless insurance regardless, now
+    that it's at least comparing against the right kind of value (an id,
+    not a label) to ever have a chance of matching."""
+    tab_id = _SETTINGS_SUBTAB_ID_BY_LABEL[evt.value]
+    disabled = _settings_subtabs_disabled()
+    if tab_id == "debug-settings" and disabled:
+        log.debug("settings subtab select: label=%s id=%s disabled=%s -> IGNORED", evt.value, tab_id, disabled)
+        return gr.skip()
+    log.debug("settings subtab select: label=%s id=%s disabled=%s -> RECORDED", evt.value, tab_id, disabled)
+    return tab_id
+
+
+def _settings_subtab_entry_ui(last_chosen: str):
+    """Wired to settings_tab.select() - the moment the user enters the
+    Settings tab (from anywhere else), not on a timer: confirmed live
+    that someone already sitting on a sub-tab when a job starts is left
+    alone (matches _settings_gating_ui only disabling the tabs' own
+    clickability, not evicting an existing occupant), so there's nothing
+    for this to correct except at the moment of a fresh entry.
+
+    Always explicitly asserts a destination - either "debug-settings" or
+    last_chosen - never a bare gr.update() no-op: a no-op was confirmed
+    live NOT to reliably undo a still-pending prior push to a Tabs
+    component's selected= (see git history/session notes for the
+    original bug this replaced), so "leave it alone and hope it already
+    reverted" isn't trustworthy here regardless of which branch applies.
+
+    Because this recomputes _settings_subtabs_disabled() fresh on every
+    single entry rather than remembering "did I force this last time",
+    there's no flag to clear and nothing that can go stale: if the job
+    ended 5 seconds ago or 5 minutes ago, disabled is simply False now,
+    and the else branch below re-shows last_chosen - whatever that
+    genuinely was, Debug included if that's really where the user left
+    off - with no separate revert-to-Llama special case needed."""
+    disabled = _settings_subtabs_disabled()
+    if disabled and last_chosen != "debug-settings":
+        log.debug("settings subtab entry: last_chosen=%s disabled=%s -> pushing debug-settings", last_chosen, disabled)
+        return gr.update(selected="debug-settings")
+    log.debug("settings subtab entry: last_chosen=%s disabled=%s -> pushing %s", last_chosen, disabled, last_chosen)
+    return gr.update(selected=last_chosen)
+
+
 def _operation_force_abort() -> None:
     """Immediately hard-aborts whatever's running, if anything - skips the
     two-click grace period (for Restart, which needs the operation gone
@@ -617,7 +971,7 @@ def get_client(cfg: AppConfig) -> LlamaClient:
         if cfg.server_mode == "external":
             desired_base = cfg.external_url.rstrip("/")
         else:
-            desired_base = f"http://{cfg.server_host}:{cfg.server_port}"
+            desired_base = _managed_base_url(cfg)
 
         if _session["client"] is not None and _session["base_url"] == desired_base:
             log.debug("get_client(): reusing existing client for %s", desired_base)
@@ -649,7 +1003,81 @@ def restart_server_ui() -> str:
     _operation_force_abort()
     _wait_for_operation_to_end()
     _stop_managed()
-    return "Server connection cleared. It will (re)connect/(re)start on the next request."
+    _refresh_reachability_cache()
+    # No more "it'll reconnect on the next request" - lazy-start is
+    # retired from the UI path (see _try_start_managed_llama below),
+    # Single/Batch/Recaption are gated off the moment nothing's reachable,
+    # so an explicit restart is genuinely required now, not just an
+    # available shortcut.
+    return "Server connection cleared. Start it again (managed mode: \"Start llama server\" in Settings)."
+
+
+def _try_start_managed_llama() -> tuple[bool, str]:
+    """Attempts to start (or confirm-reuse) the managed llama-server for
+    the current config, blocking until ready or failed. Shared by the
+    "Start llama server" button, autostart-at-launch, and a settings-save
+    that needs to restart with new server-process args - one
+    implementation of "make sure a working managed connection exists,"
+    not three that could drift apart. Reuses get_client() - the exact
+    same connection-resolution Single/Batch/Recaption already use,
+    including its existing resolve_selection() model validation, so a
+    missing/invalid model selection is reported the same way here as it
+    would be from any other entry point."""
+    try:
+        get_client(current_cfg)
+    except ServerError as exc:
+        return False, f"Couldn't start llama-server: {exc}"
+    _refresh_reachability_cache()
+    return True, "llama-server is running."
+
+
+def _start_managed_llama_ui():
+    """A generator, not a plain function - starting can take a while
+    (model load), and a single return value would leave the status box
+    silent/frozen for the whole duration with no sign anything's
+    happening (the chained _refresh_reachability_ui after this click only
+    fires once this generator is fully exhausted, so it can't help with
+    mid-wait feedback either - same pattern already used for
+    run_single_ui's "Starting server (loading model)..." yield, for the
+    exact same reason)."""
+    yield "Starting llama-server (this can take a while if a model needs to load)..."
+    _, message = _try_start_managed_llama()
+    yield message
+
+
+def _end_managed_llama_ui():
+    """Only ever meaningfully clickable when _is_server_managed_by_us() is
+    true (see its interactive= wiring below) - but _stop_managed() is
+    itself already safe to call regardless, since it only ever touches
+    _session["managed"], which is only ever non-None when this session
+    is the one that actually spawned the process (see core/server.py's
+    docstring). The ownership check here is just to report accurately
+    what happened for a stale/racing click, not to gate the action. A
+    generator for the same reason _start_managed_llama_ui is - stopping
+    can take up to ManagedServer.stop()'s own 10s wait before it falls
+    back to a hard kill."""
+    yield "Stopping llama-server..."
+    owned = _is_server_managed_by_us(_managed_base_url(current_cfg))
+    _stop_managed()
+    _refresh_reachability_cache()
+    yield "llama-server stopped." if owned else "Nothing to stop - this session doesn't own the running server."
+
+
+def _verify_external_ui(external_url: str) -> str:
+    """Tests whatever URL is currently in the External server URL field -
+    not necessarily current_cfg.external_url, since the user may be
+    checking a value they haven't saved yet. A real check beyond a bare
+    /health 200: also asks /props (get_loaded_model_name, core/server.py -
+    the same call the status bar's "Model: X" already uses) so the result
+    says what model is actually loaded there, not just that *something*
+    answered."""
+    base_url = external_url.rstrip("/")
+    if not is_healthy(base_url):
+        return f"No server responding at {base_url}."
+    model = get_loaded_model_name(base_url)
+    if model:
+        return f"Reachable - model loaded: {model}."
+    return f"Reachable at {base_url}, but couldn't read which model is loaded (no /props response)."
 
 
 def restart_app_ui() -> None:
@@ -678,7 +1106,7 @@ def restart_app_ui() -> None:
 # its own Column (single_interrupt_col) rather than sharing Caption's, so
 # swapping which one is visible reuses the plain-two-Column-Row shape
 # confirmed to align correctly with the row above - see the Single-image
-# tab and _operation_button_states' docstring for the full story.
+# tab and _update_ui_status' docstring for the full story.
 _RUN_IDLE = gr.update(interactive=True)
 _RUN_BUSY = gr.update(interactive=False)
 _COL_SHOWN = gr.update(visible=True)
@@ -1002,7 +1430,7 @@ def interrupt_batch_ui():
 #
 # Recaption is its own "review" operation kind (not reusing "single",
 # even though it's literally the same caption_image() call the
-# Single-image tab makes) - see _operation_button_states' docstring for
+# Single-image tab makes) - see _update_ui_status' docstring for
 # why a third kind, rather than sharing "single", is actually necessary
 # here. It still mutually-excludes against Single-image/Batch the same
 # way they already exclude each other, for free (all three ultimately
@@ -1114,7 +1542,7 @@ def review_table_select_ui(
 # exact same "disabled while a 'single'-kind operation is running
 # anywhere" treatment as part of the requirement that recaptioning
 # disables the rest of this tab's navigation, not just morph its own
-# button. See _review_nav_state below and _operation_button_states.
+# button. See _review_nav_state below and _update_ui_status.
 _REVIEW_NAV_BUSY = tuple(gr.update(interactive=False) for _ in range(6))
 _REVIEW_NAV_IDLE = tuple(gr.update(interactive=True) for _ in range(6))
 # 3 (recaption_col, interrupt_col, interrupt_btn) + 6 (_REVIEW_NAV_BUSY/IDLE
@@ -1186,47 +1614,90 @@ def interrupt_review_ui():
 # -------------------------------------------------------------- Settings tab
 
 def save_settings_ui(
-    server_mode, server_host, server_port, external_url,
-    n_gpu_layers, context_size, extra_server_args,
+    server_mode, server_port, external_url,
+    n_gpu_layers, context_size, extra_server_args, autostart_managed_llama,
     resize_enabled, resize_target_mp, snap_enabled, snap_multiple,
     prompt_template, temperature, top_p, max_tokens, request_timeout,
     trigger_word, overwrite_existing, recursive_batch, debug_tab_enabled,
 ) -> str:
+    """Per-category behavior on save (see the design discussion this was
+    built from): image resizing/captioning defaults/prompt-template-bundle
+    fields are just written through, live immediately, no process
+    interaction - already true by construction, nothing special needed
+    for them below. Server-process-affecting fields (mode, port, GPU
+    layers, context size, extra args) each need a specific reaction:
+    switching to external stops any managed server we own; switching to
+    managed never auto-starts (the user must do that explicitly, even
+    with autostart on - autostart is for the *next app launch*, not this
+    save); changing the process args while staying managed stops the
+    current one (a no-op if we don't own it - see _stop_managed) and,
+    only if autostart is enabled, immediately starts a fresh one with the
+    new settings."""
     global current_cfg
+    old_cfg = current_cfg
     # model_name/mmproj_name are deliberately NOT settable from this form -
     # they live entirely in the Models tab now (models_set_active_ui), so
     # carry forward whatever's already configured rather than defaulting
     # to empty just because this form has no field for them.
-    current_cfg = AppConfig(
-        server_mode=server_mode,
-        server_host=server_host,
-        server_port=int(server_port),
-        external_url=external_url,
-        model_name=current_cfg.model_name,
-        mmproj_name=current_cfg.mmproj_name,
-        n_gpu_layers=n_gpu_layers.strip() or "auto",
-        context_size=int(context_size),
-        extra_server_args=extra_server_args,
-        resize_enabled=bool(resize_enabled),
-        resize_target_mp=float(resize_target_mp),
-        snap_enabled=bool(snap_enabled),
-        snap_multiple=int(snap_multiple),
-        prompt_template=prompt_template,
-        temperature=float(temperature),
-        top_p=float(top_p),
-        max_tokens=int(max_tokens),
-        request_timeout=int(request_timeout),
-        trigger_word=trigger_word,
-        overwrite_existing=bool(overwrite_existing),
-        recursive_batch=bool(recursive_batch),
-        debug_tab_enabled=bool(debug_tab_enabled),
-    )
+    with _config_lock:
+        current_cfg = AppConfig(
+            server_mode=server_mode,
+            server_port=int(server_port),
+            external_url=external_url,
+            model_name=current_cfg.model_name,
+            mmproj_name=current_cfg.mmproj_name,
+            n_gpu_layers=n_gpu_layers.strip() or "auto",
+            context_size=int(context_size),
+            extra_server_args=extra_server_args,
+            autostart_managed_llama=bool(autostart_managed_llama),
+            resize_enabled=bool(resize_enabled),
+            resize_target_mp=float(resize_target_mp),
+            snap_enabled=bool(snap_enabled),
+            snap_multiple=int(snap_multiple),
+            prompt_template=prompt_template,
+            temperature=float(temperature),
+            top_p=float(top_p),
+            max_tokens=int(max_tokens),
+            request_timeout=int(request_timeout),
+            trigger_word=trigger_word,
+            overwrite_existing=bool(overwrite_existing),
+            recursive_batch=bool(recursive_batch),
+            debug_tab_enabled=bool(debug_tab_enabled),
+        )
+        new_cfg = current_cfg
+        config_mod.save(new_cfg)
     log.info(
         "Settings saved: server_mode=%s model=%s ngl=%s",
-        current_cfg.server_mode, current_cfg.model_name or "(none)", current_cfg.n_gpu_layers,
+        new_cfg.server_mode, new_cfg.model_name or "(none)", new_cfg.n_gpu_layers,
     )
-    config_mod.save(current_cfg)
-    return "Settings saved. Use \"Restart server connection\" if you changed the model or server settings, or restart the app if you changed the Debug tab setting."
+
+    switched_to_external = old_cfg.server_mode != "external" and new_cfg.server_mode == "external"
+    switched_to_managed = old_cfg.server_mode == "external" and new_cfg.server_mode == "managed"
+    process_args_changed = (
+        old_cfg.server_port, old_cfg.n_gpu_layers, old_cfg.context_size, old_cfg.extra_server_args
+    ) != (
+        new_cfg.server_port, new_cfg.n_gpu_layers, new_cfg.context_size, new_cfg.extra_server_args
+    )
+
+    if switched_to_external:
+        _stop_managed()
+        message = "Settings saved. Switched to external mode."
+    elif switched_to_managed:
+        message = (
+            "Settings saved. Switched to managed mode - click \"Start llama server\" "
+            "in this tab when you're ready (autostart applies on the next app launch, not now)."
+        )
+    elif new_cfg.server_mode == "managed" and process_args_changed:
+        _stop_managed()
+        if new_cfg.autostart_managed_llama:
+            _, start_message = _try_start_managed_llama()
+            message = f"Settings saved. {start_message}"
+        else:
+            message = "Settings saved. Click \"Start llama server\" to apply the new server settings."
+    else:
+        message = "Settings saved."
+
+    return message
 
 
 # ----------------------------------------------------------- Download queue
@@ -1715,8 +2186,9 @@ def models_set_active_ui(groups: list[ModelGroup], quant_name: str, mmproj_name:
             f"\"{shown}\" isn't downloaded yet - use the Download button, not Set as active."
         )
     mmproj_value = "" if mmproj_name is None else mmproj_name
-    current_cfg = replace(current_cfg, model_name=quant_name, mmproj_name=mmproj_value)
-    config_mod.save(current_cfg)
+    with _config_lock:
+        current_cfg = replace(current_cfg, model_name=quant_name, mmproj_name=mmproj_value)
+        config_mod.save(current_cfg)
     log.info("Models tab: set active model to %s (mmproj=%s)", quant_name, mmproj_value or "(auto)")
     mmproj_note = f"mmproj: {mmproj_value}" if mmproj_value else "mmproj: auto-pick largest"
 
@@ -1802,27 +2274,14 @@ def _display_base_url() -> str:
     cfg = current_cfg
     if cfg.server_mode == "external":
         return cfg.external_url.rstrip("/")
-    return f"http://{cfg.server_host}:{cfg.server_port}"
-
-
-def _server_status_text(base_url: str, healthy: bool) -> str:
-    # Just "managed" (we started it, this session) vs "remote" (already
-    # running somewhere - reused without starting it, or external mode,
-    # doesn't matter which) - the adjacent "Model: n/a" already covers
-    # unhealthy/crashed, so a third state for that here would just be
-    # saying the same thing twice.
-    cfg = current_cfg
-    if cfg.server_mode == "external":
-        return "remote"
-
-    if _is_server_managed_by_us(base_url):
-        return "managed"
-    return "remote" if healthy else "stopped"
+    return _managed_base_url(cfg)
 
 
 def get_status_text() -> str:
+    cfg = current_cfg
     base_url = _display_base_url()
     healthy = is_healthy(base_url)
+    installed = LLAMA_SERVER_EXE.exists()  # cheap, local - no extra network call
     # Always the server's own answer, never our config - our selection is
     # just what we'd ask it to load next, not necessarily what's actually
     # loaded right now (e.g. external mode, or a server someone else picked).
@@ -1831,7 +2290,7 @@ def get_status_text() -> str:
     return (
         f"Python {platform.python_version()} &nbsp;·&nbsp; "
         f"Gradio {gr.__version__} &nbsp;·&nbsp; "
-        f"llama-server: {_server_status_text(base_url, healthy)} &nbsp;·&nbsp; "
+        f"llama-server: {_status_label(cfg, healthy, installed)} &nbsp;·&nbsp; "
         f"Model: {model} &nbsp;·&nbsp; "
         f"{_operation_status_text()}"
     )
@@ -1890,7 +2349,16 @@ def build_app() -> gr.Blocks:
         current_tab_label_state = gr.State("Single image")
 
         with gr.Tabs() as main_tabs:
-            with gr.Tab("Single image", id="single") as single_tab:
+            # interactive=False at construction (option B from the design
+            # discussion - the simpler fallback, not a dedicated splash
+            # overlay): the very first paint, before demo.load's chain has
+            # had a chance to run even once, would otherwise show every
+            # tab clickable regardless of real server state. Corrected
+            # within the first real check (_startup_reachability_ui,
+            # wired at the bottom of build_app) - this same gap applied to
+            # Models and Batch too (see their own Tab() calls below), not
+            # just Single-image.
+            with gr.Tab("Single image", id="single", interactive=False) as single_tab:
                 with gr.Row(equal_height=True):
                     with gr.Column():
                         single_image = gr.Image(
@@ -1945,7 +2413,7 @@ def build_app() -> gr.Blocks:
                 )
                 single_image.change(clear_single_result_ui, [], [single_caption, single_status])
 
-            with gr.Tab("Batch processing") as batch_tab:
+            with gr.Tab("Batch processing", interactive=False) as batch_tab:
                 with gr.Row():
                     batch_dir = gr.Textbox(label="Directory of images", scale=4)
                     batch_browse_btn = gr.Button("Browse...", scale=1)
@@ -2065,7 +2533,7 @@ def build_app() -> gr.Blocks:
                 )
                 review_interrupt_btn.click(interrupt_review_ui, [], [review_interrupt_btn])
 
-            with gr.Tab("Models") as models_tab:
+            with gr.Tab("Models", interactive=False) as models_tab:
                 gr.Markdown(
                     config_mod.MODELS_TAB_INTRO.format(ignored_substrings=", ".join(IGNORED_SUBSTRINGS))
                 )
@@ -2138,15 +2606,21 @@ def build_app() -> gr.Blocks:
                     [models_action_btn],
                 )
 
-            with gr.Tab("Settings", id="settings"):
-                with gr.Tabs():
-                    with gr.Tab("Llama"):
+            with gr.Tab("Settings", id="settings") as settings_tab:
+                # Declared here, before settings_tabs opens, not as a
+                # direct child of `with gr.Tabs()` itself - see current_
+                # tab_label_state's own comment above for why a gr.State
+                # directly inside a Tabs block was confirmed live to
+                # corrupt the rendered tab strip.
+                current_settings_subtab_state = gr.State("llama-settings")
+                with gr.Tabs() as settings_tabs:
+                    with gr.Tab("Llama", id="llama-settings") as llama_settings_tab:
                         with gr.Group():
                             server_mode = gr.Radio(
                                 choices=[
                                     (
                                         "Managed: the llama server is managed by the UI, model management enabled",
-                                        "auto",
+                                        "managed",
                                     ),
                                     (
                                         "External: the llama server is managed by the user",
@@ -2157,12 +2631,9 @@ def build_app() -> gr.Blocks:
                                 label="Server mode",
                                 elem_id="server-mode-radio",
                             )
-                            with gr.Row():
-                                server_host = gr.Textbox(label="Host (auto mode)", value=cfg.server_host)
-                                server_port = gr.Number(label="Port (auto mode)", value=cfg.server_port, precision=0)
-                            external_url = gr.Textbox(
-                                label="External server URL (external mode)", value=cfg.external_url
-                            )
+
+                        with gr.Group(visible=(cfg.server_mode == "managed")) as managed_server_group:
+                            server_port = gr.Number(label="Port (managed mode)", value=cfg.server_port, precision=0)
                             with gr.Row():
                                 n_gpu_layers = gr.Textbox(
                                     label="GPU layers ('auto', 'all', or an exact number)",
@@ -2172,6 +2643,25 @@ def build_app() -> gr.Blocks:
                             extra_server_args = gr.Textbox(
                                 label="Extra llama-server arguments", value=cfg.extra_server_args
                             )
+                            with gr.Row():
+                                start_llama_btn = gr.Button(
+                                    "Start llama server", interactive=False, variant="secondary"
+                                )
+                                end_llama_btn = gr.Button("End llama server", interactive=False)
+                            autostart_managed_llama = gr.Checkbox(
+                                label="Autostart on app launch (if installed but not already running)",
+                                value=cfg.autostart_managed_llama,
+                            )
+
+                        with gr.Group(visible=(cfg.server_mode == "external")) as external_server_group:
+                            external_url = gr.Textbox(label="External server URL", value=cfg.external_url)
+                            verify_external_btn = gr.Button("Verify")
+
+                        # Shared by both mode-conditional groups above
+                        # (only one of which is ever visible at a time),
+                        # rather than one status box per group - Start/
+                        # End/Verify never fire at the same moment anyway.
+                        llama_lifecycle_status = gr.Textbox(show_label=False, container=False, interactive=False)
 
                         with gr.Group():
                             prompt_template = gr.Textbox(
@@ -2185,10 +2675,45 @@ def build_app() -> gr.Blocks:
                                 label="Request timeout (seconds)", value=cfg.request_timeout, precision=0
                             )
 
-                    with gr.Tab("Hydra"):
+                        # Purely cosmetic (which fields are relevant to the
+                        # selected mode) - server_mode itself is still the
+                        # one source of truth for which mode is active;
+                        # this never needs to be read back, only pushed to.
+                        server_mode.change(
+                            lambda mode: (gr.update(visible=mode == "managed"), gr.update(visible=mode == "external")),
+                            [server_mode],
+                            [managed_server_group, external_server_group],
+                        )
+                        # Both chain the same immediate refresh
+                        # save_settings_btn already uses (see its own
+                        # comment) - Start/End change server state
+                        # directly, so waiting up to 8s for the next
+                        # reachability_timer tick to reflect it would be
+                        # the exact same staleness that fix already
+                        # addressed for settings saves. current_tab_label_
+                        # state is "Settings" here too (these buttons only
+                        # exist on that tab), so push_to_settings is
+                        # always a no-op, not a real redirect.
+                        start_llama_btn.click(_start_managed_llama_ui, [], [llama_lifecycle_status]).then(
+                            _refresh_reachability_ui, [current_tab_label_state],
+                            [
+                                models_tab, single_tab, batch_tab, start_llama_btn, end_llama_btn, main_tabs,
+                                current_tab_label_state,
+                            ],
+                        )
+                        end_llama_btn.click(_end_managed_llama_ui, [], [llama_lifecycle_status]).then(
+                            _refresh_reachability_ui, [current_tab_label_state],
+                            [
+                                models_tab, single_tab, batch_tab, start_llama_btn, end_llama_btn, main_tabs,
+                                current_tab_label_state,
+                            ],
+                        )
+                        verify_external_btn.click(_verify_external_ui, [external_url], [llama_lifecycle_status])
+
+                    with gr.Tab("Hydra", id="hydra-settings") as hydra_settings_tab:
                         gr.Markdown("Not implemented yet.")
 
-                    with gr.Tab("Image resizing"):
+                    with gr.Tab("Image resizing", id="image-resizing-settings") as image_resizing_settings_tab:
                         with gr.Group():
                             resize_enabled = gr.Checkbox(
                                 label="Downscale oversized images before sending to the model",
@@ -2206,7 +2731,7 @@ def build_app() -> gr.Blocks:
                                     value=cfg.snap_multiple, precision=0, show_label=False,
                                 )
 
-                    with gr.Tab("Captioning defaults"):
+                    with gr.Tab("Captioning defaults", id="captioning-defaults-settings") as captioning_defaults_settings_tab:
                         with gr.Group():
                             trigger_word = gr.Textbox(label="Default trigger word", value=cfg.trigger_word)
                             with gr.Row():
@@ -2217,10 +2742,19 @@ def build_app() -> gr.Blocks:
                                     label="Recursive batch by default", value=cfg.recursive_batch
                                 )
 
-                    with gr.Tab("Debug"):
+                    # id="debug-settings" - the one fixed, never-gated
+                    # fallback landing spot for _fallback_tab_safety_ui
+                    # (see its own comment): unlike the other four
+                    # sub-tabs above (all disabled while a caption is
+                    # running - see _settings_gating_ui) and unlike the
+                    # top-level Debug tab further down (conditionally
+                    # hidden by debug_tab_enabled), this sub-tab is just a
+                    # checkbox with no live effect of its own, so there's
+                    # never a reason to gate it.
+                    with gr.Tab("Debug", id="debug-settings"):
                         with gr.Group():
                             debug_tab_enabled = gr.Checkbox(
-                                label="Enable Debug tab (requires app restart)",
+                                label="Enable Debuglog tab (requires app restart)",
                                 value=cfg.debug_tab_enabled,
                             )
 
@@ -2230,8 +2764,8 @@ def build_app() -> gr.Blocks:
                 settings_status = gr.Textbox(show_label=False, container=False, interactive=False)
 
                 settings_inputs = [
-                    server_mode, server_host, server_port, external_url,
-                    n_gpu_layers, context_size, extra_server_args,
+                    server_mode, server_port, external_url,
+                    n_gpu_layers, context_size, extra_server_args, autostart_managed_llama,
                     resize_enabled, resize_target_mp, snap_enabled, snap_multiple,
                     prompt_template, temperature, top_p, max_tokens, request_timeout,
                     trigger_word, overwrite_existing, recursive_batch, debug_tab_enabled,
@@ -2241,17 +2775,21 @@ def build_app() -> gr.Blocks:
                     # check_status/_cached_controllable/_cached_reachable
                     # read), and the Models/Single-image/Batch-processing
                     # tabs' interactive state would otherwise be stale for
-                    # up to 15s until reachability_timer's next tick -
+                    # up to 8s until reachability_timer's next tick -
                     # refresh it immediately instead. current_tab_label_
                     # state is "Settings" here (this click can only happen
                     # from the Settings tab), so the push-to-Settings
                     # branch in _refresh_reachability_ui is always a no-op
                     # in this context, not a real redirect.
-                    _refresh_reachability_ui, [current_tab_label_state], [models_tab, single_tab, batch_tab, main_tabs],
+                    _refresh_reachability_ui, [current_tab_label_state],
+                    [
+                        models_tab, single_tab, batch_tab, start_llama_btn, end_llama_btn, main_tabs,
+                        current_tab_label_state,
+                    ],
                 )
                 restart_app_btn.click(restart_app_ui, [], [])
 
-            with gr.Tab("Debug", visible=cfg.debug_tab_enabled):
+            with gr.Tab("Debuglog", visible=cfg.debug_tab_enabled):
                 gr.Markdown(f"**Python debug log** (also written to `{PY_LOG_PATH}`)")
                 debug_python_box = gr.Textbox(
                     lines=18, max_lines=18, interactive=False, show_label=False,
@@ -2277,12 +2815,20 @@ def build_app() -> gr.Blocks:
         # whatever visibility was declared at Blocks-build time, not the
         # latest server-pushed state - Gradio's own quirk, not something
         # we did. status_timer already self-corrects that within 2s (see
-        # _operation_button_states' docstring), but re-running it right on
+        # _update_ui_status' docstring), but re-running it right on
         # tab-select too makes the correction immediate instead of a
         # brief, harmless flash of both Run and Interrupt at once.
-        single_tab.select(_operation_button_states, [], _run_interrupt_btns)
-        batch_tab.select(_operation_button_states, [], _run_interrupt_btns)
-        review_tab.select(_operation_button_states, [], _run_interrupt_btns)
+        single_tab.select(_update_ui_status, [], _run_interrupt_btns)
+        batch_tab.select(_update_ui_status, [], _run_interrupt_btns)
+        review_tab.select(_update_ui_status, [], _run_interrupt_btns)
+        # Tracks which Settings sub-tab was genuinely clicked into, as
+        # opposed to whatever settings_tabs is currently displaying (see
+        # _on_settings_subtab_select's own docstring for why those two
+        # things need to be kept separate).
+        settings_tabs.select(_on_settings_subtab_select, [], [current_settings_subtab_state])
+        # Redirects to Debug on entering Settings while the sub-tabs are
+        # disabled - see _settings_subtab_entry_ui's own docstring.
+        settings_tab.select(_settings_subtab_entry_ui, [current_settings_subtab_state], [settings_tabs])
 
         # Tracks which top-level tab is currently selected (declared up by
         # main_tabs' own definition, see the comment there) purely so
@@ -2292,9 +2838,17 @@ def build_app() -> gr.Blocks:
         # see that function's docstring.
         main_tabs.select(_on_main_tab_select, [], [current_tab_label_state])
 
+        _settings_gated_tabs = [
+            llama_settings_tab, hydra_settings_tab, image_resizing_settings_tab, captioning_defaults_settings_tab,
+        ]
+
         status_timer = gr.Timer(2.0)
         status_timer.tick(get_status_text, [], [status_bar])
-        status_timer.tick(_operation_button_states, [], _run_interrupt_btns)
+        status_timer.tick(_update_ui_status, [], _run_interrupt_btns)
+        status_timer.tick(_settings_gating_ui, [], _settings_gated_tabs)
+        status_timer.tick(
+            _fallback_tab_safety_ui, [current_tab_label_state], [main_tabs, settings_tabs, current_tab_label_state]
+        )
         status_timer.tick(_download_status_ui, [], [download_status_row, download_status_text])
         status_timer.tick(_download_triggered_refresh_ui, [models_selected_folder_state], _models_scan_outputs)
         if cfg.debug_tab_enabled:
@@ -2305,21 +2859,26 @@ def build_app() -> gr.Blocks:
         # - it's a real network call (external mode), unlike everything else
         # status_timer drives, so it doesn't need or want a 2s cadence. Its
         # result is picked up by the very next status_timer tick afterward
-        # (_operation_button_states reads the cache, doesn't recompute it)
+        # (_update_ui_status reads the cache, doesn't recompute it)
         # for Single/Batch/Recaption's own Run/Recaption BUTTON gating; the
         # Models/Single-image/Batch-processing TABS' own interactive state
         # is set directly below instead, since gating those also needs to
         # know (and occasionally override) which tab is currently selected
         # - see _refresh_reachability_ui's docstring.
-        reachability_timer = gr.Timer(15.0)
+        reachability_timer = gr.Timer(8.0)
         reachability_timer.tick(
-            _refresh_reachability_ui, [current_tab_label_state], [models_tab, single_tab, batch_tab, main_tabs]
+            _refresh_reachability_ui, [current_tab_label_state],
+            [
+                models_tab, single_tab, batch_tab, start_llama_btn, end_llama_btn, main_tabs,
+                current_tab_label_state,
+            ],
         )
 
         demo.load(get_status_text, [], [status_bar])
         demo.load(models_refresh_ui, [models_selected_folder_state], _models_scan_outputs)
         demo.load(_download_status_ui, [], [download_status_row, download_status_text])
-        # _operation_button_states reads the reachability cache rather than
+        demo.load(_settings_gating_ui, [], _settings_gated_tabs)
+        # _update_ui_status reads the reachability cache rather than
         # checking fresh (see its own docstring) - chained after (not a
         # parallel demo.load, which it used to be) specifically so it
         # always sees a just-refreshed cache, not whatever the optimistic
@@ -2327,9 +2886,20 @@ def build_app() -> gr.Blocks:
         # ui's real (and slower - a live network call) check to the punch.
         # That race was real: Single/Batch could show enabled on a fresh
         # page load against an unreachable server, correcting only once
-        # status_timer's first 2s tick came around, if at all.
-        demo.load(_startup_reachability_ui, [], [main_tabs, models_tab, single_tab, batch_tab]).then(
-            _operation_button_states, [], _run_interrupt_btns
+        # status_timer's first 2s tick came around, if at all. Autostart
+        # (if enabled) chains after that, deliberately - the initial UI
+        # renders in its correct not-yet-running state first, then
+        # autostart is a background upgrade on top of it, never a
+        # substitute for landing correctly in the first place.
+        demo.load(
+            _startup_reachability_ui, [],
+            [main_tabs, models_tab, single_tab, batch_tab, start_llama_btn, end_llama_btn, current_tab_label_state],
+        ).then(_update_ui_status, [], _run_interrupt_btns).then(
+            _autostart_managed_llama_ui, [],
+            [
+                models_tab, single_tab, batch_tab, start_llama_btn, end_llama_btn, main_tabs,
+                current_tab_label_state,
+            ],
         )
 
     return demo

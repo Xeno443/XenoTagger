@@ -1,9 +1,11 @@
 """llama-server process lifecycle.
 
 Two modes, chosen via AppConfig.server_mode:
-  - "auto": if something already answers at server_host:server_port, use it
-    and never touch it. Otherwise start llama-server.exe ourselves and stop
-    it again when we're done.
+  - "managed": if something already answers at MANAGED_HOST:server_port,
+    use it and never touch it. Otherwise start llama-server.exe ourselves
+    (always bound to MANAGED_HOST - a subprocess this app spawns and talks
+    to itself has no reason to bind anywhere else) and stop it again when
+    we're done.
   - "external": never manage a process, always talk to external_url
     (which may point at another machine entirely) - this app has no
     business touching anything there, ever.
@@ -54,6 +56,12 @@ ROOT_DIR = Path(__file__).resolve().parent.parent.parent
 LLAMA_SERVER_EXE = ROOT_DIR / "llama-cuda" / "llama-server.exe"
 LOG_PATH = ROOT_DIR / "webui" / "logs" / "llama-server.log"
 
+# Managed mode always binds/talks to localhost - it's a subprocess this
+# app itself spawns and is the only intended client of, so there's no
+# real use case for a user-configurable host there (unlike external mode,
+# which legitimately may point at a different machine).
+MANAGED_HOST = "127.0.0.1"
+
 log = logging.getLogger(__name__)
 
 
@@ -64,24 +72,34 @@ class ServerError(RuntimeError):
 @dataclass
 class ServerStatus:
     """Cheap, read-only categorization for UI gating - never starts or
-    stops anything, unlike resolve_server(). reachable: can Single/Batch/
-    Recaption actually caption right now (or, for auto mode, could they
-    once a server lazily starts on the first real request). controllable:
-    can the Models tab's model/mmproj selection have any actual effect at
-    the *mode* level - True for auto mode (we can always start/restart
-    what we want, whether or not anything's running yet), False for
-    external mode (never ours to tell what to load). healthy: is
-    something actually answering right now, as opposed to auto mode's
-    "not running yet, but installed" case (also reachable=True) - kept
-    separate from reachable so a caller can tell those two apart without
-    another network call. app.py additionally narrows controllable by
-    session ownership when healthy is True (see its _cached_controllable):
-    a healthy auto-mode server this app didn't start itself might be
-    running any model at all, which this module has no way to know."""
+    stops anything, unlike resolve_server(). reachable: is something
+    actually answering a health check right now - the only thing that
+    gates Single/Batch/Recaption. There's no more "not running yet, but
+    installed, so count it as reachable anyway" case: starting a managed
+    server is now always an explicit action (a button, or autostart at
+    launch), never an implicit side effect of clicking Caption, so
+    "installed but idle" is just as unusable right now as "not installed
+    at all" - both are reachable=False.
+
+    controllable: can the Models tab's model/mmproj selection have any
+    actual effect at the *mode* level - True for managed mode once
+    llama.cpp is installed (whether or not anything's running yet), False
+    for external mode (never ours to tell what to load) and for managed
+    mode with nothing installed (nothing to ever control). app.py further
+    narrows this by session ownership when reachable is True (see its
+    _cached_controllable): a healthy managed-mode server this app didn't
+    start itself might be running any model at all, which this module has
+    no way to know.
+
+    installed: managed mode only - is llama-server.exe present on disk.
+    Not meaningful for external mode (always False there). Exists so a
+    caller can tell "not installed" apart from "installed but idle"
+    without another network call - both are reachable=False, but they
+    need different status text/button behavior (see app.py)."""
 
     reachable: bool
     controllable: bool
-    healthy: bool
+    installed: bool
     reason: str = ""
 
 
@@ -142,7 +160,7 @@ def _start_process(cfg: AppConfig, model_path: Path, mmproj_path: Path) -> subpr
         str(LLAMA_SERVER_EXE),
         "-m", str(model_path),
         "--mmproj", str(mmproj_path),
-        "--host", cfg.server_host,
+        "--host", MANAGED_HOST,
         "--port", str(cfg.server_port),
         "-ngl", str(cfg.n_gpu_layers),
         "-c", str(cfg.context_size),
@@ -176,7 +194,7 @@ def resolve_server(
         log.debug("Using external server at %s", base_url)
         return base_url, None
 
-    base_url = f"http://{cfg.server_host}:{cfg.server_port}"
+    base_url = f"http://{MANAGED_HOST}:{cfg.server_port}"
     if is_healthy(base_url):
         log.info("Reusing already-running server at %s", base_url)
         return base_url, None
@@ -213,24 +231,22 @@ def check_status(cfg: AppConfig) -> ServerStatus:
     Models tab's model/mmproj selection means anything."""
     if cfg.server_mode == "external":
         base_url = cfg.external_url.rstrip("/")
-        healthy = is_healthy(base_url)
-        if healthy:
-            return ServerStatus(reachable=True, controllable=False, healthy=True)
+        if is_healthy(base_url):
+            return ServerStatus(reachable=True, controllable=False, installed=False)
         return ServerStatus(
-            reachable=False, controllable=False, healthy=False, reason=f"No server responding at {base_url}."
+            reachable=False, controllable=False, installed=False,
+            reason=f"No server responding at {base_url}.",
         )
 
-    # auto/managed - always controllable at the mode level, whether or not
-    # anything's running yet: reusing an already-healthy server or
-    # starting fresh are both things this mode can always eventually do.
-    # (app.py further narrows this when healthy - see ServerStatus's own
-    # docstring.)
-    base_url = f"http://{cfg.server_host}:{cfg.server_port}"
+    base_url = f"http://{MANAGED_HOST}:{cfg.server_port}"
     if is_healthy(base_url):
-        return ServerStatus(reachable=True, controllable=True, healthy=True)
+        return ServerStatus(reachable=True, controllable=True, installed=True)
     if LLAMA_SERVER_EXE.exists():
-        return ServerStatus(reachable=True, controllable=True, healthy=False)
+        return ServerStatus(
+            reachable=False, controllable=True, installed=True,
+            reason="llama-server isn't running yet.",
+        )
     return ServerStatus(
-        reachable=False, controllable=True, healthy=False,
-        reason="llama.cpp isn't installed yet, and nothing is already running locally.",
+        reachable=False, controllable=False, installed=False,
+        reason="llama.cpp isn't installed yet.",
     )

@@ -1,93 +1,199 @@
-# portable-env
+# XenoTagger
 
-A from-scratch, portable Python + Git toolchain for Windows, built as a common
-base that different tool-specific branches extend (e.g. a webui branch,
-a comfyui branch, etc.).
+A Gradio + CLI Python app that captions images for LoRA dataset creation,
+using a local (or remote) llama.cpp multimodal vision server. Point it at
+a folder of images, it writes a `.txt` caption sidecar next to each one.
 
-## Branch model
+This repo used to be the `portable-env` common-base toolchain (worktrees,
+`main`/`webui`/etc. branches). That model is gone — XenoTagger is now a
+**standalone single-branch repo**
+(`https://github.com/Xeno443/XenoTagger.git`). Ignore any leftover
+references elsewhere to worktrees or a `portable-env-<branch>` layout;
+they describe a repo structure this one no longer has.
 
-`main` holds only the common base. Each use case lives on its own branch,
-merging `main` in periodically to pick up common fixes, and adding on top
-whatever launch/update/model-download scripts fit that tool's own
-distribution model (git clone, manual archive download, ...). Those
-distribution-management scripts (branch switching, self-updating) are
-intentionally NOT part of the common base — they depend on how a given
-branch's tool is obtained, which varies per branch.
+## Layout
 
-## Worktrees
+- `webui/app.py` — the Gradio GUI. Single-image, Batch processing,
+  Review (edit/recaption existing captions), Models (local + curated
+  downloads), Settings (Llama/Hydra/Image resizing/Captioning defaults/
+  Debug sub-tabs), an opt-in Debuglog tab. Its own module docstring
+  documents the concurrency model (`_session_lock`/`_operation_lock`/
+  `_config_lock`) and several Gradio layout workarounds in detail — read
+  that before changing button/tab wiring, don't re-derive it.
+- `webui/cli.py` — headless batch captioning, independent entry point.
+  Shares `core/batch.py`/`core/captioner.py` with the GUI; reads/writes
+  the same `webui/config/settings.json`. No UI-specific code ever
+  belongs in `core/`.
+- `webui/core/` — framework-agnostic logic shared by both entry points:
+  - `config.py` — `AppConfig` dataclass, the single source of truth for
+    every setting; `load()`/`save()` for `settings.json`.
+  - `server.py` — llama-server process lifecycle (`managed` mode: we
+    spawn/own it; `external` mode: we just talk to a URL) and
+    `check_status()` for cheap read-only UI gating.
+  - `client.py` — the one place that actually calls llama-server's
+    chat API, plus in-memory image preprocessing.
+  - `captioner.py` — the shared "caption one image" entry point used by
+    Single-image, Batch, and the CLI alike (and the intended hook point
+    for a future Hydra classifier pass, see below).
+  - `batch.py` — directory batch-captioning loop (stateless: a `.txt`
+    sidecar existing is the only "already done" record).
+  - `models.py` — discovers/classifies local GGUF models under
+    `webui/models/`.
+  - `downloads.py` — background curated-model downloader.
+- `webui/config/` — `settings.json` (gitignored, per-machine),
+  `models_source.json` (checked in — curated downloadable model list),
+  `models_cache.json` (gitignored).
+- `setup-tagger.cmd` — downloads a llama.cpp CUDA build + matching
+  cudart into `llama-cuda/` (gitignored). Hardcodes one CUDA version
+  today (see its own TODO comment — older cards may need a different
+  one; no backend picker yet).
+- `run-tagger.cmd` / `tag-cli.cmd` — launch the GUI / CLI through the
+  portable environment.
+- `setup-env.bat` / `environment.bat` — inherited from the portable-env
+  base: build/activate the portable Python + Git toolchain under
+  `system\` (gitignored). Still accurate, unrelated to the worktree
+  model that was dropped.
 
-Branches are worked on as separate `git worktree` checkouts, not by
-switching branches back and forth in one folder. Reason: `system\` is
-several gigabytes and gitignored (see Conventions below), and different
-branches can need conflicting installed packages (e.g. different PyTorch
-builds) — a plain branch switch wouldn't touch `system\` at all (it's
-untracked), so each branch needs its own independent copy on disk rather
-than sharing or rebuilding one every time you switch.
+## VRAM / hardware constraint
 
-Convention: sibling directories, never nested inside another worktree
-(nesting would put the linked worktree's `.git` file inside the parent's
-working tree, where git would see it as untracked embedded-repo clutter
-needing its own ignore rule). Named `portable-env-<branch>`:
+Consumer GPUs this needs to work on commonly have 8–16GB VRAM, often
+with several GB already spoken for by the desktop/browser/editor before
+the app even starts — actual free VRAM at caption time can end up
+smaller than a single model quant under `webui/models/`. Don't assume a
+high-VRAM card: `n_gpu_layers="auto"` (partial CPU offload) is relied on
+as the default behavior, not an optional fallback for edge cases, and
+that needs to keep working down to 12GB and 8GB cards, not just
+whatever the developer happens to have. Development/testing so far has
+mainly been on an RTX 5080 (16GB, typically ~9.5–10.5GB actually free)
+— treat that as one data point, not the floor.
 
-- `portable-env` — the main worktree (holds the real `.git`), branch `main`
-- `portable-env-webui` — linked worktree, branch `webui`
+huihui-ai's abliteration lineage has been the reliable choice for
+refusal-free vision models; other uploaders' "abliterated" tags have
+been confirmed to still refuse on the same content — check a model
+card's lineage back to huihui-ai before trusting the tag alone.
 
-Run `git worktree list` from any of them for the current, authoritative set
-— don't trust this list to stay up to date. To add another: `git worktree
-add -b <branch> ../portable-env-<branch> main` (new branch) or `git worktree
-add ../portable-env-<branch> <branch>` (branch already exists).
+## Major design decisions (llama-server lifecycle rewrite, 2026-08-28/30)
 
-Each worktree needs `setup-env.bat` run in it once to build its own
-`system\`. A coding-assistant session started in one worktree's folder is a
-separate session from one started in another's — they share git history but
-nothing else (not chat context, not `system\`, not gitignored files like
-this repo's old session-handoff notes). This file is the shared context
-between them: every worktree gets whatever version of it its branch last
-merged from `main`, so keep it current rather than relying on a session
-handoff that only the worktree it was written in will ever see.
+The server-management UX went through a full rewrite this session,
+replacing an earlier implicit-lazy-start design:
 
-## Common base
+- Server modes are `"managed"` / `"external"` everywhere (renamed from
+  `"auto"`/`"remote"`; `config.load()` migrates an old `settings.json`
+  automatically). Managed always binds `127.0.0.1` (`server.MANAGED_HOST`)
+  — no more user-configurable host for it. Default managed port is
+  **8901** (was 8080).
+- No more implicit lazy-start from the UI: starting the managed server
+  is always an explicit action — a "Start llama server" button in
+  Settings→Llama, or an "autostart on launch" checkbox that only fires
+  once at app startup, never mid-session. (`get_client()`/
+  `resolve_server()` still lazy-start for the CLI — headless has no
+  "disabled button" concept and still needs that.)
+- "End llama server" is gated on **session ownership**
+  (`_is_server_managed_by_us` / `_session` dict) — this app only ever
+  offers to kill a process it itself started, never someone else's
+  server found already running on the same port.
+- Status is a 5-state label: N/A, idle, error, running (managed) /
+  unreachable, connected (external) — distinguishing "fresh, never
+  started" (idle) from "was running, then unexpectedly stopped" (error,
+  with a crash warning) via an edge-detect on the previous poll. A
+  deliberate "End llama server" click is explicitly NOT labeled "error"
+  (`_expected_stop` flag, set inside `_stop_managed()` itself).
+- Settings is restructured into Llama/Hydra/Image resizing/Captioning
+  defaults/Debug sub-tabs. The four operation-sensitive sub-tabs (not
+  Debug) get their own `interactive=` disabled while a caption job is
+  running (`_settings_gating_ui`) — **deliberately tab-level only, not
+  the fields inside them** (a field-level version was drafted and then
+  reverted — see git history around 2026-08-30 — because it wasn't what
+  was wanted). Separately, entering the Settings tab while those
+  sub-tabs are disabled redirects to Debug and remembers which sub-tab
+  you were genuinely on, restoring it once things re-enable
+  (`_settings_subtab_entry_ui`/`_on_settings_subtab_select`,
+  `current_settings_subtab_state`) — see the file for a known-strange,
+  not-fully-diagnosed edge case still open below.
+- Save Settings behavior differs per field category: the prompt-template
+  bundle applies immediately; switching to external kills an owned
+  managed server; switching to managed never auto-starts; server-process
+  args changed while managed kill (if owned) and optionally restart per
+  the autostart checkbox. A `_config_lock` guards the read-modify-write
+  of `current_cfg` + `config_mod.save()`.
+- Installing llama.cpp itself is explicitly **out of scope** for this
+  pass — "not installed" still just points at `setup-tagger.cmd`, no
+  in-UI installer.
 
-- `setup-env.bat` — builds `system\` from scratch: downloads the WinPython
-  "dot" edition (exact Python version match, self-extracting archive from
-  SourceForge) for `system\python` (already includes pip, headers, import
-  libs — no separate restructuring needed), then PortableGit for
-  `system\git`. Also keeps pip and its build-tooling deps
-  (`setuptools`/`wheel`/`packaging`/`build`/`pyproject_hooks`/`colorama`)
-  upgraded on every run. Idempotent — safe to re-run.
-- `setup-env-classic.bat` — older approach: raw Python embeddable zip,
-  manually restructured into a full-layout distribution (`DLLs`/`Lib`/
-  `Scripts`), then bootstrapped via `get-pip.py`. Kept locally for
-  reference/fallback only — gitignored, not pushed. May get re-added
-  properly later.
-- `environment.bat` — sets `PATH` for `git\bin`/`python`/`python\Scripts`,
-  then calls `environment-local.bat` if one exists next to it. Supports a
-  `passive` argument (just sets env vars and returns); without it, drops into
-  an interactive `cmd.exe` inside `system\python` for poking at the
-  environment manually.
-- `environment-local.bat` — optional, per-branch. Not present on `main`.
-  A branch adds one for its own env vars/PATH additions (e.g. `ffmpeg\bin`,
-  `HF_HOME`, `SKIP_VENV`). `environment.bat` auto-detects and calls it.
+## House rules
 
-## Branch discipline
+- **No venv, ever.** Everything installs straight into `system\python`.
+  Never invoke `system\python\Scripts\*.exe` directly — always
+  `system\python\python.exe -m pip install ...` / `python.exe script.py`.
+- **No custom CSS unless a real built-in Gradio option was checked and
+  confirmed absent first.** `webui/ui_css.py` holds the only two custom
+  rules, each commented with the built-in option that was ruled out.
+- **Never elevate the root logger to DEBUG** — elevate only
+  `logging.getLogger("core")` and the app's own `"app"` logger (fixed
+  name, not `__name__`). Third-party libraries get noisy fast otherwise.
+- Before committing, review `git status`/`git diff` — nothing here
+  needs the old "don't touch main-originated files" branch discipline,
+  that was portable-env-specific and no longer applies.
 
-This repo uses long-lived branches for different use cases (main = common
-base, webui = SD WebUI variant, etc.). Each branch should only ADD files
-on top of main, never modify files that originated on main (setup-env.bat,
-environment.bat, CLAUDE.md, .gitignore).
+## Gradio gotchas hit in this codebase (don't re-discover these)
 
-If a change to a main-originated file seems necessary while working on a
-use-case branch, stop and flag it rather than editing it directly - that
-change likely belongs on main itself (via a generic mechanism like
-environment-local.bat), not on the branch.
+- `gr.SelectData.value` for a `Tab` is **always its label, never its
+  `id`** — confirmed via `gradio/layouts/tabs.py`'s own docstring. An
+  `id` is required to ever target a tab via `gr.update(selected=...)`;
+  without one, a push silently matches nothing. Every `gr.Tab(...)`
+  that's ever a `selected=` target needs an explicit `id=`.
+- A bare `gr.update()` does **not** reliably self-correct/forget a prior
+  real push to a `Tabs` component's `selected=` once the user navigates
+  away and back — always explicitly assert the destination in both
+  directions, never rely on a no-op to "leave it alone."
+- `.select()` fires only on a genuine user click, never on a server-
+  pushed `gr.update(selected=...)` — reliable for top-level `Tabs`, but
+  a **nested** `Tabs` inside a `Tab` that's itself being switched into
+  has, at least once, appeared to fire `.select()` anyway (never fully
+  root-caused — see the open item below).
+- Switching away from and back to a top-level tab remounts nested
+  `Column`s back to their build-time-declared `visible=`, not the
+  latest server-pushed state.
+- `gr.Group()` produces ugly stretched/gapped layouts with mismatched-
+  height siblings — only use for uniform-height stacked rows.
+- `gr.Image` output components refuse to serve a raw file path outside
+  the app's CWD/system temp dir — load via PIL into memory instead.
+- `os.execv`-based restart on Windows spawns a fresh process under an
+  untracked PID — look up whatever's bound to port 7901, don't trust a
+  previously-known task ID.
+- `tkinter` save/browse dialogs only work when the browser and Python
+  process are on the same machine.
 
-Before committing, review `git status` and `git diff` and confirm no
-main-originated files were unintentionally modified.
+## Open / deferred
 
-## Conventions
-
-- Everything under `system\` is regenerated by `setup-env*.bat` and
-  gitignored — never commit anything in there.
-- `_reference\` holds the original SD-webui-specific portable setup this
-  project was split off from, kept locally for cross-referencing while
-  rebuilding. Gitignored, not meant to be committed.
+- **Settings sub-tab redirect has a known "strange effect," not fully
+  diagnosed** — mostly works (tab-level disable while a job runs,
+  redirect-to-Debug on entry, restore the real sub-tab afterward via
+  `current_settings_subtab_state`), but the user flagged residual odd
+  behavior after live testing on 2026-08-30. Revisit before relying on
+  it further; the nested-`Tabs`-fires-`.select()`-anyway gotcha above is
+  the leading suspect.
+- **Nothing has been committed since `4b45cd5`** ("Gate captioning and
+  Models tabs on live server reachability, restructure Settings") — the
+  entire server-lifecycle rewrite above is sitting uncommitted in the
+  working tree. Review and commit in logical chunks rather than one
+  giant commit.
+- **Model management / llama.cpp setup UI**: curated GGUF downloading
+  is built (`core/downloads.py`, `models_source.json`). Applying the
+  same pattern to llama.cpp itself (CUDA/Vulkan/CPU backend picker,
+  `nvidia-smi`-based default) is still just a design sketch, not
+  implemented — `setup-tagger.cmd` remains a hardcoded-CUDA-version
+  manual script.
+- **Hydra tagger integration — not started in this repo.** A second-
+  stage Hydra 3.5 (RedRocket) e621-style tag classifier, meant to
+  ground NSFW/explicit tagging the VLM alone is weak at, is prototyped
+  separately in a standalone `HydraTagger` repo. `core/captioner.py`'s
+  shared entry point exists partly so this only needs wiring in once.
+- Smaller deferred items: an "unsaved Settings changes" indicator; the
+  brief tab-disabled flash before redirect on a fresh page load; a
+  possible rare race between overlapping Start/End llama clicks.
+- Live UI behavior in this environment can only be verified by
+  scripted simulation (`py_compile` + `build_app()` + mocked event
+  handlers) — there is no browser access here. Treat "verified" claims
+  in git history/PR descriptions accordingly; a live pass by the user
+  is still the real test.
