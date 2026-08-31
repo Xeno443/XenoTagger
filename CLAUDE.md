@@ -152,8 +152,8 @@ replacing an earlier implicit-lazy-start design:
 
 A second-stage e621 tag classifier (`webui/vendor/rr_hydra/`,
 `core/hydra_classifier.py`/`core/hydra_install.py`, Settings → Hydra)
-appends Hydra's own tags after the VLM's caption
-(`"<trigger>, <VLM paragraph>, tag1, tag2, ..."`) to ground NSFW/explicit
+appends Hydra's own tags after the VLM's caption, on their own line
+(`"<trigger>, <VLM paragraph>\ntag1, tag2, ..."`) to ground NSFW/explicit
 tagging the VLM alone is weak at. Prototyped separately first in a
 standalone `HydraTagger` repo; this is the real integration.
 

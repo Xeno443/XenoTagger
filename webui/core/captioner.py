@@ -81,7 +81,7 @@ def caption_image(
         try:
             hydra_result = hydra_classifier.classify(image, cfg)
             if hydra_result.tag_text:
-                caption = f"{caption}, {hydra_result.tag_text}"
+                caption = f"{caption}\n{hydra_result.tag_text}"
         except hydra_classifier.HydraError as exc:
             log.warning("caption_image(): Hydra classification failed, continuing without it: %s", exc)
 
