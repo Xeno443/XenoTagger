@@ -1,5 +1,6 @@
 _reference/
 system/
+.venv/
 setup-env-classic.bat
 handoff.md
 llama/

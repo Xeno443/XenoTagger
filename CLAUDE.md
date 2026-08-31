@@ -80,6 +80,23 @@ they describe a repo structure this one no longer has.
   `setup-tagger.cmd` (which used to also install a hardcoded CUDA-only
   llama.cpp build) is gone — that job moved to `core/llama_install.py`
   above.
+- `setup-venv.bat` / `run-tagger-venv.cmd` / `tag-cli-venv.cmd`
+  (added 2026-09-01) — an alternative to the portable environment for
+  anyone who already has git and Python installed systemwide and would
+  rather use a normal venv. `setup-venv.bat` creates `.venv\` (gitignored)
+  via the systemwide `python` on PATH and installs
+  `webui/requirements.txt` into it; the two `-venv.cmd` launchers mirror
+  `run-tagger.cmd`/`tag-cli.cmd` but target `.venv\Scripts\python.exe`
+  instead of `system\python\python.exe`. Doesn't touch `system\` at all
+  — both setups coexist untouched side by side in the same checkout, and
+  nothing about the portable-env path changed. `webui/requirements.txt`
+  has no version pins, so a systemwide Python that's a different version
+  than the portable env's pinned one (see `setup-env.bat`) is expected to
+  just work. This is why `core/hydra_install.py`'s pip-install subprocess
+  was changed from a hardcoded `system\python\python.exe` path to
+  `sys.executable` — it now targets whichever interpreter is actually
+  running the app, portable or venv, instead of always assuming the
+  portable one.
 
 ## VRAM / hardware constraint
 
@@ -353,9 +370,17 @@ mid-call.
 
 ## House rules
 
-- **No venv, ever.** Everything installs straight into `system\python`.
-  Never invoke `system\python\Scripts\*.exe` directly — always
+- **No venv, ever — for this repo's own portable-env path.** Everything
+  installs straight into `system\python`. Never invoke
+  `system\python\Scripts\*.exe` directly — always
   `system\python\python.exe -m pip install ...` / `python.exe script.py`.
+  This is about `system\python` specifically, not a blanket objection to
+  venvs everywhere: `setup-venv.bat` (see Layout above) offers an
+  end-user-facing `.venv\` as an explicit alternative for anyone who'd
+  rather not use the portable environment at all. Don't reintroduce a
+  venv *inside* the portable-env workflow itself, e.g. as some
+  in-between layer under `system\python` — that's what this rule
+  actually rules out.
 - **No custom CSS unless a real built-in Gradio option was checked and
   confirmed absent first.** `webui/ui_css.py` holds the only two custom
   rules, each commented with the built-in option that was ruled out.
