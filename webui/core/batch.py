@@ -61,10 +61,9 @@ class BatchResult:
     errors: list[tuple[Path, str]] = field(default_factory=list)
 
 
-def find_images(directory: Path, recursive: bool = False) -> list[Path]:
-    pattern_iter = directory.rglob("*") if recursive else directory.glob("*")
+def find_images(directory: Path) -> list[Path]:
     return sorted(
-        p for p in pattern_iter if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+        p for p in directory.glob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
     )
 
 
@@ -74,7 +73,7 @@ class ReviewItem:
     status: str  # "new" (no .txt, no .issue), "captioned" (.txt exists), "error" (.issue exists)
 
 
-def scan_review_status(directory: Path, recursive: bool = False) -> list[ReviewItem]:
+def scan_review_status(directory: Path) -> list[ReviewItem]:
     """For the Review tab: classifies every image in `directory` by its
     current on-disk state, using the exact same file-presence rules
     run_batch() itself uses to decide skip/retry. A pure snapshot, same
@@ -83,7 +82,7 @@ def scan_review_status(directory: Path, recursive: bool = False) -> list[ReviewI
     fresh read."""
     directory = Path(directory)
     items = []
-    for image_path in find_images(directory, recursive=recursive):
+    for image_path in find_images(directory):
         txt_path = image_path.with_suffix(".txt")
         issue_path = Path(f"{txt_path}{ISSUE_SUFFIX}")
         if txt_path.exists():
@@ -100,7 +99,6 @@ def run_batch(
     directory: Path,
     client: LlamaClient,
     cfg: AppConfig,
-    recursive: bool = False,
     overwrite: bool = False,
     trigger_word: Optional[str] = None,
     progress_cb: Optional[ProgressCallback] = None,
@@ -122,12 +120,12 @@ def run_batch(
     directly.
     """
     directory = Path(directory)
-    images = find_images(directory, recursive=recursive)
+    images = find_images(directory)
     result = BatchResult()
     total = len(images)
     log.info(
-        "Starting batch: %d image(s) in %s (recursive=%s, overwrite=%s)",
-        total, directory, recursive, overwrite,
+        "Starting batch: %d image(s) in %s (overwrite=%s)",
+        total, directory, overwrite,
     )
 
     for i, image_path in enumerate(images, start=1):

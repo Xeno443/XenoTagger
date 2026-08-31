@@ -581,6 +581,13 @@ def _goto_llama_settings_ui():
     return gr.update(selected="settings"), gr.update(selected="llama-settings"), "llama-settings", "Settings"
 
 
+def _goto_hydra_settings_ui():
+    """The Models tab's "Manage Hydra" button's click target - same pure
+    navigation as _goto_llama_settings_ui above, to Settings -> Hydra
+    instead."""
+    return gr.update(selected="settings"), gr.update(selected="hydra-settings"), "hydra-settings", "Settings"
+
+
 def _llama_lifecycle_button_updates(cfg: AppConfig, status: ServerStatus):
     """(start_btn_update, end_btn_update) for the Llama settings tab's
     two lifecycle buttons - shared by _refresh_reachability_ui and
@@ -695,34 +702,36 @@ def _autostart_managed_llama_ui():
 
 
 def _autoload_hydra_model_ui():
-    """Chained onto the END of the same demo.load chain
-    _autostart_managed_llama_ui is already on (after it, never before or
-    in parallel) - deliberately, so that when both autostart-llama and
-    autoload-Hydra are enabled, Hydra's load attempt happens against
-    whatever VRAM llama-server's own autostart already claimed. That
-    ordering is the actual real-world scenario worth exercising (see
-    AppConfig.hydra_autoload_model's own docstring) - loading Hydra
-    first, then llama-server, would never surface the coexistence
-    problem this is meant to test for. Silent no-op unless hydra_enabled,
+    """Chained onto the demo.load chain BEFORE _autostart_managed_llama_ui
+    (deliberately reordered - see AppConfig.hydra_autoload_model's own
+    docstring) - so that when both autostart-llama and autoload-Hydra are
+    enabled, Hydra gets first pick of a clean, fully-free VRAM budget and
+    llama-server's own n_gpu_layers="auto" (which gracefully adapts to
+    reduced free VRAM, unlike Hydra's own all-or-nothing load) sizes
+    itself around whatever's left. Silent no-op unless hydra_enabled,
     hydra_autoload_model, deps+model are both present, and nothing is
     already loaded - same "no popup for didn't-autostart" convention as
-    _autostart_managed_llama_ui itself. A real load failure (e.g. a CUDA
-    OOM) is still surfaced via gr.Info + the status text, exactly like a
-    manual Load click would."""
+    _autostart_managed_llama_ui itself.
+
+    The actual load - including the stop-managed-llama/restart dance,
+    now moot here in the normal case since nothing's started yet this
+    early in a fresh launch, but still a real safety net for an edge
+    case like an orphaned managed process surviving an app crash - is
+    delegated to _load_hydra_with_llama_coexistence() (see its own
+    docstring), the same shared logic the manual Load button uses, so
+    correctness doesn't depend on this function's own ordering assumption
+    staying true forever."""
     cfg = current_cfg
     noop = (gr.update(), gr.update())
     if not (cfg.hydra_enabled and cfg.hydra_autoload_model):
-        return noop
+        yield noop
+        return
     st = hydra_classifier.status()
     if not (st.deps_installed and st.model_downloaded) or st.loaded:
-        return noop
+        yield noop
+        return
     _notify("Loading Hydra model automatically (autoload is enabled)...")
-    try:
-        hydra_classifier.load(cfg)
-        message = f"Hydra model loaded on {hydra_classifier.status().device}."
-    except hydra_classifier.HydraError as exc:
-        message = f"Couldn't autoload Hydra model: {exc}"
-    return gr.update(value=message), gr.update(value=_hydra_status_text())
+    yield from _load_hydra_with_llama_coexistence()
 
 
 # ------------------------------------------------------ Operation tracking
@@ -1399,13 +1408,13 @@ def _format_duration(seconds: float) -> str:
     return f"{hours}h {minutes}m"
 
 
-def run_batch_ui(directory_str, recursive, overwrite, trigger_word_override):
+def run_batch_ui(directory_str, overwrite, trigger_word_override):
     blocked = _operation_blocked_by()
     if blocked:
         yield blocked, "", None, "", _RUN_BUSY, gr.update(), gr.update(), gr.update()
         return
 
-    log.info("Batch requested: %s (recursive=%s, overwrite=%s)", directory_str, recursive, overwrite)
+    log.info("Batch requested: %s (overwrite=%s)", directory_str, overwrite)
     directory = Path(directory_str) if directory_str else None
     if not directory or not directory.is_dir():
         log.warning("Batch: not a directory: %s", directory_str)
@@ -1434,7 +1443,7 @@ def run_batch_ui(directory_str, recursive, overwrite, trigger_word_override):
         if not already_up:
             yield "Processing...", "", None, "", gr.update(), gr.update(), gr.update(), gr.update()
 
-        images = find_images(directory, recursive=recursive)
+        images = find_images(directory)
         if not images:
             log.warning("Batch: no images found in %s", directory)
             yield "No images found in that directory.", "", None, "", *idle_state
@@ -1454,7 +1463,6 @@ def run_batch_ui(directory_str, recursive, overwrite, trigger_word_override):
             try:
                 result_holder["result"] = run_batch(
                     directory, client, current_cfg,
-                    recursive=recursive,
                     overwrite=overwrite,
                     trigger_word=trigger_word_override,
                     progress_cb=progress_cb,
@@ -1807,7 +1815,7 @@ def save_settings_ui(
     n_gpu_layers, context_size, extra_server_args, autostart_managed_llama,
     resize_enabled, resize_target_mp, snap_enabled, snap_multiple,
     prompt_template, temperature, top_p, max_tokens, request_timeout,
-    trigger_word, overwrite_existing, recursive_batch, debug_tab_enabled,
+    trigger_word, overwrite_existing, debug_tab_enabled,
     hydra_enabled, hydra_device, hydra_confidence, hydra_threshold, hydra_implications,
     hydra_exclude_categories, hydra_exclude_tags, hydra_max_tags, hydra_autoload_model,
 ) -> str:
@@ -1852,7 +1860,6 @@ def save_settings_ui(
             request_timeout=int(request_timeout),
             trigger_word=trigger_word,
             overwrite_existing=bool(overwrite_existing),
-            recursive_batch=bool(recursive_batch),
             debug_tab_enabled=bool(debug_tab_enabled),
             hydra_enabled=bool(hydra_enabled),
             hydra_device=hydra_device,
@@ -2131,7 +2138,7 @@ def _llama_install_start_ui(backend_id: str) -> str:
         if _install_thread is not None and _install_thread.is_alive():
             return "An install is already in progress."
     if is_healthy(_managed_base_url(current_cfg)):
-        return "Stop the running llama-server first (\"End llama server\" above) before installing/reinstalling."
+        return "Stop the running llama-server first (\"Stop llama server\" above) before installing/reinstalling."
     with _install_lock:
         _install_abort_requested = False
         _install_state.update(phase="planning", bytes_done=0, bytes_total=0)
@@ -2160,14 +2167,23 @@ def _llama_install_abort_ui() -> str:
 
 def _llama_install_status_ui():
     """(row_visibility, progress_html, lifecycle_infotext_update,
-    installed_backend_text_update) - wired to the same 2s status_timer as
-    the download-status row, plus called directly after Install/Abort
-    clicks for immediate feedback. lifecycle_infotext_update only ever
-    carries a real value on the tick that pops a pending _install_announce
-    (every other tick is a no-op gr.update(), so it never overwrites a
-    Start/End/Verify message that isn't actually stale); installed_backend_
-    text_update is always recomputed fresh from disk - just a marker-file
-    read, cheap enough not to need the same one-shot treatment."""
+    backend_dropdown_update, install_btn_update, abort_btn_update,
+    installed_caption_update, autostart_checkbox_update) - wired to the
+    same 2s status_timer as the download-status row, plus called
+    directly after Install/Abort clicks for immediate feedback.
+
+    lifecycle_infotext_update only ever carries a real value on the tick
+    that pops a pending _install_announce (every other tick is a no-op
+    gr.update(), so it never overwrites a Start/Stop/Verify message that
+    isn't actually stale). backend_dropdown_update only pushes a value
+    right after an install actually completes (the same announce tick) -
+    NOT on every idle poll, which would otherwise fight a user's own
+    in-progress dropdown pick before they've clicked Install/Reinstall.
+    install_btn_update/abort_btn_update/installed_caption_update/
+    autostart_checkbox_update are read-only derived state (label text
+    and interactive= only), safe to recompute every tick with no such
+    risk - autostart_managed_llama only makes sense once something is
+    actually installed to autostart."""
     global _install_announce
     with _install_lock:
         phase = _install_state["phase"]
@@ -2175,27 +2191,48 @@ def _llama_install_status_ui():
         bytes_total = _install_state["bytes_total"]
         announce = _install_announce
         _install_announce = None
+    running = phase in ("planning", "downloading", "extracting")
 
     if announce is not None:
         _notify(announce[0], level=announce[1])
     infotext_update = gr.update(value=announce[0]) if announce is not None else gr.update()
-    installed_update = gr.update(value=_llama_installed_text())
 
-    if phase not in ("planning", "downloading", "extracting"):
-        return gr.update(visible=False), gr.update(value=""), infotext_update, installed_update
+    info = llama_installed_info()
+    backend_update = (
+        gr.update(value=info["backend_id"])
+        if (announce is not None and info is not None and info.get("backend_id") in LLAMA_BACKENDS)
+        else gr.update()
+    )
+    install_btn_update = gr.update(
+        value="Reinstall llama.cpp" if info is not None else "Install llama.cpp",
+        interactive=not running,
+    )
+    abort_btn_update = gr.update(interactive=running)
+    installed_caption_update = gr.update(value=_llama_installed_text())
+    autostart_update = gr.update(interactive=info is not None)
 
-    if phase == "planning":
-        html = "<div>Resolving latest llama.cpp release...</div>"
-    elif phase == "extracting":
-        html = "<div>Extracting...</div>"
+    if not running:
+        status_row_update = gr.update(visible=False)
+        status_html_update = gr.update(value="")
     else:
-        total = max(bytes_total, 1)
-        pct = min(100, int(bytes_done * 100 / total))
-        html = (
-            f"<progress value=\"{bytes_done}\" max=\"{total}\" style=\"width:100%;\"></progress>"
-            f"<div>Downloading: {pct}% ({format_size(bytes_done)} / {format_size(bytes_total)})</div>"
-        )
-    return gr.update(visible=True), gr.update(value=html), infotext_update, installed_update
+        if phase == "planning":
+            html = "<div>Resolving latest llama.cpp release...</div>"
+        elif phase == "extracting":
+            html = "<div>Extracting...</div>"
+        else:
+            total = max(bytes_total, 1)
+            pct = min(100, int(bytes_done * 100 / total))
+            html = (
+                f"<progress value=\"{bytes_done}\" max=\"{total}\" style=\"width:100%;\"></progress>"
+                f"<div>Downloading: {pct}% ({format_size(bytes_done)} / {format_size(bytes_total)})</div>"
+            )
+        status_row_update = gr.update(visible=True)
+        status_html_update = gr.update(value=html)
+    return (
+        status_row_update, status_html_update, infotext_update,
+        backend_update, install_btn_update, abort_btn_update, installed_caption_update,
+        autostart_update,
+    )
 
 
 def _llama_installed_text() -> str:
@@ -2205,22 +2242,42 @@ def _llama_installed_text() -> str:
     return f"Installed: {info.get('label', info.get('backend_id'))} ({info.get('build_tag')})"
 
 
+def _llama_backend_dropdown_default() -> str:
+    """Pre-selects the backend dropdown to whatever's actually installed,
+    rather than always defaulting to LLAMA_DEFAULT_BACKEND - so a user who
+    already has, say, CUDA 12.4 installed sees that reflected instead of
+    the newest-by-default CUDA 13.3 sitting there looking unrelated to
+    their "Reinstall" button."""
+    info = llama_installed_info()
+    if info and info.get("backend_id") in LLAMA_BACKENDS:
+        return info["backend_id"]
+    return LLAMA_DEFAULT_BACKEND
+
+
+def _llama_install_button_label() -> str:
+    return "Reinstall llama.cpp" if llama_installed_info() is not None else "Install llama.cpp"
+
+
 # --------------------------------------------------------------- Hydra install/lifecycle
 #
 # Two separate concerns, kept apart the same way llama's own install
 # section is kept apart from _download_lock above:
 #   - Installing Hydra's Python deps (torch + friends) is a pip subprocess
-#     streaming text output over time - its own lock/thread/state below,
-#     since that's a fundamentally different shape of progress than a
-#     byte-counted file transfer.
+#     - its own lock/thread/state below. Its per-line output is NOT
+#     streamed into the UI (a dedicated Textbox for this was tried and
+#     removed - too noisy for a settings page); core.hydra_install's own
+#     log.debug("pip: %s", line) call already captures every line to the
+#     debug log unconditionally (see its own docstring), regardless of
+#     whether a UI callback is listening, so nothing is lost by not
+#     wiring one here - only completion/failure surfaces to the UI, via
+#     hydra_lifecycle_infotext + a _notify() popup.
 #   - Downloading hydra-3.5.safetensors is just another file - it reuses
 #     the EXISTING curated-model download queue (_download_enqueue et al.
-#     above) rather than inventing a second download mechanism; only the
-#     on-screen progress row is Hydra-tab-local (a Gradio component can
-#     only be laid out once, so the Models tab's own download_status_row/
-#     download_status_text can't also be reused here - but the underlying
-#     queue/worker/_download_status_html() state they poll is global and
-#     happily shared).
+#     above) rather than inventing a second download mechanism. The
+#     button and its progress row now live on the Models tab's "Hydra
+#     model" section (moved there from this sub-tab), sharing the same
+#     underlying queue/worker/_download_status_html() state the VLM
+#     section's own download row polls.
 # Loading/unloading the model itself is not a background job at all - it
 # blocks for a few seconds at most (~1GB), so it's a plain generator
 # click handler, the same shape as _start_managed_llama_ui/
@@ -2231,7 +2288,6 @@ def _llama_installed_text() -> str:
 _hydra_install_lock = threading.RLock()
 _hydra_install_thread: Optional[threading.Thread] = None
 _hydra_install_running = False
-_hydra_install_output: list[str] = []  # last 200 lines of pip's own output, newest last
 # One-shot (message, level) popped by the next _hydra_install_status_ui
 # tick, same single-shot idiom as llama's own _install_announce above -
 # so a stale completion message doesn't keep stomping on whatever
@@ -2258,6 +2314,16 @@ def _hydra_sliders_to_metric(confidence: float, threshold: float) -> str:
     return f"f{confidence:g}@{threshold:g}"
 
 
+def _hydra_models_table_rows() -> list[list[str]]:
+    """Single-row table for the Models tab's "Hydra model" section -
+    deliberately mirrors _models_table_rows()' 4-column shape (A/Model/
+    Source/Quants) even though most of it doesn't really apply to a lone
+    safetensors file, purely so the two sections look like variations on
+    one format rather than two different conventions side by side."""
+    downloaded = hydra_classifier.status().model_downloaded
+    return [["", "RedRocket-Hydra", "Curated", "1/1" if downloaded else "0/1"]]
+
+
 def _hydra_status_text() -> str:
     st = hydra_classifier.status()
     parts = [
@@ -2270,17 +2336,9 @@ def _hydra_status_text() -> str:
 
 def _hydra_install_worker() -> None:
     global _hydra_install_thread, _hydra_install_running, _hydra_install_announce
-    with _hydra_install_lock:
-        _hydra_install_output.clear()
-
-    def on_output(line: str) -> None:
-        with _hydra_install_lock:
-            _hydra_install_output.append(line)
-            del _hydra_install_output[:-200]
-
     try:
-        completed = hydra_install_deps(on_output)
-        message = "Hydra dependencies installed." if completed else "Hydra dependency install failed - see output above."
+        completed = hydra_install_deps()
+        message = "Hydra dependencies installed." if completed else "Hydra dependency install failed - see debug log."
         level = "info" if completed else "error"
     except Exception as exc:
         log.exception("Hydra dependency install failed")
@@ -2304,14 +2362,18 @@ def _hydra_install_start_ui() -> str:
 
 
 def _hydra_install_status_ui():
-    """(output_box_visible, output_box_value, lifecycle_infotext_update,
-    hydra_status_md_update) - wired to the same 2s status_timer as
-    everything else, plus called directly after the Install click for
-    immediate feedback."""
+    """(lifecycle_infotext_update, status_md_update, install_btn_update,
+    load_btn_update, unload_btn_update, enabled_checkbox_update,
+    autoload_checkbox_update) - wired to the same 2s status_timer as
+    everything else, plus called directly after Install/Load/Unload
+    clicks for immediate feedback. The three buttons and two checkboxes
+    are all read-only derived state (interactive= only), safe to
+    recompute every tick with no risk of fighting an in-flight user
+    edit, unlike lifecycle_infotext (one-shot, see _install_announce's
+    own comment for why)."""
     global _hydra_install_announce
     with _hydra_install_lock:
         running = _hydra_install_running
-        output_text = "\n".join(_hydra_install_output[-40:])
         announce = _hydra_install_announce
         _hydra_install_announce = None
 
@@ -2319,7 +2381,18 @@ def _hydra_install_status_ui():
         _notify(announce[0], level=announce[1])
     infotext_update = gr.update(value=announce[0]) if announce is not None else gr.update()
     hydra_status_update = gr.update(value=_hydra_status_text())
-    return gr.update(visible=running, value=output_text), infotext_update, hydra_status_update
+
+    st = hydra_classifier.status()
+    ready = st.deps_installed and st.model_downloaded
+    return (
+        infotext_update,
+        hydra_status_update,
+        gr.update(interactive=not st.deps_installed and not running),
+        gr.update(interactive=st.deps_installed and st.model_downloaded and not st.loaded),
+        gr.update(interactive=st.loaded),
+        gr.update(interactive=ready),
+        gr.update(interactive=ready),
+    )
 
 
 def _hydra_download_model_ui() -> str:
@@ -2334,17 +2407,86 @@ def _hydra_download_model_ui() -> str:
     return "Queued hydra-3.5.safetensors for download (~1GB)."
 
 
-def _load_hydra_model_ui():
+def _load_hydra_with_llama_coexistence():
+    """The shared "load Hydra, safely coexisting with an already-running
+    managed llama-server" logic - used by BOTH the manual "Load Hydra
+    model" button and the startup autoload path, so correctness doesn't
+    depend on which of the two triggered it, or on the autoload chain's
+    own Hydra-before-llama ordering (see AppConfig.hydra_autoload_model's
+    docstring) staying right forever. That ordering just avoids the
+    pointless stop-immediately-after-start dance during a normal dual-
+    autostart launch; this function is what actually makes it safe
+    regardless.
+
+    llama-server's own n_gpu_layers="auto" is the one piece here that
+    adapts gracefully to reduced free VRAM (partial CPU offload);
+    hydra_classifier.load() is all-or-nothing onto one device. So if a
+    MANAGED llama-server this session owns is already running, and
+    hydra_device is "cuda" (no VRAM contention at all if it's "cpu" -
+    skip the dance entirely), it's stopped first so Hydra gets first pick
+    of free VRAM, then llama-server is restarted from current_cfg so
+    "auto" resizes itself around whatever Hydra actually claimed.
+    Ownership-gated the same way "Stop llama server" already is - never
+    touches a server this session didn't start (an orphaned process from
+    a previous run, or someone else's server on that port, is left
+    alone, same as everywhere else in this file).
+
+    Refuses outright (no stop/restart at all) if a caption operation is
+    currently active - killing the server out from under an in-flight
+    Single/Batch/Review request would break it. In practice the Hydra
+    settings sub-tab is already disabled while one is running
+    (_settings_gating_ui), so this is the same "second line of defense
+    against a stray click" _operation_blocked_by() already is elsewhere,
+    not the primary gate.
+
+    Fires one _notify() popup on the final outcome - this can now take as
+    long as a full llama-server restart (reloading a 10-30GB model, not
+    just Hydra's own ~1GB), long enough to deserve one regardless of
+    which of the two triggers fired it, same as this project's other
+    background-completion popups."""
     if hydra_classifier.status().loaded:
         yield "Hydra model is already loaded.", gr.update()
         return
+
+    blocked = _operation_blocked_by()
+    if blocked:
+        message = f"Can't load Hydra model right now - {blocked}"
+        yield message, gr.update()
+        _notify(message, level="warning")
+        return
+
+    cfg = current_cfg
+    needs_restart = cfg.hydra_device == "cuda" and _is_server_managed_by_us(_managed_base_url(cfg))
+
+    if needs_restart:
+        yield "Stopping llama-server to free VRAM for Hydra...", gr.update()
+        _stop_managed()
+        _refresh_reachability_cache()
+
     yield "Loading Hydra model...", gr.update()
     try:
-        hydra_classifier.load(current_cfg)
+        hydra_classifier.load(cfg)
         message = f"Hydra model loaded on {hydra_classifier.status().device}."
+        level = "info"
     except hydra_classifier.HydraError as exc:
         message = f"Couldn't load Hydra model: {exc}"
+        level = "warning"
+
+    if needs_restart:
+        yield f"{message} Restarting llama-server...", gr.update(value=_hydra_status_text())
+        started, start_message = _try_start_managed_llama()
+        message = f"{message} {start_message}" if started else f"{message} Restart failed: {start_message}"
+        if not started:
+            level = "warning"
+
     yield message, gr.update(value=_hydra_status_text())
+    _notify(message, level=level)
+
+
+def _load_hydra_model_ui():
+    """The manual "Load Hydra model" button's click target - see
+    _load_hydra_with_llama_coexistence()'s own docstring."""
+    yield from _load_hydra_with_llama_coexistence()
 
 
 def _unload_hydra_model_ui():
@@ -2959,11 +3101,18 @@ def build_app() -> gr.Blocks:
                         label="Trigger word",
                         value=cfg.trigger_word,
                     )
+                    batch_overwrite = gr.Checkbox(
+                        label="Overwrite existing captions", value=cfg.overwrite_existing
+                    )
+
+                with gr.Row():
+                    batch_last_image = gr.Image(
+                        label="Preview", interactive=False, show_label=False,
+                        buttons=[],
+                    )
                     with gr.Column():
-                        batch_recursive = gr.Checkbox(label="Recursive", value=cfg.recursive_batch)
-                        batch_overwrite = gr.Checkbox(
-                            label="Overwrite existing captions", value=cfg.overwrite_existing
-                        )
+                        batch_last_file = gr.Textbox(label="Last file processed", interactive=False)
+                        batch_last_caption = gr.Textbox(label="Last caption created", interactive=False)
 
                 # Same two-Column swap as the Single-image tab (see that tab
                 # and app.py's own module docstring for why: a Row of two
@@ -2976,21 +3125,12 @@ def build_app() -> gr.Blocks:
                     with gr.Column(visible=False) as batch_interrupt_col:
                         batch_interrupt_btn = gr.Button("Interrupt", variant="stop")
 
-                with gr.Row():
-                    batch_last_image = gr.Image(
-                        label="Preview", interactive=False, show_label=False,
-                        buttons=[],
-                    )
-                    with gr.Column():
-                        batch_last_file = gr.Textbox(label="Last file processed", interactive=False)
-                        batch_last_caption = gr.Textbox(label="Last caption created", interactive=False)
-
                 batch_infotext = gr.Textbox(show_label=False, container=False, interactive=False)
 
                 batch_browse_btn.click(browse_directory_ui, [batch_dir], [batch_dir])
                 batch_run_btn.click(
                     run_batch_ui,
-                    [batch_dir, batch_recursive, batch_overwrite, batch_trigger],
+                    [batch_dir, batch_overwrite, batch_trigger],
                     [
                         batch_infotext, batch_last_file, batch_last_image, batch_last_caption,
                         batch_run_btn, batch_run_col, batch_interrupt_col, batch_interrupt_btn,
@@ -3040,7 +3180,9 @@ def build_app() -> gr.Blocks:
                     review_infotext, review_items_state, review_index_state, review_loaded_caption_state,
                     review_image, review_caption, review_table,
                 ]
-                review_browse_btn.click(browse_directory_ui, [review_dir], [review_dir])
+                review_browse_btn.click(browse_directory_ui, [review_dir], [review_dir]).then(
+                    review_scan_ui, [review_dir], _review_nav_outputs
+                )
                 review_scan_btn.click(review_scan_ui, [review_dir], _review_nav_outputs)
                 review_prev_btn.click(
                     review_prev_ui,
@@ -3070,12 +3212,13 @@ def build_app() -> gr.Blocks:
                 review_interrupt_btn.click(interrupt_review_ui, [], [review_interrupt_btn])
 
             with gr.Tab("Models", interactive=False) as models_tab:
+                gr.Markdown("### VLM model")
                 gr.Markdown(
                     config_mod.MODELS_TAB_INTRO.format(ignored_substrings=", ".join(IGNORED_SUBSTRINGS))
                 )
                 models_table = gr.Dataframe(
                     headers=["A", "Model", "Source", "Quants"], datatype=["str", "str", "str", "str"],
-                    interactive=False, row_count=(0, "dynamic"),
+                    interactive=False, row_count=(0, "dynamic"), buttons=[],
                 )
                 with gr.Row():
                     # allow_custom_value=True is load-bearing, not cosmetic: it
@@ -3097,6 +3240,44 @@ def build_app() -> gr.Blocks:
                 with gr.Row(visible=False) as download_status_row:
                     download_status_text = gr.HTML(container=False, scale=4)
                     download_abort_btn = gr.Button("Abort all downloads", scale=1)
+
+                # Deliberately minimal for now, mirroring the VLM section's
+                # look (same 4 columns) without its "set as active model"
+                # machinery - there's only ever one Hydra model, no
+                # quant/mmproj pair to pick between, so a click-to-select
+                # row + dropdowns would have nothing real to do. Refresh
+                # here is literally the same handler as the VLM section's
+                # own Refresh (redundant today - this row doesn't need a
+                # live rescan of webui/models/ - kept only for UX
+                # consistency with a "there's a Refresh button on this
+                # section too" expectation).
+                #
+                # Not wrapped in a gr.Group() (nor is the VLM section above) -
+                # tried once and reverted, see ui_css.py's own note on
+                # gr.Group() (also in this project's CLAUDE.md gotchas):
+                # it merges mismatched-height siblings - a Markdown block, a
+                # Dataframe, and Rows of buttons here - into one stretched
+                # grey slab instead of leaving each its own distinct look,
+                # confirmed live. Group is only safe for genuinely uniform
+                # stacked rows (see Settings' own Groups), not a mixed
+                # section like this one.
+                #
+                # "---" is plain CommonMark (a real <hr>, not a custom rule) -
+                # gr.Markdown already renders it, no CSS needed.
+                gr.Markdown("---")
+                gr.Markdown("### Hydra model")
+                hydra_models_table = gr.Dataframe(
+                    headers=["A", "Model", "Source", "Quants"], datatype=["str", "str", "str", "str"],
+                    interactive=False, row_count=(1, "fixed"), buttons=[],
+                    value=_hydra_models_table_rows(),
+                )
+                with gr.Row():
+                    hydra_models_download_btn = gr.Button("Download Hydra model (~1GB)")
+                    hydra_models_manage_btn = gr.Button("Manage Hydra")
+                    hydra_models_refresh_btn = gr.Button("Refresh")
+                with gr.Row(visible=False) as hydra_download_status_row:
+                    hydra_download_status_text = gr.HTML(container=False)
+
                 models_infotext = gr.Textbox(show_label=False, container=False, interactive=False)
 
                 # See this tab's own handler-function docstrings above for what
@@ -3109,6 +3290,10 @@ def build_app() -> gr.Blocks:
                     models_quant_dropdown, models_mmproj_dropdown, models_action_btn, models_infotext,
                 ]
                 refresh_models_btn.click(models_refresh_ui, [models_selected_folder_state], _models_scan_outputs)
+                hydra_models_download_btn.click(_hydra_download_model_ui, [], [models_infotext])
+                hydra_models_refresh_btn.click(
+                    models_refresh_ui, [models_selected_folder_state], _models_scan_outputs
+                )
                 models_table.select(
                     models_table_select_ui,
                     [models_groups_state],
@@ -3150,6 +3335,12 @@ def build_app() -> gr.Blocks:
                 current_settings_subtab_state = gr.State("llama-settings")
                 with gr.Tabs() as settings_tabs:
                     with gr.Tab("Llama", id="llama-settings") as llama_settings_tab:
+                        gr.Markdown(config_mod.LLAMA_TAB_INTRO)
+                        # Same position as hydra_status_md on the Hydra tab -
+                        # a status line right under the intro, above any
+                        # Group/section, not folded into the managed-mode
+                        # config box below (moved out of there live).
+                        installed_backend_text = gr.Markdown(_llama_installed_text())
                         with gr.Group():
                             server_mode = gr.Radio(
                                 choices=[
@@ -3167,47 +3358,60 @@ def build_app() -> gr.Blocks:
                                 elem_id="server-mode-radio",
                             )
 
-                        with gr.Group(visible=(cfg.server_mode == "managed")) as managed_server_group:
-                            installed_backend_text = gr.Markdown(_llama_installed_text())
+                        # gr.Column, not gr.Group - only visible= toggling is
+                        # needed here, not Group's bordered/connected-siblings
+                        # styling, which (per the Models tab's own gotcha,
+                        # confirmed live there) squashes the button rows below
+                        # into a merged slab instead of leaving them looking
+                        # like real buttons. Column has no such styling.
+                        with gr.Column(visible=(cfg.server_mode == "managed")) as managed_server_group:
+                            # The dropdown+Install+Abort row stays OUTSIDE the
+                            # Group below, on the tab's plain background - a
+                            # Row of buttons inside a Group loses the gap
+                            # between them and merges into one flat bar (see
+                            # the Models tab's own gotcha above; confirmed
+                            # live there, then anticipated again here before
+                            # even trying it). Everything from the install-
+                            # status row onward is plain config fields (no
+                            # buttons), so grouping THOSE for the shared grey
+                            # background doesn't carry the same risk.
                             with gr.Row():
                                 llama_backend_dropdown = gr.Dropdown(
                                     choices=[(b.label, bid) for bid, b in LLAMA_BACKENDS.items()],
-                                    value=LLAMA_DEFAULT_BACKEND,
+                                    value=_llama_backend_dropdown_default(),
                                     show_label=False, container=False, scale=3,
                                 )
-                                install_llama_btn = gr.Button("Install / Reinstall llama.cpp", scale=2)
-                                abort_install_btn = gr.Button("Abort install", scale=1)
-                            with gr.Row(visible=False) as llama_install_status_row:
-                                llama_install_status_text = gr.HTML(container=False)
-                            server_port = gr.Number(label="Port (managed mode)", value=cfg.server_port, precision=0)
-                            with gr.Row():
-                                n_gpu_layers = gr.Textbox(
-                                    label="GPU layers ('auto', 'all', or an exact number)",
-                                    value=cfg.n_gpu_layers,
+                                install_llama_btn = gr.Button(_llama_install_button_label(), scale=2)
+                                abort_install_btn = gr.Button("Abort install", scale=1, interactive=False)
+                            with gr.Group():
+                                with gr.Row(visible=False) as llama_install_status_row:
+                                    llama_install_status_text = gr.HTML(container=False)
+                                autostart_managed_llama = gr.Checkbox(
+                                    label="Autostart on app launch (if installed but not already running)",
+                                    value=cfg.autostart_managed_llama,
+                                    interactive=(llama_installed_info() is not None),
                                 )
-                                context_size = gr.Number(label="Context size", value=cfg.context_size, precision=0)
-                            extra_server_args = gr.Textbox(
-                                label="Extra llama-server arguments", value=cfg.extra_server_args
-                            )
+                                server_port = gr.Number(
+                                    label="Port (managed mode)", value=cfg.server_port, precision=0
+                                )
+                                with gr.Row():
+                                    n_gpu_layers = gr.Textbox(
+                                        label="GPU layers ('auto', 'all', or an exact number)",
+                                        value=cfg.n_gpu_layers,
+                                    )
+                                    context_size = gr.Number(label="Context size", value=cfg.context_size, precision=0)
+                                extra_server_args = gr.Textbox(
+                                    label="Extra llama-server arguments", value=cfg.extra_server_args
+                                )
                             with gr.Row():
                                 start_llama_btn = gr.Button(
                                     "Start llama server", interactive=False, variant="secondary"
                                 )
-                                end_llama_btn = gr.Button("End llama server", interactive=False)
-                            autostart_managed_llama = gr.Checkbox(
-                                label="Autostart on app launch (if installed but not already running)",
-                                value=cfg.autostart_managed_llama,
-                            )
+                                end_llama_btn = gr.Button("Stop llama server", interactive=False)
 
-                        with gr.Group(visible=(cfg.server_mode == "external")) as external_server_group:
+                        with gr.Column(visible=(cfg.server_mode == "external")) as external_server_group:
                             external_url = gr.Textbox(label="External server URL", value=cfg.external_url)
                             verify_external_btn = gr.Button("Verify")
-
-                        # Shared by both mode-conditional groups above
-                        # (only one of which is ever visible at a time),
-                        # rather than one status box per group - Start/
-                        # End/Verify never fire at the same moment anyway.
-                        llama_lifecycle_infotext = gr.Textbox(show_label=False, container=False, interactive=False)
 
                         with gr.Group():
                             prompt_template = gr.Textbox(
@@ -3221,6 +3425,15 @@ def build_app() -> gr.Blocks:
                                 label="Request timeout (seconds)", value=cfg.request_timeout, precision=0
                             )
 
+                        # Shared by both mode-conditional groups above (only one
+                        # of which is ever visible at a time), rather than one
+                        # status box per group - Start/Stop/Verify never fire at
+                        # the same moment anyway. Kept at the very bottom of the
+                        # tab, so it lands right above the shared Save settings/
+                        # Restart app row below (outside this Tabs() block
+                        # entirely - see settings_tab's own layout further down).
+                        llama_lifecycle_infotext = gr.Textbox(show_label=False, container=False, interactive=False)
+
                         # Purely cosmetic (which fields are relevant to the
                         # selected mode) - server_mode itself is still the
                         # one source of truth for which mode is active;
@@ -3232,7 +3445,7 @@ def build_app() -> gr.Blocks:
                         )
                         # Both chain the same immediate refresh
                         # save_settings_btn already uses (see its own
-                        # comment) - Start/End change server state
+                        # comment) - Start/Stop change server state
                         # directly, so waiting up to 8s for the next
                         # reachability_timer tick to reflect it would be
                         # the exact same staleness that fix already
@@ -3257,8 +3470,9 @@ def build_app() -> gr.Blocks:
                         verify_external_btn.click(_verify_external_ui, [external_url], [llama_lifecycle_infotext])
 
                         _llama_install_status_outputs = [
-                            llama_install_status_row, llama_install_status_text,
-                            llama_lifecycle_infotext, installed_backend_text,
+                            llama_install_status_row, llama_install_status_text, llama_lifecycle_infotext,
+                            llama_backend_dropdown, install_llama_btn, abort_install_btn, installed_backend_text,
+                            autostart_managed_llama,
                         ]
                         install_llama_btn.click(
                             _llama_install_start_ui, [llama_backend_dropdown], [llama_lifecycle_infotext]
@@ -3277,6 +3491,14 @@ def build_app() -> gr.Blocks:
                             _goto_llama_settings_ui, [],
                             [main_tabs, settings_tabs, current_settings_subtab_state, current_tab_label_state],
                         )
+                        # Models tab's "Manage Hydra" button - wired here for the
+                        # same reason restart_server_btn's own click is wired here
+                        # rather than next to its declaration (see its comment
+                        # just above).
+                        hydra_models_manage_btn.click(
+                            _goto_hydra_settings_ui, [],
+                            [main_tabs, settings_tabs, current_settings_subtab_state, current_tab_label_state],
+                        )
 
                     with gr.Tab("Hydra", id="hydra-settings") as hydra_settings_tab:
                         gr.Markdown(
@@ -3284,31 +3506,46 @@ def build_app() -> gr.Blocks:
                             "classifier - if loaded, its tags are appended after the VLM's "
                             "caption on every Single-image/Batch/Review caption. Loading "
                             "competes with llama-server for VRAM, so it's never automatic - "
-                            "install its dependencies, download its model, then Load it "
-                            "explicitly below (or enable autoload for next launch)."
+                            "install its dependencies below, download its model on the "
+                            "Models tab, then Load it explicitly below (or enable autoload "
+                            "for next launch)."
                         )
                         hydra_status_md = gr.Markdown(_hydra_status_text())
-                        with gr.Group():
-                            with gr.Row():
-                                hydra_install_btn = gr.Button("Install Hydra dependencies", scale=2)
-                                hydra_download_btn = gr.Button("Download Hydra model (~1GB)", scale=2)
-                            hydra_install_output = gr.Textbox(
-                                label="Install output", visible=False, lines=10, max_lines=10, interactive=False,
-                            )
-                            with gr.Row():
-                                hydra_load_btn = gr.Button("Load Hydra model")
-                                hydra_unload_btn = gr.Button("Unload Hydra model")
-                            hydra_autoload_model = gr.Checkbox(
-                                label="Autoload on app launch (if installed, downloaded, and enabled)",
-                                value=cfg.hydra_autoload_model,
-                            )
-                            hydra_lifecycle_infotext = gr.Textbox(show_label=False, container=False, interactive=False)
 
+                        # Initial interactive= values only - kept fresh
+                        # afterward by _hydra_install_status_ui (2s timer +
+                        # after every Install/Load/Unload click below).
+                        _hydra_st = hydra_classifier.status()
+                        _hydra_ready = _hydra_st.deps_installed and _hydra_st.model_downloaded
                         with gr.Group():
+                            hydra_autoload_model = gr.Checkbox(
+                                label="Autoload Hydra model on startup",
+                                value=cfg.hydra_autoload_model,
+                                interactive=_hydra_ready,
+                            )
                             hydra_enabled = gr.Checkbox(
                                 label="Enable Hydra tagging (appends tags after the VLM caption)",
                                 value=cfg.hydra_enabled,
+                                interactive=_hydra_ready,
                             )
+
+                        # Plain Row, not Group - see managed_server_group's own
+                        # comment above for why (Group's styling squashes
+                        # button rows into a merged slab).
+                        with gr.Row():
+                            hydra_install_btn = gr.Button(
+                                "Install Hydra dependencies", interactive=not _hydra_st.deps_installed,
+                            )
+                            hydra_load_btn = gr.Button(
+                                "Load Hydra model",
+                                interactive=(
+                                    _hydra_st.deps_installed and _hydra_st.model_downloaded
+                                    and not _hydra_st.loaded
+                                ),
+                            )
+                            hydra_unload_btn = gr.Button("Unload Hydra model", interactive=_hydra_st.loaded)
+
+                        with gr.Group():
                             hydra_device = gr.Radio(
                                 choices=[("CUDA", "cuda"), ("CPU", "cpu")],
                                 value=cfg.hydra_device,
@@ -3359,20 +3596,38 @@ def build_app() -> gr.Blocks:
                                 label="Max tags appended (0 = no cap)", value=cfg.hydra_max_tags, precision=0,
                             )
 
-                        with gr.Row(visible=False) as hydra_download_status_row:
-                            hydra_download_status_text = gr.HTML(container=False)
+                        # Same placement rationale as llama_lifecycle_infotext
+                        # above - bottom of the tab, right above the shared Save
+                        # settings/Restart app row.
+                        hydra_lifecycle_infotext = gr.Textbox(show_label=False, container=False, interactive=False)
 
+                        _hydra_install_status_outputs = [
+                            hydra_lifecycle_infotext, hydra_status_md,
+                            hydra_install_btn, hydra_load_btn, hydra_unload_btn,
+                            hydra_enabled, hydra_autoload_model,
+                        ]
                         hydra_install_btn.click(_hydra_install_start_ui, [], [hydra_lifecycle_infotext]).then(
-                            _hydra_install_status_ui, [],
-                            [hydra_install_output, hydra_lifecycle_infotext, hydra_status_md],
+                            _hydra_install_status_ui, [], _hydra_install_status_outputs
                         )
-                        hydra_download_btn.click(_hydra_download_model_ui, [], [hydra_lifecycle_infotext])
                         hydra_load_btn.click(
                             _load_hydra_model_ui, [], [hydra_lifecycle_infotext, hydra_status_md]
+                        ).then(_hydra_install_status_ui, [], _hydra_install_status_outputs).then(
+                            # Same immediate-refresh reasoning as Start/Stop
+                            # llama's own chained calls above - a manual Load
+                            # click can now stop+restart the managed server
+                            # (see _load_hydra_with_llama_coexistence), and
+                            # waiting up to 8s for reachability_timer's next
+                            # tick to reflect that would be the same
+                            # staleness already fixed for Start/Stop/Save.
+                            _refresh_reachability_ui, [current_tab_label_state],
+                            [
+                                models_tab, single_tab, batch_tab, start_llama_btn, end_llama_btn, main_tabs,
+                                current_tab_label_state,
+                            ],
                         )
                         hydra_unload_btn.click(
                             _unload_hydra_model_ui, [], [hydra_lifecycle_infotext, hydra_status_md]
-                        )
+                        ).then(_hydra_install_status_ui, [], _hydra_install_status_outputs)
 
                     with gr.Tab("Image resizing", id="image-resizing-settings") as image_resizing_settings_tab:
                         with gr.Group():
@@ -3395,13 +3650,9 @@ def build_app() -> gr.Blocks:
                     with gr.Tab("Captioning defaults", id="captioning-defaults-settings") as captioning_defaults_settings_tab:
                         with gr.Group():
                             trigger_word = gr.Textbox(label="Default trigger word", value=cfg.trigger_word)
-                            with gr.Row():
-                                overwrite_existing = gr.Checkbox(
-                                    label="Overwrite existing captions by default", value=cfg.overwrite_existing
-                                )
-                                recursive_batch = gr.Checkbox(
-                                    label="Recursive batch by default", value=cfg.recursive_batch
-                                )
+                            overwrite_existing = gr.Checkbox(
+                                label="Overwrite existing captions by default", value=cfg.overwrite_existing
+                            )
 
                     # id="debug-settings" - the one fixed, never-gated
                     # fallback landing spot for _fallback_tab_safety_ui
@@ -3429,7 +3680,7 @@ def build_app() -> gr.Blocks:
                     n_gpu_layers, context_size, extra_server_args, autostart_managed_llama,
                     resize_enabled, resize_target_mp, snap_enabled, snap_multiple,
                     prompt_template, temperature, top_p, max_tokens, request_timeout,
-                    trigger_word, overwrite_existing, recursive_batch, debug_tab_enabled,
+                    trigger_word, overwrite_existing, debug_tab_enabled,
                     hydra_enabled, hydra_device, hydra_confidence, hydra_threshold, hydra_implications,
                     hydra_exclude_categories, hydra_exclude_tags, hydra_max_tags, hydra_autoload_model,
                 ]
@@ -3523,9 +3774,7 @@ def build_app() -> gr.Blocks:
         status_timer.tick(_download_status_ui, [], [download_status_row, download_status_text])
         status_timer.tick(_download_triggered_refresh_ui, [models_selected_folder_state], _models_scan_outputs)
         status_timer.tick(_llama_install_status_ui, [], _llama_install_status_outputs)
-        status_timer.tick(
-            _hydra_install_status_ui, [], [hydra_install_output, hydra_lifecycle_infotext, hydra_status_md]
-        )
+        status_timer.tick(_hydra_install_status_ui, [], _hydra_install_status_outputs)
         status_timer.tick(_download_status_ui, [], [hydra_download_status_row, hydra_download_status_text])
         if cfg.debug_tab_enabled:
             status_timer.tick(get_python_debug_text, [], [debug_python_box])
@@ -3554,9 +3803,7 @@ def build_app() -> gr.Blocks:
         demo.load(models_refresh_ui, [models_selected_folder_state], _models_scan_outputs)
         demo.load(_download_status_ui, [], [download_status_row, download_status_text])
         demo.load(_llama_install_status_ui, [], _llama_install_status_outputs)
-        demo.load(
-            _hydra_install_status_ui, [], [hydra_install_output, hydra_lifecycle_infotext, hydra_status_md]
-        )
+        demo.load(_hydra_install_status_ui, [], _hydra_install_status_outputs)
         demo.load(_download_status_ui, [], [hydra_download_status_row, hydra_download_status_text])
         demo.load(_settings_gating_ui, [], _settings_gated_tabs)
         # _update_ui_status reads the reachability cache rather than
@@ -3576,18 +3823,18 @@ def build_app() -> gr.Blocks:
             _startup_reachability_ui, [],
             [main_tabs, models_tab, single_tab, batch_tab, start_llama_btn, end_llama_btn, current_tab_label_state],
         ).then(_update_ui_status, [], _run_interrupt_btns).then(
+            # Deliberately BEFORE llama's own autostart below - see
+            # _autoload_hydra_model_ui's own docstring for why the
+            # ordering matters (Hydra gets first pick of free VRAM;
+            # llama-server's n_gpu_layers="auto" adapts around whatever's
+            # left, not the other way around).
+            _autoload_hydra_model_ui, [], [hydra_lifecycle_infotext, hydra_status_md],
+        ).then(
             _autostart_managed_llama_ui, [],
             [
                 models_tab, single_tab, batch_tab, start_llama_btn, end_llama_btn, main_tabs,
                 current_tab_label_state,
             ],
-        ).then(
-            # Deliberately last in this chain, after llama's own autostart -
-            # see _autoload_hydra_model_ui's own docstring for why the
-            # ordering matters (Hydra's autoload is meant to be tested
-            # against whatever VRAM llama-server's autostart already
-            # claimed, not before it).
-            _autoload_hydra_model_ui, [], [hydra_lifecycle_infotext, hydra_status_md],
         )
 
     return demo

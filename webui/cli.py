@@ -4,12 +4,12 @@ file only adds argparse plumbing and console/file logging on top, nothing
 here duplicates what's in core/.
 
 Settings come from the same webui/config/settings.json the GUI reads and
-writes (core/config.py) - most flags below (--recursive, --overwrite,
---model, --mmproj) are optional per-run overrides layered on top of
-whatever's already saved there, not a separate configuration.
+writes (core/config.py) - most flags below (--overwrite, --model,
+--mmproj) are optional per-run overrides layered on top of whatever's
+already saved there, not a separate configuration.
 
 Example:
-    system\\python\\python.exe webui\\cli.py --dir D:\\dataset\\images --recursive
+    system\\python\\python.exe webui\\cli.py --dir D:\\dataset\\images --overwrite
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ import sys
 from pathlib import Path
 
 from core import config as config_mod
+from core import hydra_classifier
 from core.client import LlamaClient
 from core.hydra_install import (
     MODEL_SIZE_BYTES as HYDRA_MODEL_SIZE_BYTES,
@@ -45,7 +46,6 @@ def parse_args(argv=None) -> argparse.Namespace:
              "Settings -> Hydra (or hydra_enabled/hydra_autoload_model in settings.json) for that.",
     )
     parser.add_argument("--dir", required=False, help="Directory of images to caption")
-    parser.add_argument("--recursive", action="store_true", default=None)
     parser.add_argument("--overwrite", action="store_true", default=None)
     parser.add_argument("--trigger-word", default=None)
     parser.add_argument("--model", default=None, help="Model variant name, e.g. 'my-model/Q4_K_M'")
@@ -185,8 +185,6 @@ def main(argv=None) -> int:
         return 2
 
     cfg = config_mod.load()
-    if args.recursive is not None:
-        cfg.recursive_batch = args.recursive
     if args.overwrite is not None:
         cfg.overwrite_existing = args.overwrite
 
@@ -199,6 +197,27 @@ def main(argv=None) -> int:
     if not directory.is_dir():
         log.error("Not a directory: %s", directory)
         return 2
+
+    # core.captioner only ever USES an already-loaded Hydra model (see its
+    # own docstring) - unlike the GUI, cli.py has no interactive "Load
+    # Hydra model" button and is a fresh, one-shot process every run, so
+    # if nothing here loads it, hydra_enabled silently does nothing on
+    # every single caption. Loaded BEFORE resolve_server() below (not
+    # after) for the same VRAM-ordering reason the GUI's own autoload
+    # chain was reordered for: llama-server's own n_gpu_layers="auto" is
+    # the one piece here that gracefully adapts to reduced free VRAM
+    # (partial CPU offload) - Hydra's load() is all-or-nothing onto one
+    # device, so it gets first pick, and llama's "auto" sizes itself
+    # around whatever's left. A load failure (deps/model missing, OOM)
+    # degrades gracefully - logged, batch continues without Hydra tags -
+    # matching core.captioner's own "never fail a whole caption/batch"
+    # philosophy for Hydra specifically.
+    if cfg.hydra_enabled:
+        try:
+            hydra_classifier.load(cfg)
+            log.info("Hydra model loaded on %s.", hydra_classifier.status().device)
+        except hydra_classifier.HydraError as exc:
+            log.warning("Hydra tagging is enabled but the model couldn't be loaded - continuing without it: %s", exc)
 
     model_path = mmproj_path = None
     if cfg.server_mode != "external":
@@ -231,7 +250,6 @@ def main(argv=None) -> int:
             directory,
             client,
             cfg,
-            recursive=cfg.recursive_batch,
             overwrite=cfg.overwrite_existing,
             trigger_word=args.trigger_word,
             progress_cb=on_progress,

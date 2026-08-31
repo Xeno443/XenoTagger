@@ -67,6 +67,17 @@ MODELS_TAB_INTRO = (
     "the queue."
 )
 
+# Shown as the Markdown note at the top of Settings -> Llama (app.py).
+# Same rationale/placement as MODELS_TAB_INTRO above - UI copy, not
+# per-user state, kept here so it's editable without hunting through the
+# Gradio layout code.
+LLAMA_TAB_INTRO = (
+    "Choose how this app talks to llama-server: **Managed** starts and "
+    "owns a local llama-server process for you (install it below if "
+    "it isn't yet, then pick a model on the Models tab); **External** "
+    "just connects to a llama-server you're running yourself, anywhere."
+)
+
 
 @dataclass
 class AppConfig:
@@ -132,7 +143,6 @@ class AppConfig:
     # Captioning output.
     trigger_word: str = ""
     overwrite_existing: bool = False
-    recursive_batch: bool = False
 
     # Off by default: when disabled, no log handler is even attached (not
     # just hidden), so there's no formatting/buffering overhead anywhere in

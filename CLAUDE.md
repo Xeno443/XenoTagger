@@ -174,12 +174,19 @@ standalone `HydraTagger` repo; this is the real integration.
   `AppConfig.hydra_enabled` only gates *using* an already-loaded model
   in `captioner.py`; it never triggers a load. When both
   `autostart_managed_llama` and `hydra_autoload_model` are enabled, the
-  demo.load chain deliberately runs Hydra's autoload *after*
-  llama-server's, so the real-world VRAM-contention scenario is what
-  actually gets exercised at every launch.
+  demo.load chain runs Hydra's autoload **before** llama-server's own
+  autostart (reversed 2026-09-01 — see "Hydra/llama VRAM coexistence"
+  below for why and for the belt-and-suspenders mechanism that makes
+  this safe regardless of ordering).
 - **Hydra failures degrade gracefully** — `captioner.py` catches
   `HydraError` (deps/model missing, not loaded, OOM, whatever) and just
-  keeps the VLM-only caption; it never fails a whole caption/batch.
+  keeps the VLM-only caption; it never fails a whole caption/batch. Same
+  philosophy in `cli.py` (added 2026-09-01 — see "Hydra/llama VRAM
+  coexistence" below): `cli.py` previously never called
+  `hydra_classifier.load()` anywhere, so `hydra_enabled: true` in
+  `settings.json` silently did nothing on every CLI caption; now it
+  attempts a load before `resolve_server()`, logs a warning and
+  continues VLM-only on failure.
 - **Heavy deps on demand, not in base `requirements.txt`** — mirrors
   `llama_install.py`'s own precedent. The model weight
   (`hydra-3.5.safetensors`, ~1GB) lives in `webui/models/RedRocket-Hydra/`
@@ -222,6 +229,64 @@ standalone `HydraTagger` repo; this is the real integration.
   This also drops `csi<weight>@<precision>` from the reachable UI
   (judged not worth a second control for; the field still accepts it if
   hand-edited into `settings.json`).
+
+## Hydra/llama VRAM coexistence (2026-09-01)
+
+Flagged live: `hydra_enabled: true` with the model not actually loaded
+(never loaded, autoload off, or a load failed) was being silently
+ignored - `captioner.py` just keeps the VLM-only caption with no
+user-visible sign Hydra didn't fire. Investigating that surfaced a
+second, more fundamental issue: llama-server's own `n_gpu_layers="auto"`
+is the one piece in this app that gracefully adapts to reduced free VRAM
+(partial CPU offload) - `hydra_classifier.load()` has no such fallback,
+it's all-or-nothing onto one device. So whichever of the two claims VRAM
+*first* matters: if llama's "auto" goes first and grabs most of it,
+Hydra loading second is the one likely to just OOM.
+
+Two things this drove, both in `app.py` unless noted:
+
+- **`_load_hydra_with_llama_coexistence()`** - the one shared generator
+  behind both the manual "Load Hydra model" button (`_load_hydra_model_ui`)
+  and the startup autoload path (`_autoload_hydra_model_ui`), so
+  correctness doesn't depend on either caller getting the details right
+  independently. If `hydra_device == "cuda"` and a **managed** llama-
+  server **this session owns** (`_is_server_managed_by_us` - same
+  ownership gate "Stop llama server" already uses; never touches an
+  external server, an orphaned process from a crashed previous run, or
+  someone else's server on that port) is currently running, it's stopped
+  first, Hydra loads against a clean VRAM budget, then llama-server is
+  restarted via `_try_start_managed_llama()` (the same shared start
+  primitive already reused by the Start button/autostart/a settings-save
+  restart) so `"auto"` resizes itself around whatever Hydra actually
+  claimed. Skipped entirely if `hydra_device == "cpu"` (no VRAM
+  contention) or if `_operation_blocked_by()` says a caption job is
+  active (killing the server mid-request would break it - in practice
+  the Hydra sub-tab is already disabled while one runs, so this is a
+  second-line-of-defense check, not the primary gate, same idiom
+  `_operation_blocked_by()` uses everywhere else). Fires one `_notify()`
+  popup on the final outcome, since a stop+restart can now take as long
+  as a full llama-server reload (10-30GB), not just Hydra's own ~1GB.
+- **Startup autoload order reversed**: the `demo.load` chain now runs
+  `_autoload_hydra_model_ui` *before* `_autostart_managed_llama_ui`
+  (previously the other way around, deliberately, specifically to
+  exercise the contention case during initial Hydra integration testing -
+  see the git history around 2026-08-31 for that older reasoning, now
+  superseded). With both autostart-llama and autoload-Hydra enabled,
+  Hydra now gets first pick of a clean VRAM budget at every launch,
+  llama's "auto" adapts around it. This is an optimization on top of
+  the shared function above, not a substitute for it - at true startup
+  `_load_hydra_with_llama_coexistence()`'s own stop/restart branch is
+  normally a no-op (nothing's started yet this early), but it's still
+  live as the real safety net for the orphaned-process edge case.
+- **`cli.py`** now calls `hydra_classifier.load(cfg)` (if `hydra_enabled`)
+  right before `resolve_server()` - same ordering logic, no stop/restart
+  dance needed since a fresh CLI process hasn't started (or connected to)
+  llama-server yet at that point. A load failure logs a warning and
+  continues VLM-only, matching `captioner.py`'s own degrade-gracefully
+  philosophy. Doesn't help if `resolve_server()` ends up *connecting to*
+  an already-running server owned by something else (e.g. the GUI) that
+  already claimed VRAM before this process even started - out of scope,
+  same "never touch what we don't own" boundary as everywhere else.
 
 ## Status/notification architecture (2026-08-31)
 
@@ -357,11 +422,87 @@ mid-call.
   behavior after live testing on 2026-08-30. Revisit before relying on
   it further; the nested-`Tabs`-fires-`.select()`-anyway gotcha above is
   the leading suspect.
-- **Nothing has been committed since `4b45cd5`** ("Gate captioning and
-  Models tabs on live server reachability, restructure Settings") — the
-  entire server-lifecycle rewrite above is sitting uncommitted in the
-  working tree. Review and commit in logical chunks rather than one
-  giant commit.
+- **Settings tab visual harmonization (Llama vs. Hydra sub-tabs) — done
+  (2026-09-01).** Both sub-tabs now share the same shape: a top intro
+  Markdown pulled from a `core.config` variable (`LLAMA_TAB_INTRO`,
+  mirroring `MODELS_TAB_INTRO`'s own precedent), a management `gr.Group()`
+  with side-by-side action buttons, an autostart/autoload checkbox above
+  the lifecycle buttons, and a lifecycle infotext moved to the very
+  bottom of the sub-tab (lands right above the shared Save settings/
+  Restart app row, since both sub-tabs stack inside one `Tabs()` that
+  sits above that row). Llama's install/reinstall flow now reads real
+  installed-backend state (`llama_installed_info()`) to preselect the
+  backend dropdown and swap the button between "Install llama.cpp"/
+  "Reinstall llama.cpp"; `abort_install_btn` is now actually gated on
+  install-in-progress (previously always clickable). Hydra's pip-output
+  Textbox was removed — `core.hydra_install.install_deps()` already
+  unconditionally `log.debug()`s every line regardless of any UI
+  callback, so nothing was lost; only completion/failure surfaces to the
+  UI now, via infotext + a `_notify()` popup. Hydra's "Download Hydra
+  model" button/progress row moved off this sub-tab entirely, onto the
+  Models tab's new "Hydra model" section (see below).
+  `installed_backend_text` (the "Installed: CUDA 12.4 ... (b10701)" line)
+  now sits right under the tab's intro Markdown, the same position
+  `hydra_status_md` occupies on the Hydra tab.
+- **Follow-up (2026-09-01, same day): the gr.Group()-squashes-buttons
+  problem confirmed live on the Models tab (see below) turned out to
+  also affect the Llama sub-tab's button rows** - `managed_server_group`/
+  `external_server_group` were `gr.Group(visible=...)`, used purely to
+  toggle a whole section's visibility together, but Group's bordered/
+  connected-siblings styling was squashing "Install llama.cpp"/"Abort
+  install"/"Start llama server"/"Stop llama server"/"Verify" into merged
+  slabs the same way it did on Models. Fixed by swapping both to
+  `gr.Column(visible=...)` - same visible= toggle behavior, no bordering
+  side effect. Hydra's Install/Load/Unload button Row had its own
+  dedicated (single-child) `gr.Group()` wrapper too, removed the same
+  way. A plain `gr.Markdown("---")` (real CommonMark `<hr>`, no CSS) now
+  separates the Models tab's two sections.
+- **Follow-up #2 (2026-09-01): the Llama sub-tab's config fields (port,
+  GPU layers, context size, extra args, install-status caption,
+  Autostart) now sit inside their own `gr.Group()` for a shared grey
+  background matching Server mode's box** - requested live after seeing
+  that range sitting on the plain black background next to Server
+  mode's own box. The backend-dropdown+Install+Abort Row was
+  deliberately kept OUTSIDE this Group (same reasoning as the fix right
+  above - a Row of buttons inside a Group loses its inter-button gaps
+  and merges into one flat bar), so the grey box actually starts at the
+  install-status row, not literally at the dropdown. `autostart_managed_
+  llama` moved from below Extra args to right after the installed-
+  backend caption (above Port) and is now only `interactive=` once
+  `llama_installed_info()` is not None (there's nothing to autostart
+  otherwise) - kept live via the same `_llama_install_status_ui` poll
+  that already drives the Install button's label/interactive.
+- **Other 2026-09-01 UI redesign items, all done alongside the Settings
+  harmonization above**: recursive batch/review scanning was removed
+  entirely (UI checkbox, `AppConfig.recursive_batch`, `find_images()`/
+  `run_batch()`/`scan_review_status()` params, `cli.py --recursive`) —
+  batch/review only ever process the given root directory now, no
+  subfolder walk. Batch's Run/Interrupt buttons moved to just above
+  `batch_infotext`. Review's Browse button now chains an automatic
+  `review_scan_ui` call (Scan button label unchanged — typing a path by
+  hand still needs a manual Scan/click, no auto-scan-on-Enter). The
+  Models tab is now two plain (ungrouped) sections under a `### VLM
+  model`/`### Hydra model` Markdown title each - a `gr.Group()` wrap was
+  tried first and reverted live: it merged the mismatched-height
+  Markdown/Dataframe/button-Row children into one stretched grey slab
+  instead of leaving each its own look (the exact failure mode the
+  gr.Group() gotcha below already warns about - Group is only safe for
+  genuinely uniform stacked rows, confirmed again here the hard way).
+  "VLM model" is the pre-existing table/dropdowns/buttons, now with
+  `buttons=[]` on
+  `models_table` to drop Gradio's default copy/fullscreen toolbar
+  buttons — a real `gr.Dataframe(buttons=...)` param, not CSS, following
+  `review_table`'s existing precedent) and a new "Hydra model" section:
+  a matching 4-column one-row `gr.Dataframe` (`_hydra_models_table_rows()`),
+  a Download button (moved here from Settings → Hydra, now writes to
+  `models_infotext` instead of `hydra_lifecycle_infotext`), a "Manage
+  Hydra" button (`_goto_hydra_settings_ui()`, mirrors the pre-existing
+  `_goto_llama_settings_ui()`), and a Refresh button that's deliberately
+  just the same `models_refresh_ui` handler as the VLM section's own
+  Refresh — it doesn't actually rescan the Hydra row (that only happens
+  on page load or after a Load/Unload/Install click chains
+  `_hydra_install_status_ui`), kept intentionally minimal per explicit
+  user direction ("useless for now").
 - **Model management / llama.cpp setup UI**: curated GGUF downloading
   is built (`core/downloads.py`, `models_source.json`). The same
   pattern is now applied to llama.cpp itself via `core/llama_install.py`
@@ -375,6 +516,14 @@ mid-call.
   defaults were retuned as a result. Still deliberately left out
   (upstream supports them, just not exposed in Settings): exclusive-
   groups, aliases, and per-category-prefix knobs.
+- **Llama tab's download progress bar - user-owned follow-up, not yet
+  scheduled.** During the 2026-09-01 harmonization pass, whether Hydra's
+  model-download progress display (on the Models tab's "Hydra model"
+  section) should visually match llama.cpp's own byte-progress `<progress>`
+  bar (`llama_install_status_text`, `_llama_install_status_ui`) came up
+  but was explicitly deferred: "I will revisit the llama download bar,
+  leave as is for now." Don't start on this without the user bringing it
+  back up first.
 - Smaller deferred items: an "unsaved Settings changes" indicator; the
   brief tab-disabled flash before redirect on a fresh page load; a
   possible rare race between overlapping Start/End llama clicks.
