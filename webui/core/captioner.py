@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Optional, Union
+from typing import Callable, Optional, Union
 
 from . import hydra_classifier
 from .client import CaptionResult, LlamaClient
@@ -40,6 +40,7 @@ def caption_image(
     client: LlamaClient,
     cfg: AppConfig,
     trigger_word: Optional[str] = None,
+    on_stage: Optional[Callable[[str], None]] = None,
 ) -> tuple[str, CaptionResult]:
     """The one shared "process one image" call - used by the Single-image
     tab, the Batch tab, and the CLI alike, so every caller sees the same
@@ -47,7 +48,17 @@ def caption_image(
     caption has the trigger word applied (result.content is the raw,
     pre-trigger-word text); result is the full CaptionResult for callers
     that need more detail (token counts, timing, result.truncated, resize
-    info) than just the caption string."""
+    info) than just the caption string.
+
+    on_stage, if given, is called with a short label ("captioning" /
+    "tagging (Hydra)") right before each of this function's two possible
+    model calls - this is the hook the GUI uses to show which stage a
+    caption is currently in (see app.py's _operation_set_stage). Purely
+    optional and side-effect-only - core/ itself has no UI, this is just
+    a plain callback so it stays framework-agnostic; the CLI simply
+    doesn't pass one."""
+    if on_stage:
+        on_stage("captioning")
     result = client.caption(
         image,
         prompt=cfg.prompt_template,
@@ -65,6 +76,8 @@ def caption_image(
     caption = apply_trigger_word(result.content, word)
 
     if cfg.hydra_enabled:
+        if on_stage:
+            on_stage("tagging (Hydra)")
         try:
             hydra_result = hydra_classifier.classify(image, cfg)
             if hydra_result.tag_text:

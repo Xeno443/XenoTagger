@@ -105,10 +105,21 @@ def run_batch(
     trigger_word: Optional[str] = None,
     progress_cb: Optional[ProgressCallback] = None,
     should_stop: Optional[Callable[[], bool]] = None,
+    on_stage: Optional[Callable[[Path, str], None]] = None,
 ) -> BatchResult:
     """should_stop, if given, is checked before each image - returning True
     stops the batch after whatever image is currently in flight finishes
     (never mid-request), leaving everything captioned so far in place.
+
+    on_stage, if given, is called with (image_path, stage) - the path is
+    added here rather than coming from caption_image() itself (whose own
+    on_stage is just (stage) - see its docstring), since only run_batch()
+    knows which image is currently in flight; caption_image() processes
+    one image at a time and has no reason to know its own path. Called
+    from whatever thread run_batch() itself runs on (the GUI runs it in a
+    background worker thread, see app.py's run_batch_ui), so it must be a
+    plain, Gradio-free callback, never something that touches gr.*
+    directly.
     """
     directory = Path(directory)
     images = find_images(directory, recursive=recursive)
@@ -134,8 +145,11 @@ def run_batch(
                 progress_cb(i, total, image_path, "skipped", None, None)
             continue
 
+        stage_cb = (lambda s, _path=image_path: on_stage(_path, s)) if on_stage else None
         try:
-            caption, outcome = caption_image(image_path, client, cfg, trigger_word=trigger_word)
+            caption, outcome = caption_image(
+                image_path, client, cfg, trigger_word=trigger_word, on_stage=stage_cb
+            )
             if outcome.truncated:
                 result.truncated += 1
                 reason = f"truncated: cut off at {outcome.completion_tokens}/{cfg.max_tokens} tokens"

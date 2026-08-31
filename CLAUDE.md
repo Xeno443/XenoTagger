@@ -66,6 +66,11 @@ they describe a repo structure this one no longer has.
 - `webui/config/` — `settings.json` (gitignored, per-machine),
   `models_source.json` (checked in — curated downloadable model list),
   `models_cache.json` (gitignored).
+- `hydra-implications-faq.md` — a worked walkthrough (concrete 4-level
+  tag-hierarchy example) of how Hydra's `remove`/`constrain-remove`/
+  `enforce-remove` implications modes actually resolve nested e621 tag
+  families differently. The behavior isn't obvious from the option names
+  alone — read before touching `hydra_implications` again.
 - `run-tagger.cmd` / `tag-cli.cmd` — launch the GUI / CLI through the
   portable environment.
 - `setup-env.bat` / `environment.bat` — inherited from the portable-env
@@ -186,6 +191,100 @@ standalone `HydraTagger` repo; this is the real integration.
   umbrella), so a relative import climbing above it fails. Caught via a
   real load-a-real-model-and-classify-a-real-image smoke test, not just
   `py_compile`.
+- **`hydra_implications` defaults to `"remove"`, not `"inherit"`** — a
+  real-image sweep (varying `hydra_metric` at a fixed image; see
+  `hydra-implications-faq.md` for the mechanism) found `inherit`'s
+  whole-ancestor-chain propagation (e.g. `mammal` + `canid` + `canine` +
+  `domestic dog` + `herding dog` + `pastoral dog` + `german shepherd` all
+  firing together for one dog) roughly doubled the tag count at every
+  tested `hydra_metric` setting versus `remove`, which collapses each
+  family down to just its most specific present tag. `constrain-remove`/
+  `enforce-remove` were considered and rejected: `constrain-remove`'s
+  confidence-clamping has no visible effect here since `classify()`'s
+  `tag_text` discards probabilities entirely and `hydra_max_tags`
+  defaults to 0 (uncapped), and `enforce-remove` risks vetoing an
+  otherwise-confident specific tag over an unrelated ancestor's unlucky
+  score — undesirable when Hydra's whole purpose is grounding the
+  specific tags the VLM is weak at.
+- **`hydra_metric` defaults to `"f0.5@0.1"`, not `"f1.0@0.1"`** — same
+  sweep, at `remove`: `f0.5` landed in a "complements the caption, not a
+  wall of text" range (35–52 tags on the test image) without the
+  contradictory tags (e.g. `male penetrating female` beside `male/male`
+  content) that started reappearing above `~f0.9`.
+- **Settings → Hydra exposes `hydra_metric` as two sliders — Confidence
+  (`f<beta>`, 0.1–1.5) and Threshold (the `@<min_precision>` floor,
+  0.0–0.5) — not a raw text field.** `_hydra_metric_to_sliders()`/
+  `_hydra_sliders_to_metric()` in `app.py` convert directly (the slider
+  value *is* the number in the metric string), deliberately not
+  replicating upstream's non-linear slider-to-beta curve
+  (`classification.py`'s `simple_slider`/`log_interval`) — more
+  transparent, and it's what the actual tuning above happened against.
+  This also drops `csi<weight>@<precision>` from the reachable UI
+  (judged not worth a second control for; the field still accepts it if
+  hand-edited into `settings.json`).
+
+## Status/notification architecture (2026-08-31)
+
+Two distinct UI concepts, named deliberately differently so they're never
+confused in conversation or code:
+
+- **status bar** — the single global `status_bar` component (Python/
+  Gradio version, llama-server health, loaded model, active operation),
+  polled every 2s by `status_timer` and shown on every tab.
+- **infotext bar** — the per-tab textboxes (`single_infotext`,
+  `batch_infotext`, `review_infotext`, `models_infotext`,
+  `settings_infotext`, `llama_lifecycle_infotext`,
+  `hydra_lifecycle_infotext`), each written only by its own tab's own
+  handlers. Deliberately kept per-tab, not merged into one shared field —
+  a merged box would have live-progress writers (e.g. batch's per-image
+  yield loop) stomping on one-off action feedback (e.g. Save Settings)
+  landing in the same tick.
+
+`_notify(text, level="info"|"warning"|"error")` is the one place a
+Gradio popup toast gets fired, replacing what used to be scattered direct
+`gr.Info`/`gr.Warning` calls. `level` drives both the `log.<level>()`
+call (auto-captured by the debug log when enabled) and the popup type -
+see the `gr.Error` gotcha above for why `"error"` still pops a
+`gr.Warning`-styled toast, not a red one. A message that should only be
+logged, never popped, still just calls `log.<level>()` directly - `_notify`
+always pops.
+
+Long-running background work (batch captioning, curated-model/Hydra-model
+downloads, llama.cpp/Hydra-deps installs) now fires a one-shot `_notify()`
+popup on completion or failure, not just a silent infotext-box update -
+so finding out something finished doesn't require still being on the tab
+that started it (the original ask: "I start a few model downloads, let
+Hydra deps install, then go run a batch - I have no idea what's happening
+to the other things"). Batch fires it directly from its own generator
+(already a live Gradio callback throughout the run). Downloads/installs
+run on raw background threads with no Gradio request context, so each
+queues a one-shot (message, level) announcement (`_download_announces`,
+`_install_announce`, `_hydra_install_announce`) that the next 2s
+`status_timer` poll pops and relays through `_notify` - the same
+single-shot-flag idiom `_download_needs_refresh` already established, now
+also used to drive a popup instead of only a silent infotext update.
+
+Captioning now shows a live per-image stage in its own tab's **infotext
+bar** (not the status bar - that was tried first and reverted; the status
+bar doesn't need this level of detail, and it's the wrong field for it
+per the status-bar/infotext-bar split above). `core.captioner.caption_image()`
+takes an optional `on_stage(text)` callback, called with `"captioning"`
+before the VLM call and `"tagging (Hydra)"` before Hydra's, threaded
+through unchanged from `core.batch.run_batch()`.
+
+Infotext boxes only update on a yield, never on an independent poll, so
+showing a *live* stage change means the caller has to actually yield
+when the stage changes, not just before/after the whole call. Batch
+already ran `caption_image()` inside a background worker thread feeding
+a `queue.Queue` that its generator drains and yields from (needed for
+per-image progress) - `on_stage` there just pushes a `("stage", text)`
+item onto the same queue, tagged separately from `("progress", ...)`
+items so the drain loop can tell them apart. Single-image and Review
+didn't have that shape at all (they called `caption_image()` directly
+and only yielded once before, once after) - both got the same
+background-thread-+-queue treatment added specifically so `on_stage` has
+something to push into and the generator has something to yield from
+mid-call.
 
 ## House rules
 
@@ -230,9 +329,27 @@ standalone `HydraTagger` repo; this is the real integration.
   previously-known task ID.
 - `tkinter` save/browse dialogs only work when the browser and Python
   process are on the same machine.
+- `gr.Error` is not a fire-and-forget popup like `gr.Info`/`gr.Warning` —
+  calling it just constructs an exception object; it only displays
+  anything if actually `raise`d, and raising it aborts whatever function
+  raised it (Gradio's own dispatcher catches it to render the modal).
+  `app.py`'s `_notify()` deliberately maps its `"error"` level to a
+  `gr.Warning`-styled toast for this reason, not `gr.Error` — none of
+  its callers (mostly 2s-timer polling handlers) can afford to have a
+  popup silently abort them mid-function.
 
 ## Open / deferred
 
+- **Broad UI-logic refactor, not yet scoped.** Much of the app predates
+  this session's status-bar/infotext-bar/`_notify` consolidation (see
+  "Status/notification architecture" above) and still carries older UI
+  patterns from before that. Revisit the rest of the app against the new
+  logic once it's settled. User's own remark on this, verbatim: "no more
+  lazy start and ui elements enabled/disabled redesign" - i.e. don't let
+  the old implicit-lazy-start style creep back in anywhere during the
+  refactor, and the widespread `interactive=True/False` enable/disable
+  pattern (Run/Interrupt gating, Settings sub-tab gating, etc.) is itself
+  a candidate for redesign here, not just something to preserve as-is.
 - **Settings sub-tab redirect has a known "strange effect," not fully
   diagnosed** — mostly works (tab-level disable while a job runs,
   redirect-to-Debug on entry, restore the real sub-tab afterward via
@@ -251,15 +368,13 @@ standalone `HydraTagger` repo; this is the real integration.
   (CUDA 13.3/12.4, ROCm, CPU backend picker; no auto-detect heuristic —
   the dropdown just defaults to CUDA 13.3 and the user picks otherwise).
 - **Hydra tagger integration** — done, see "Hydra 3.5 second-stage tag
-  classifier" above. Deliberately left out of this first pass (upstream
-  supports them, just not exposed in Settings yet): exclusive-groups,
-  aliases, and per-category-prefix knobs. Also still open: the actual
-  `pip install torch...`/model download and a live GPU
-  caption-with-Hydra-enabled test haven't been run yet in this repo —
-  only a real load+classify smoke test against another repo's
-  already-downloaded weights (see the section above); a live pass
-  through Settings → Hydra on real hardware is still the real test,
-  same caveat as the rest of this file's UI verification.
+  classifier" above. A real `pip install torch...`/model download plus
+  live GPU classify passes (a throwaway metric-sweep script and the real
+  Settings → Hydra sliders in the running GUI) have now happened against
+  real images on real hardware, and `hydra_metric`/`hydra_implications`
+  defaults were retuned as a result. Still deliberately left out
+  (upstream supports them, just not exposed in Settings): exclusive-
+  groups, aliases, and per-category-prefix knobs.
 - Smaller deferred items: an "unsaved Settings changes" indicator; the
   brief tab-disabled flash before redirect on a fresh page load; a
   possible rare race between overlapping Start/End llama clicks.

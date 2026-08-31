@@ -104,6 +104,7 @@ import logging
 import os
 import platform
 import queue
+import re
 import sys
 import threading
 import time
@@ -150,6 +151,37 @@ log = logging.getLogger("app")  # fixed name, not __name__ - which is "__main__"
                                   # "app" when imported (e.g. in tests) -
                                   # this way logging.getLogger("app") always
                                   # refers to the right logger either way.
+
+# gr.Error is deliberately not in here, even though it's the "error"-
+# flavored popup - unlike gr.Info/gr.Warning (plain calls that post a
+# toast and let execution continue), gr.Error only displays anything
+# when *raised* and allowed to propagate all the way out to Gradio's own
+# dispatcher, which aborts whatever function raised it. That's the wrong
+# shape for _notify's callers below - none of them want firing a popup
+# to also cut their own function off before it returns its normal
+# outputs. So "error" still logs as a real log.error() line, it just
+# surfaces as a (non-fatal) warning-styled toast rather than a red one.
+_POPUP_FNS = {"info": gr.Info, "warning": gr.Warning, "error": gr.Warning}
+
+
+def _notify(text: str, level: str = "info") -> None:
+    """The one place a Gradio popup toast gets fired - replaces what used
+    to be scattered direct gr.Info/gr.Warning calls. level picks both the
+    log.<level>() call (auto-captured by the debug log/file when enabled -
+    see _setup_debug_logging) and the matching popup type - see
+    _POPUP_FNS above for why "error" still pops a warning-styled toast,
+    not a red one. This always pops a toast - for a message that should
+    only be logged, call log.<level>() directly instead.
+
+    Must be called from inside a real Gradio callback (click/tick/load
+    handler) - like gr.Info/Warning themselves, it needs Gradio's request
+    context, so it can't be called from a raw background thread (e.g. the
+    batch/download/install worker threads) - those still have to route
+    through a queue/state that a polling handler relays from, the same
+    pattern already used for lifecycle infotext boxes."""
+    getattr(log, level)(text)
+    _POPUP_FNS[level](text)
+
 
 current_cfg: AppConfig = config_mod.load()
 
@@ -386,9 +418,9 @@ def _note_controllable_transition(controllable: bool, cfg: AppConfig, status: Se
     global _last_known_controllable
     if not controllable and _last_known_controllable:
         if cfg.server_mode == "managed" and not status.installed:
-            gr.Info("Model management is disabled: llama.cpp isn't installed yet, so there's nothing to manage.")
+            _notify("Model management is disabled: llama.cpp isn't installed yet, so there's nothing to manage.")
         else:
-            gr.Info(
+            _notify(
                 "Model management is disabled: the active llama-server isn't one this app "
                 "started, so what it currently has loaded isn't something the Models tab can "
                 "show you or change."
@@ -442,11 +474,11 @@ def _update_reachability_tracking(status: ServerStatus, cfg: AppConfig) -> None:
         _down_is_crash = not expected
         if _down_is_crash:
             if managed_installed:
-                gr.Warning("The managed llama-server stopped responding - it may have crashed. Restart it from Settings.")
+                _notify("The managed llama-server stopped responding - it may have crashed. Restart it from Settings.", level="warning")
             else:
-                gr.Warning(f"No captioning server is reachable - {status.reason} Set it up on the Settings tab.")
+                _notify(f"No captioning server is reachable - {status.reason} Set it up on the Settings tab.", level="warning")
     elif was_reachable is None and not managed_installed:
-        gr.Warning(f"No captioning server is reachable - {status.reason} Set it up on the Settings tab.")
+        _notify(f"No captioning server is reachable - {status.reason} Set it up on the Settings tab.", level="warning")
     # was_reachable is False (steady-state down), or None+managed_installed
     # (fresh idle) - no popup either way.
 
@@ -646,7 +678,7 @@ def _autostart_managed_llama_ui():
         status = _reachability_cache
     if not status.installed or status.reachable:
         return noop
-    gr.Info("Starting managed llama-server automatically (autostart is enabled)...")
+    _notify("Starting managed llama-server automatically (autostart is enabled)...")
     ok, _ = _try_start_managed_llama()
     if not ok:
         return noop
@@ -684,7 +716,7 @@ def _autoload_hydra_model_ui():
     st = hydra_classifier.status()
     if not (st.deps_installed and st.model_downloaded) or st.loaded:
         return noop
-    gr.Info("Loading Hydra model automatically (autoload is enabled)...")
+    _notify("Loading Hydra model automatically (autoload is enabled)...")
     try:
         hydra_classifier.load(cfg)
         message = f"Hydra model loaded on {hydra_classifier.status().device}."
@@ -1202,15 +1234,44 @@ def run_single_ui(image_path, trigger_word_override: str):
         if not already_up:
             yield "", "Processing...", gr.update(), gr.update(), gr.update(), gr.update()
 
-        try:
-            caption, result = caption_image(
-                image_path, client, cfg, trigger_word=trigger_word_override
-            )
-        except ClientError as exc:
-            log.warning("Single-image caption failed for %s: %s", image_path, exc)
-            yield "", f"Captioning failed: {exc}", *idle_state
+        # A plain blocking caption_image() call can't yield mid-call, so
+        # showing a live stage change ("captioning" -> "tagging (Hydra)")
+        # in single_infotext needs the same background-thread + queue
+        # shape run_batch_ui already uses - the queue is what lets on_stage
+        # (called synchronously inside caption_image(), from this worker
+        # thread) reach a yield in this generator without blocking on it.
+        q: "queue.Queue" = queue.Queue()
+        result_holder = {}
+
+        def on_stage_cb(stage: str) -> None:
+            q.put(stage)
+
+        def worker():
+            try:
+                result_holder["caption"], result_holder["result"] = caption_image(
+                    image_path, client, cfg, trigger_word=trigger_word_override,
+                    on_stage=on_stage_cb,
+                )
+            except ClientError as exc:
+                result_holder["error"] = str(exc)
+            q.put(None)
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        while True:
+            stage = q.get()
+            if stage is None:
+                break
+            yield gr.update(), f"{stage}...", gr.update(), gr.update(), gr.update(), gr.update()
+        thread.join()
+
+        if "error" in result_holder:
+            log.warning("Single-image caption failed for %s: %s", image_path, result_holder["error"])
+            yield "", f"Captioning failed: {result_holder['error']}", *idle_state
             return
 
+        caption = result_holder["caption"]
+        result = result_holder["result"]
         speed = f", {result.tokens_per_second:.1f} tok/s" if result.tokens_per_second else ""
 
         if result.truncated:
@@ -1378,12 +1439,16 @@ def run_batch_ui(directory_str, recursive, overwrite, trigger_word_override):
             log.warning("Batch: no images found in %s", directory)
             yield "No images found in that directory.", "", None, "", *idle_state
             return
+        total = len(images)
 
         q: "queue.Queue" = queue.Queue()
         result_holder = {}
 
-        def progress_cb(i, total, path, status, caption, resize_note):
-            q.put((i, total, path, status, caption, resize_note))
+        def progress_cb(i, total_, path, status, caption, resize_note):
+            q.put(("progress", i, path, status, caption, resize_note))
+
+        def on_stage_cb(path: Path, stage: str) -> None:
+            q.put(("stage", path, stage))
 
         def worker():
             try:
@@ -1394,6 +1459,7 @@ def run_batch_ui(directory_str, recursive, overwrite, trigger_word_override):
                     trigger_word=trigger_word_override,
                     progress_cb=progress_cb,
                     should_stop=lambda: _operation_should_stop("batch"),
+                    on_stage=on_stage_cb,
                 )
             except Exception as exc:  # noqa: BLE001 - surface to UI, don't crash app
                 result_holder["error"] = str(exc)
@@ -1403,21 +1469,53 @@ def run_batch_ui(directory_str, recursive, overwrite, trigger_word_override):
         start_time = time.monotonic()
         thread.start()
 
+        # processed/current_file/current_stage/resize_suffix all feed one
+        # combined infotext line, rebuilt on every queue item (stage or
+        # progress) - a stage-only line was tried first and reverted: the
+        # progress line that follows it lands a moment later and replaces
+        # it outright, so the "N/total processed · avg · ETA" context was
+        # only ever visible for a blink between two images. One line that
+        # always carries the fullest currently-known context avoids that.
         last_file = ""
         last_image = None
         last_caption = ""
+        processed = 0
+        current_file = ""
+        current_stage: Optional[str] = None
+        resize_suffix = ""
+
+        def infotext_text() -> str:
+            elapsed = time.monotonic() - start_time
+            avg = elapsed / processed if processed else 0.0
+            eta = avg * (total - processed)
+            text = current_file or f"{total} image(s)"
+            if resize_suffix:
+                text += f" · resized {resize_suffix}"
+            text += f" · {processed}/{total} processed · avg {avg:.1f}s/image · ETA {_format_duration(eta)}"
+            if current_stage:
+                text += f" - {current_stage}"
+            return text
+
         while True:
             item = q.get()
             if item is None:
                 break
-            i, total, path, status, caption, resize_note = item
+            if item[0] == "stage":
+                _, path, stage = item
+                if path.name != current_file:
+                    # A new image started - the previous one's resize
+                    # note (if any) no longer applies to what's showing.
+                    resize_suffix = ""
+                current_file = path.name
+                current_stage = stage
+                yield infotext_text(), last_file, last_image, last_caption, gr.update(), gr.update(), gr.update(), gr.update()
+                continue
 
-            elapsed = time.monotonic() - start_time
-            avg = elapsed / i if i else 0.0
-            eta = avg * (total - i)
-            status_text = f"{i}/{total} processed · avg {avg:.1f}s/image · ETA {_format_duration(eta)}"
-            if resize_note:
-                status_text += f" · resized {resize_note}"
+            _, i, path, status, caption, resize_note = item
+            processed = i
+            current_file = path.name
+            current_stage = None  # between images - no stage in flight until the next on_stage
+            resize_suffix = resize_note or ""
 
             # Skipped images were never sent to the model at all (already
             # captioned) - nothing to preview, so leave the preview
@@ -1442,11 +1540,13 @@ def run_batch_ui(directory_str, recursive, overwrite, trigger_word_override):
                     last_caption = "(truncated - not saved, see .txt.issue)"
                 else:
                     last_caption = "(failed - see .txt.issue)"
-            yield status_text, last_file, last_image, last_caption, gr.update(), gr.update(), gr.update(), gr.update()
+            yield infotext_text(), last_file, last_image, last_caption, gr.update(), gr.update(), gr.update(), gr.update()
 
         thread.join()
         if "error" in result_holder:
-            yield f"Unexpected error: {result_holder['error']}", last_file, last_image, last_caption, *idle_state
+            message = f"Unexpected error: {result_holder['error']}"
+            _notify(f"Batch captioning: {message}", level="error")
+            yield message, last_file, last_image, last_caption, *idle_state
         else:
             r = result_holder["result"]
             total_elapsed = time.monotonic() - start_time
@@ -1456,6 +1556,11 @@ def run_batch_ui(directory_str, recursive, overwrite, trigger_word_override):
                 f"{r.skipped} skipped, {r.failed} failed "
                 f"in {_format_duration(total_elapsed)}"
             )
+            # Fires even if the user's still watching the Batch tab - a
+            # long batch is exactly the kind of thing this was asked for
+            # (start it, go do something else, still find out when it's
+            # done or hit trouble without having to stay on this tab).
+            _notify(f"Batch captioning {summary}", level="warning" if r.failed else "info")
             yield summary, last_file, last_image, last_caption, *idle_state
     finally:
         _operation_end()
@@ -1638,13 +1743,42 @@ def review_recaption_ui(items: list[ReviewItem], index: int, current_caption: st
         if not already_up:
             yield current_caption, "Processing...", *_REVIEW_STATE_NOOP
 
-        try:
-            caption, result = caption_image(item.path, client, cfg, trigger_word=None)
-        except ClientError as exc:
-            log.warning("Review recaption failed for %s: %s", item.path, exc)
-            yield current_caption, f"Recaptioning failed: {exc}", *idle_state
+        # Same background-thread + queue shape as run_single_ui/
+        # run_batch_ui - see run_single_ui's comment for why a plain
+        # blocking caption_image() call can't yield a live stage change
+        # on its own.
+        q: "queue.Queue" = queue.Queue()
+        result_holder = {}
+
+        def on_stage_cb(stage: str) -> None:
+            q.put(stage)
+
+        def worker():
+            try:
+                result_holder["caption"], result_holder["result"] = caption_image(
+                    item.path, client, cfg, trigger_word=None,
+                    on_stage=on_stage_cb,
+                )
+            except ClientError as exc:
+                result_holder["error"] = str(exc)
+            q.put(None)
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        while True:
+            stage = q.get()
+            if stage is None:
+                break
+            yield current_caption, f"{stage}...", *_REVIEW_STATE_NOOP
+        thread.join()
+
+        if "error" in result_holder:
+            log.warning("Review recaption failed for %s: %s", item.path, result_holder["error"])
+            yield current_caption, f"Recaptioning failed: {result_holder['error']}", *idle_state
             return
 
+        caption = result_holder["caption"]
+        result = result_holder["result"]
         speed = f", {result.tokens_per_second:.1f} tok/s" if result.tokens_per_second else ""
         note = f"CUT OFF at {result.completion_tokens} tokens{speed}" if result.truncated else f"{result.completion_tokens} tokens{speed}"
         status = f"Recaptioned in {result.elapsed_s:.1f}s ({note}) — not saved yet, navigate away or edit to keep it"
@@ -1674,7 +1808,7 @@ def save_settings_ui(
     resize_enabled, resize_target_mp, snap_enabled, snap_multiple,
     prompt_template, temperature, top_p, max_tokens, request_timeout,
     trigger_word, overwrite_existing, recursive_batch, debug_tab_enabled,
-    hydra_enabled, hydra_device, hydra_metric, hydra_implications,
+    hydra_enabled, hydra_device, hydra_confidence, hydra_threshold, hydra_implications,
     hydra_exclude_categories, hydra_exclude_tags, hydra_max_tags, hydra_autoload_model,
 ) -> str:
     """Per-category behavior on save (see the design discussion this was
@@ -1722,7 +1856,7 @@ def save_settings_ui(
             debug_tab_enabled=bool(debug_tab_enabled),
             hydra_enabled=bool(hydra_enabled),
             hydra_device=hydra_device,
-            hydra_metric=hydra_metric,
+            hydra_metric=_hydra_sliders_to_metric(float(hydra_confidence), float(hydra_threshold)),
             hydra_implications=hydra_implications,
             hydra_exclude_categories=hydra_exclude_categories,
             hydra_exclude_tags=hydra_exclude_tags,
@@ -1790,6 +1924,13 @@ _download_started_at: Optional[float] = None  # time.monotonic() when _download_
 _download_abort_requested = False
 _download_worker_thread: Optional[threading.Thread] = None
 _download_needs_refresh = False  # set True whenever a download actually completes - see _download_triggered_refresh_ui
+# Completion/failure (message, level) pairs popped by the next
+# _download_status_ui tick - a list, not a single slot like
+# _install_announce/_hydra_install_announce, since several queued
+# downloads can each finish inside one 2s tick window. A plain abort
+# (download_one returning False without raising only ever means
+# should_abort() fired) is user-initiated and doesn't get announced.
+_download_announces: list[tuple[str, str]] = []
 
 
 def _download_worker() -> None:
@@ -1809,11 +1950,17 @@ def _download_worker() -> None:
                 _download_current_bytes = written
 
         completed = False
+        announce: Optional[tuple[str, str]] = None
         try:
             completed = download_one(_download_current, lambda: _download_abort_requested, on_progress)
-        except Exception:
+            if completed:
+                announce = (f"Downloaded {_download_current.label}.", "info")
+        except Exception as exc:
             log.exception("Download failed: %s", _download_current.label)
+            announce = (f"Download failed: {_download_current.label}: {exc}", "error")
         with _download_lock:
+            if announce is not None:
+                _download_announces.append(announce)
             _download_current = None
             if completed:
                 # Picked up by _download_triggered_refresh_ui on the next
@@ -1894,7 +2041,19 @@ def _download_status_ui():
     """(row_visibility_update, html_update) - wired to the same 2s
     status_timer as everything else, plus called directly after any
     action that changes the queue so the row responds immediately
-    instead of waiting for the next tick."""
+    instead of waiting for the next tick. Also fires a one-shot _notify()
+    popup per completed/failed download popped from _download_announces -
+    this function is wired to status_timer.tick twice (once for the
+    Models tab's row, once for Hydra's), but draining the list under
+    _download_lock means only whichever of the two calls runs first in a
+    given tick actually finds anything to announce, so a finished
+    download still only pops one popup, not two."""
+    with _download_lock:
+        pending = list(_download_announces)
+        _download_announces.clear()
+    for message, level in pending:
+        _notify(message, level=level)
+
     html = _download_status_html()
     if html is None:
         return gr.update(visible=False), gr.update(value="")
@@ -1916,13 +2075,16 @@ _install_lock = threading.RLock()
 _install_thread: Optional[threading.Thread] = None
 _install_state = {"phase": "idle", "bytes_done": 0, "bytes_total": 0}
 _install_abort_requested = False
-# One-shot message popped by the next _llama_install_status_ui tick (success
-# or failure) - not left sitting in _install_state, because that would mean
-# every 2s tick after a completed install keeps re-announcing the same
-# message into llama_lifecycle_status, stomping on whatever the Start/End/
-# Verify buttons wrote there in the meantime. Mirrors _download_needs_
-# refresh's single-shot-flag idiom above.
-_install_announce: Optional[str] = None
+# One-shot (message, level) popped by the next _llama_install_status_ui
+# tick (success or failure) - not left sitting in _install_state, because
+# that would mean every 2s tick after a completed install keeps
+# re-announcing the same message into llama_lifecycle_infotext, stomping
+# on whatever the Start/End/Verify buttons wrote there in the meantime.
+# Mirrors _download_needs_refresh's single-shot-flag idiom above. Also
+# used to fire a one-shot _notify() popup on completion/failure, so
+# finding out an install finished doesn't require still being on the
+# Llama sub-tab when it does.
+_install_announce: Optional[tuple[str, str]] = None  # (message, level)
 
 
 def _install_worker(backend_id: str) -> None:
@@ -1946,12 +2108,14 @@ def _install_worker(backend_id: str) -> None:
             on_progress=on_progress, on_phase=on_phase,
         )
         message = f"Installed {label} ({plan.build_tag})." if completed else "Install aborted."
+        level = "info"
     except Exception as exc:
         log.exception("llama.cpp install failed (backend=%s)", backend_id)
         message = f"Install failed: {exc}"
+        level = "error"
     with _install_lock:
         _install_state.update(phase="idle", bytes_done=0, bytes_total=0)
-        _install_announce = message
+        _install_announce = (message, level)
         _install_thread = None
 
 
@@ -1995,10 +2159,10 @@ def _llama_install_abort_ui() -> str:
 
 
 def _llama_install_status_ui():
-    """(row_visibility, progress_html, lifecycle_status_update,
+    """(row_visibility, progress_html, lifecycle_infotext_update,
     installed_backend_text_update) - wired to the same 2s status_timer as
     the download-status row, plus called directly after Install/Abort
-    clicks for immediate feedback. lifecycle_status_update only ever
+    clicks for immediate feedback. lifecycle_infotext_update only ever
     carries a real value on the tick that pops a pending _install_announce
     (every other tick is a no-op gr.update(), so it never overwrites a
     Start/End/Verify message that isn't actually stale); installed_backend_
@@ -2012,11 +2176,13 @@ def _llama_install_status_ui():
         announce = _install_announce
         _install_announce = None
 
-    status_update = gr.update(value=announce) if announce is not None else gr.update()
+    if announce is not None:
+        _notify(announce[0], level=announce[1])
+    infotext_update = gr.update(value=announce[0]) if announce is not None else gr.update()
     installed_update = gr.update(value=_llama_installed_text())
 
     if phase not in ("planning", "downloading", "extracting"):
-        return gr.update(visible=False), gr.update(value=""), status_update, installed_update
+        return gr.update(visible=False), gr.update(value=""), infotext_update, installed_update
 
     if phase == "planning":
         html = "<div>Resolving latest llama.cpp release...</div>"
@@ -2029,7 +2195,7 @@ def _llama_install_status_ui():
             f"<progress value=\"{bytes_done}\" max=\"{total}\" style=\"width:100%;\"></progress>"
             f"<div>Downloading: {pct}% ({format_size(bytes_done)} / {format_size(bytes_total)})</div>"
         )
-    return gr.update(visible=True), gr.update(value=html), status_update, installed_update
+    return gr.update(visible=True), gr.update(value=html), infotext_update, installed_update
 
 
 def _llama_installed_text() -> str:
@@ -2066,11 +2232,30 @@ _hydra_install_lock = threading.RLock()
 _hydra_install_thread: Optional[threading.Thread] = None
 _hydra_install_running = False
 _hydra_install_output: list[str] = []  # last 200 lines of pip's own output, newest last
-# One-shot message popped by the next _hydra_install_status_ui tick, same
-# single-shot idiom as llama's own _install_announce above - so a stale
-# completion message doesn't keep stomping on whatever Load/Unload wrote
-# to hydra_lifecycle_status in the meantime.
-_hydra_install_announce: Optional[str] = None
+# One-shot (message, level) popped by the next _hydra_install_status_ui
+# tick, same single-shot idiom as llama's own _install_announce above -
+# so a stale completion message doesn't keep stomping on whatever
+# Load/Unload wrote to hydra_lifecycle_infotext in the meantime, and so
+# a one-shot _notify() popup fires on completion/failure.
+_hydra_install_announce: Optional[tuple[str, str]] = None  # (message, level)
+
+
+_HYDRA_METRIC_RE = re.compile(r"f([0-9]*\.?[0-9]+)@([0-9]*\.?[0-9]+)")
+
+
+def _hydra_metric_to_sliders(metric: str) -> tuple[float, float]:
+    """Confidence/Threshold slider values for an "f<beta>@<precision>"
+    metric string - falls back to the app's own default (not
+    AppConfig.hydra_metric's literal default, which would go stale) for
+    anything else (a hand-edited "csi..." string, "default", or garbage
+    left over from before these sliders existed)."""
+    if (match := _HYDRA_METRIC_RE.fullmatch(metric.strip())) is not None:
+        return float(match.group(1)), float(match.group(2))
+    return 0.5, 0.1
+
+
+def _hydra_sliders_to_metric(confidence: float, threshold: float) -> str:
+    return f"f{confidence:g}@{threshold:g}"
 
 
 def _hydra_status_text() -> str:
@@ -2096,12 +2281,14 @@ def _hydra_install_worker() -> None:
     try:
         completed = hydra_install_deps(on_output)
         message = "Hydra dependencies installed." if completed else "Hydra dependency install failed - see output above."
+        level = "info" if completed else "error"
     except Exception as exc:
         log.exception("Hydra dependency install failed")
         message = f"Install failed: {exc}"
+        level = "error"
     with _hydra_install_lock:
         _hydra_install_running = False
-        _hydra_install_announce = message
+        _hydra_install_announce = (message, level)
         _hydra_install_thread = None
 
 
@@ -2117,7 +2304,7 @@ def _hydra_install_start_ui() -> str:
 
 
 def _hydra_install_status_ui():
-    """(output_box_visible, output_box_value, lifecycle_status_update,
+    """(output_box_visible, output_box_value, lifecycle_infotext_update,
     hydra_status_md_update) - wired to the same 2s status_timer as
     everything else, plus called directly after the Install click for
     immediate feedback."""
@@ -2128,9 +2315,11 @@ def _hydra_install_status_ui():
         announce = _hydra_install_announce
         _hydra_install_announce = None
 
-    status_update = gr.update(value=announce) if announce is not None else gr.update()
+    if announce is not None:
+        _notify(announce[0], level=announce[1])
+    infotext_update = gr.update(value=announce[0]) if announce is not None else gr.update()
     hydra_status_update = gr.update(value=_hydra_status_text())
-    return gr.update(visible=running, value=output_text), status_update, hydra_status_update
+    return gr.update(visible=running, value=output_text), infotext_update, hydra_status_update
 
 
 def _hydra_download_model_ui() -> str:
@@ -2608,6 +2797,21 @@ def _display_base_url() -> str:
     return _managed_base_url(cfg)
 
 
+def _hydra_footer_label(cfg: AppConfig) -> str:
+    """Compact one-word(ish) Hydra state for the status bar - see
+    _hydra_status_text() for the fuller sentence-form version shown on
+    the Hydra sub-tab itself; this is deliberately terser, matching the
+    llama-server segment's own "running"/"idle"/etc. brevity."""
+    if not cfg.hydra_enabled:
+        return "disabled"
+    st = hydra_classifier.status()
+    if st.loaded:
+        return f"loaded ({st.device})"
+    if not st.deps_installed or not st.model_downloaded:
+        return "not set up"
+    return "enabled, not loaded"
+
+
 def get_status_text() -> str:
     cfg = current_cfg
     base_url = _display_base_url()
@@ -2623,6 +2827,7 @@ def get_status_text() -> str:
         f"Gradio {gr.__version__} &nbsp;·&nbsp; "
         f"llama-server: {_status_label(cfg, healthy, installed)} &nbsp;·&nbsp; "
         f"Model: {model} &nbsp;·&nbsp; "
+        f"Hydra: {_hydra_footer_label(cfg)} &nbsp;·&nbsp; "
         f"{_operation_status_text()}"
     )
 
@@ -2724,25 +2929,25 @@ def build_app() -> gr.Blocks:
                         single_interrupt_btn = gr.Button("Interrupt", variant="stop")
                     with gr.Column():
                         single_save_btn = gr.Button("Save caption", interactive=False)
-                single_status = gr.Textbox(show_label=False, container=False, interactive=False)
+                single_infotext = gr.Textbox(show_label=False, container=False, interactive=False)
 
                 single_run_btn.click(
                     run_single_ui,
                     [single_image, single_trigger],
                     [
-                        single_caption, single_status,
+                        single_caption, single_infotext,
                         single_run_btn, single_run_col, single_interrupt_col, single_interrupt_btn,
                     ],
                 )
                 single_interrupt_btn.click(interrupt_single_ui, [], [single_interrupt_btn])
                 single_save_btn.click(
-                    save_single_ui, [single_image, single_caption], [single_status]
+                    save_single_ui, [single_image, single_caption], [single_infotext]
                 )
                 single_caption.change(
                     lambda text: gr.update(interactive=bool(text.strip())),
                     [single_caption], [single_save_btn],
                 )
-                single_image.change(clear_single_result_ui, [], [single_caption, single_status])
+                single_image.change(clear_single_result_ui, [], [single_caption, single_infotext])
 
             with gr.Tab("Batch processing", interactive=False) as batch_tab:
                 with gr.Row():
@@ -2780,14 +2985,14 @@ def build_app() -> gr.Blocks:
                         batch_last_file = gr.Textbox(label="Last file processed", interactive=False)
                         batch_last_caption = gr.Textbox(label="Last caption created", interactive=False)
 
-                batch_status = gr.Textbox(show_label=False, container=False, interactive=False)
+                batch_infotext = gr.Textbox(show_label=False, container=False, interactive=False)
 
                 batch_browse_btn.click(browse_directory_ui, [batch_dir], [batch_dir])
                 batch_run_btn.click(
                     run_batch_ui,
                     [batch_dir, batch_recursive, batch_overwrite, batch_trigger],
                     [
-                        batch_status, batch_last_file, batch_last_image, batch_last_caption,
+                        batch_infotext, batch_last_file, batch_last_image, batch_last_caption,
                         batch_run_btn, batch_run_col, batch_interrupt_col, batch_interrupt_btn,
                     ],
                 )
@@ -2823,7 +3028,7 @@ def build_app() -> gr.Blocks:
                     interactive=False, row_count=(0, "dynamic"), buttons=[],
                 )
 
-                review_status = gr.Textbox(show_label=False, container=False, interactive=False)
+                review_infotext = gr.Textbox(show_label=False, container=False, interactive=False)
 
                 # See the Review tab's handler-function docstrings above for
                 # what each of these three actually holds.
@@ -2832,7 +3037,7 @@ def build_app() -> gr.Blocks:
                 review_loaded_caption_state = gr.State("")
 
                 _review_nav_outputs = [
-                    review_status, review_items_state, review_index_state, review_loaded_caption_state,
+                    review_infotext, review_items_state, review_index_state, review_loaded_caption_state,
                     review_image, review_caption, review_table,
                 ]
                 review_browse_btn.click(browse_directory_ui, [review_dir], [review_dir])
@@ -2856,7 +3061,7 @@ def build_app() -> gr.Blocks:
                     review_recaption_ui,
                     [review_items_state, review_index_state, review_caption],
                     [
-                        review_caption, review_status,
+                        review_caption, review_infotext,
                         review_recaption_col, review_interrupt_col, review_interrupt_btn,
                         review_prev_btn, review_next_btn, review_table,
                         review_dir, review_browse_btn, review_scan_btn,
@@ -2892,7 +3097,7 @@ def build_app() -> gr.Blocks:
                 with gr.Row(visible=False) as download_status_row:
                     download_status_text = gr.HTML(container=False, scale=4)
                     download_abort_btn = gr.Button("Abort all downloads", scale=1)
-                models_status = gr.Textbox(show_label=False, container=False, interactive=False)
+                models_infotext = gr.Textbox(show_label=False, container=False, interactive=False)
 
                 # See this tab's own handler-function docstrings above for what
                 # each of these two actually holds.
@@ -2901,7 +3106,7 @@ def build_app() -> gr.Blocks:
 
                 _models_scan_outputs = [
                     models_table, models_groups_state, models_selected_folder_state,
-                    models_quant_dropdown, models_mmproj_dropdown, models_action_btn, models_status,
+                    models_quant_dropdown, models_mmproj_dropdown, models_action_btn, models_infotext,
                 ]
                 refresh_models_btn.click(models_refresh_ui, [models_selected_folder_state], _models_scan_outputs)
                 models_table.select(
@@ -2909,14 +3114,14 @@ def build_app() -> gr.Blocks:
                     [models_groups_state],
                     [
                         models_selected_folder_state, models_quant_dropdown, models_mmproj_dropdown,
-                        models_action_btn, models_status,
+                        models_action_btn, models_infotext,
                     ],
                 )
                 models_action_btn.click(
                     models_action_ui,
                     [models_groups_state, models_quant_dropdown, models_mmproj_dropdown],
                     [
-                        models_table, models_quant_dropdown, models_mmproj_dropdown, models_action_btn, models_status,
+                        models_table, models_quant_dropdown, models_mmproj_dropdown, models_action_btn, models_infotext,
                         download_status_row, download_status_text,
                     ],
                 )
@@ -3002,7 +3207,7 @@ def build_app() -> gr.Blocks:
                         # (only one of which is ever visible at a time),
                         # rather than one status box per group - Start/
                         # End/Verify never fire at the same moment anyway.
-                        llama_lifecycle_status = gr.Textbox(show_label=False, container=False, interactive=False)
+                        llama_lifecycle_infotext = gr.Textbox(show_label=False, container=False, interactive=False)
 
                         with gr.Group():
                             prompt_template = gr.Textbox(
@@ -3035,31 +3240,31 @@ def build_app() -> gr.Blocks:
                         # state is "Settings" here too (these buttons only
                         # exist on that tab), so push_to_settings is
                         # always a no-op, not a real redirect.
-                        start_llama_btn.click(_start_managed_llama_ui, [], [llama_lifecycle_status]).then(
+                        start_llama_btn.click(_start_managed_llama_ui, [], [llama_lifecycle_infotext]).then(
                             _refresh_reachability_ui, [current_tab_label_state],
                             [
                                 models_tab, single_tab, batch_tab, start_llama_btn, end_llama_btn, main_tabs,
                                 current_tab_label_state,
                             ],
                         )
-                        end_llama_btn.click(_end_managed_llama_ui, [], [llama_lifecycle_status]).then(
+                        end_llama_btn.click(_end_managed_llama_ui, [], [llama_lifecycle_infotext]).then(
                             _refresh_reachability_ui, [current_tab_label_state],
                             [
                                 models_tab, single_tab, batch_tab, start_llama_btn, end_llama_btn, main_tabs,
                                 current_tab_label_state,
                             ],
                         )
-                        verify_external_btn.click(_verify_external_ui, [external_url], [llama_lifecycle_status])
+                        verify_external_btn.click(_verify_external_ui, [external_url], [llama_lifecycle_infotext])
 
                         _llama_install_status_outputs = [
                             llama_install_status_row, llama_install_status_text,
-                            llama_lifecycle_status, installed_backend_text,
+                            llama_lifecycle_infotext, installed_backend_text,
                         ]
                         install_llama_btn.click(
-                            _llama_install_start_ui, [llama_backend_dropdown], [llama_lifecycle_status]
+                            _llama_install_start_ui, [llama_backend_dropdown], [llama_lifecycle_infotext]
                         ).then(_llama_install_status_ui, [], _llama_install_status_outputs)
                         abort_install_btn.click(
-                            _llama_install_abort_ui, [], [llama_lifecycle_status]
+                            _llama_install_abort_ui, [], [llama_lifecycle_infotext]
                         ).then(_llama_install_status_ui, [], _llama_install_status_outputs)
 
                         # Models tab's "Manage llama server" button - wired here,
@@ -3097,7 +3302,7 @@ def build_app() -> gr.Blocks:
                                 label="Autoload on app launch (if installed, downloaded, and enabled)",
                                 value=cfg.hydra_autoload_model,
                             )
-                            hydra_lifecycle_status = gr.Textbox(show_label=False, container=False, interactive=False)
+                            hydra_lifecycle_infotext = gr.Textbox(show_label=False, container=False, interactive=False)
 
                         with gr.Group():
                             hydra_enabled = gr.Checkbox(
@@ -3109,9 +3314,31 @@ def build_app() -> gr.Blocks:
                                 value=cfg.hydra_device,
                                 label="Device (only takes effect after an Unload + Load)",
                             )
-                            hydra_metric = gr.Textbox(
-                                label="Calibration metric", value=cfg.hydra_metric,
+                            _hydra_confidence_default, _hydra_threshold_default = _hydra_metric_to_sliders(
+                                cfg.hydra_metric
                             )
+                            with gr.Row():
+                                hydra_confidence = gr.Slider(
+                                    minimum=0.1, maximum=1.5, step=0.05,
+                                    value=_hydra_confidence_default,
+                                    label="Confidence",
+                                    info=(
+                                        "Per-tag strictness. Low = looser, more tags "
+                                        "(favors catching everything). High = stricter, "
+                                        "fewer but more certain tags (favors precision)."
+                                    ),
+                                )
+                                hydra_threshold = gr.Slider(
+                                    minimum=0.0, maximum=0.5, step=0.05,
+                                    value=_hydra_threshold_default,
+                                    label="Threshold",
+                                    info=(
+                                        "Safety floor, independent of Confidence: never let "
+                                        "a tag through with a measured track record worse "
+                                        "than this (e.g. 0.1 = wrong no more than 9 times "
+                                        "out of 10 on Hydra's own validation data)."
+                                    ),
+                                )
                             hydra_implications = gr.Dropdown(
                                 choices=[
                                     "preserve", "inherit", "constrain", "enforce", "remove",
@@ -3135,16 +3362,16 @@ def build_app() -> gr.Blocks:
                         with gr.Row(visible=False) as hydra_download_status_row:
                             hydra_download_status_text = gr.HTML(container=False)
 
-                        hydra_install_btn.click(_hydra_install_start_ui, [], [hydra_lifecycle_status]).then(
+                        hydra_install_btn.click(_hydra_install_start_ui, [], [hydra_lifecycle_infotext]).then(
                             _hydra_install_status_ui, [],
-                            [hydra_install_output, hydra_lifecycle_status, hydra_status_md],
+                            [hydra_install_output, hydra_lifecycle_infotext, hydra_status_md],
                         )
-                        hydra_download_btn.click(_hydra_download_model_ui, [], [hydra_lifecycle_status])
+                        hydra_download_btn.click(_hydra_download_model_ui, [], [hydra_lifecycle_infotext])
                         hydra_load_btn.click(
-                            _load_hydra_model_ui, [], [hydra_lifecycle_status, hydra_status_md]
+                            _load_hydra_model_ui, [], [hydra_lifecycle_infotext, hydra_status_md]
                         )
                         hydra_unload_btn.click(
-                            _unload_hydra_model_ui, [], [hydra_lifecycle_status, hydra_status_md]
+                            _unload_hydra_model_ui, [], [hydra_lifecycle_infotext, hydra_status_md]
                         )
 
                     with gr.Tab("Image resizing", id="image-resizing-settings") as image_resizing_settings_tab:
@@ -3195,7 +3422,7 @@ def build_app() -> gr.Blocks:
                 with gr.Row():
                     save_settings_btn = gr.Button("Save settings", variant="primary")
                     restart_app_btn = gr.Button("Restart app")
-                settings_status = gr.Textbox(show_label=False, container=False, interactive=False)
+                settings_infotext = gr.Textbox(show_label=False, container=False, interactive=False)
 
                 settings_inputs = [
                     server_mode, server_port, external_url,
@@ -3203,10 +3430,10 @@ def build_app() -> gr.Blocks:
                     resize_enabled, resize_target_mp, snap_enabled, snap_multiple,
                     prompt_template, temperature, top_p, max_tokens, request_timeout,
                     trigger_word, overwrite_existing, recursive_batch, debug_tab_enabled,
-                    hydra_enabled, hydra_device, hydra_metric, hydra_implications,
+                    hydra_enabled, hydra_device, hydra_confidence, hydra_threshold, hydra_implications,
                     hydra_exclude_categories, hydra_exclude_tags, hydra_max_tags, hydra_autoload_model,
                 ]
-                save_settings_btn.click(save_settings_ui, settings_inputs, [settings_status]).then(
+                save_settings_btn.click(save_settings_ui, settings_inputs, [settings_infotext]).then(
                     # Saving can change server_mode (or anything else
                     # check_status/_cached_controllable/_cached_reachable
                     # read), and the Models/Single-image/Batch-processing
@@ -3297,7 +3524,7 @@ def build_app() -> gr.Blocks:
         status_timer.tick(_download_triggered_refresh_ui, [models_selected_folder_state], _models_scan_outputs)
         status_timer.tick(_llama_install_status_ui, [], _llama_install_status_outputs)
         status_timer.tick(
-            _hydra_install_status_ui, [], [hydra_install_output, hydra_lifecycle_status, hydra_status_md]
+            _hydra_install_status_ui, [], [hydra_install_output, hydra_lifecycle_infotext, hydra_status_md]
         )
         status_timer.tick(_download_status_ui, [], [hydra_download_status_row, hydra_download_status_text])
         if cfg.debug_tab_enabled:
@@ -3328,7 +3555,7 @@ def build_app() -> gr.Blocks:
         demo.load(_download_status_ui, [], [download_status_row, download_status_text])
         demo.load(_llama_install_status_ui, [], _llama_install_status_outputs)
         demo.load(
-            _hydra_install_status_ui, [], [hydra_install_output, hydra_lifecycle_status, hydra_status_md]
+            _hydra_install_status_ui, [], [hydra_install_output, hydra_lifecycle_infotext, hydra_status_md]
         )
         demo.load(_download_status_ui, [], [hydra_download_status_row, hydra_download_status_text])
         demo.load(_settings_gating_ui, [], _settings_gated_tabs)
@@ -3360,7 +3587,7 @@ def build_app() -> gr.Blocks:
             # ordering matters (Hydra's autoload is meant to be tested
             # against whatever VRAM llama-server's autostart already
             # claimed, not before it).
-            _autoload_hydra_model_ui, [], [hydra_lifecycle_status, hydra_status_md],
+            _autoload_hydra_model_ui, [], [hydra_lifecycle_infotext, hydra_status_md],
         )
 
     return demo

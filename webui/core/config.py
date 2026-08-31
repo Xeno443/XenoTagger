@@ -157,8 +157,8 @@ class AppConfig:
     # hydra/classification.py's parse_metric). Cheap to recompute, so this
     # (and the three settings below) apply on the very next caption with
     # no reload needed.
-    hydra_metric: str = "f1.0@0.1"
-    hydra_implications: str = "inherit"
+    hydra_metric: str = "f0.5@0.1"
+    hydra_implications: str = "remove"
     hydra_exclude_categories: str = ""  # space-separated, e.g. "meta lore"
     hydra_exclude_tags: str = ""  # space-separated
     hydra_max_tags: int = 0  # 0 = no cap, else keep only the top-N by probability
