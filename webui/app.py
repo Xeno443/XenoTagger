@@ -588,6 +588,24 @@ def _goto_hydra_settings_ui():
     return gr.update(selected="settings"), gr.update(selected="hydra-settings"), "hydra-settings", "Settings"
 
 
+def _send_batch_to_review_ui(directory: str):
+    """The Batch tab's "Send to Review" button - pure navigation + handoff
+    of the directory field to the Review tab (same "explicitly assert
+    every destination" reasoning as _goto_llama_settings_ui above -
+    main_tabs.select() doesn't reliably fire on a server-pushed switch
+    like this one). Wired (not defined) down in the Review tab's own
+    section further below, same "components referenced don't exist yet
+    this early in the file" reason hydra_models_manage_btn's click is
+    wired inside the Settings tab body rather than right next to its own
+    button. Chained with .then(review_scan_ui, ...) by its caller, same
+    two-step "set the field, then scan" shape review_browse_btn's own
+    click already uses - there's no success/failure signal from a batch
+    run worth reflecting here (see the button's own interactive= gating:
+    a valid directory is the only thing checked, not whether the last
+    batch run in it actually succeeded)."""
+    return gr.update(selected="review"), directory, "Review"
+
+
 def _llama_lifecycle_button_updates(cfg: AppConfig, status: ServerStatus):
     """(start_btn_update, end_btn_update) for the Llama settings tab's
     two lifecycle buttons - shared by _refresh_reachability_ui and
@@ -3126,6 +3144,15 @@ def build_app() -> gr.Blocks:
                         batch_run_btn = gr.Button("Run batch", variant="primary")
                     with gr.Column(visible=False) as batch_interrupt_col:
                         batch_interrupt_btn = gr.Button("Interrupt", variant="stop")
+                    with gr.Column():
+                        # Gated purely on "is batch_dir a real directory" -
+                        # there's no cheap way to know whether the last batch
+                        # run in it actually succeeded (batch.py is stateless,
+                        # see its own module docstring), so that's
+                        # deliberately not part of the check. Click wiring is
+                        # further below, in the Review tab's own section -
+                        # see _send_batch_to_review_ui's own docstring for why.
+                        batch_send_review_btn = gr.Button("Send to Review", interactive=False)
 
                 batch_infotext = gr.Textbox(show_label=False, container=False, interactive=False)
 
@@ -3139,8 +3166,12 @@ def build_app() -> gr.Blocks:
                     ],
                 )
                 batch_interrupt_btn.click(interrupt_batch_ui, [], [batch_interrupt_btn])
+                batch_dir.change(
+                    lambda d: gr.update(interactive=bool(d and Path(d).is_dir())),
+                    [batch_dir], [batch_send_review_btn],
+                )
 
-            with gr.Tab("Review") as review_tab:
+            with gr.Tab("Review", id="review") as review_tab:
                 with gr.Row():
                     review_dir = gr.Textbox(label="Directory of images", scale=4)
                     with gr.Column(scale=1, min_width=120):
@@ -3212,6 +3243,9 @@ def build_app() -> gr.Blocks:
                     ],
                 )
                 review_interrupt_btn.click(interrupt_review_ui, [], [review_interrupt_btn])
+                batch_send_review_btn.click(
+                    _send_batch_to_review_ui, [batch_dir], [main_tabs, review_dir, current_tab_label_state]
+                ).then(review_scan_ui, [review_dir], _review_nav_outputs)
 
             with gr.Tab("Models", interactive=False) as models_tab:
                 gr.Markdown("### VLM model")
@@ -3287,6 +3321,7 @@ def build_app() -> gr.Blocks:
                 # progress) - a single row below both sections is the
                 # honest reflection of "one queue, one download bar, one
                 # abort button".
+                gr.Markdown("---")
                 with gr.Row(visible=False) as download_status_row:
                     download_status_text = gr.HTML(container=False, scale=4)
                     download_abort_btn = gr.Button("Abort all downloads", scale=1)
