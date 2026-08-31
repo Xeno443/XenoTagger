@@ -121,11 +121,16 @@ os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
 import gradio as gr
 
 from core import config as config_mod
+from core import hydra_classifier
 from core.batch import ISSUE_SUFFIX, ReviewItem, find_images, run_batch, scan_review_status
 from core.captioner import caption_image
 from core.client import ClientError, LlamaClient
 from core.config import AppConfig
 from core.downloads import DownloadItem, download_one
+from core.hydra_install import (
+    MODEL_PATH as HYDRA_MODEL_PATH, MODEL_SIZE_BYTES as HYDRA_MODEL_SIZE_BYTES, MODEL_URL as HYDRA_MODEL_URL,
+    install_deps as hydra_install_deps,
+)
 from core.llama_install import (
     BACKENDS as LLAMA_BACKENDS, DEFAULT_BACKEND as LLAMA_DEFAULT_BACKEND,
     install as llama_install_run, installed_info as llama_installed_info, plan_install as llama_plan_install,
@@ -657,6 +662,37 @@ def _autostart_managed_llama_ui():
     )
 
 
+def _autoload_hydra_model_ui():
+    """Chained onto the END of the same demo.load chain
+    _autostart_managed_llama_ui is already on (after it, never before or
+    in parallel) - deliberately, so that when both autostart-llama and
+    autoload-Hydra are enabled, Hydra's load attempt happens against
+    whatever VRAM llama-server's own autostart already claimed. That
+    ordering is the actual real-world scenario worth exercising (see
+    AppConfig.hydra_autoload_model's own docstring) - loading Hydra
+    first, then llama-server, would never surface the coexistence
+    problem this is meant to test for. Silent no-op unless hydra_enabled,
+    hydra_autoload_model, deps+model are both present, and nothing is
+    already loaded - same "no popup for didn't-autostart" convention as
+    _autostart_managed_llama_ui itself. A real load failure (e.g. a CUDA
+    OOM) is still surfaced via gr.Info + the status text, exactly like a
+    manual Load click would."""
+    cfg = current_cfg
+    noop = (gr.update(), gr.update())
+    if not (cfg.hydra_enabled and cfg.hydra_autoload_model):
+        return noop
+    st = hydra_classifier.status()
+    if not (st.deps_installed and st.model_downloaded) or st.loaded:
+        return noop
+    gr.Info("Loading Hydra model automatically (autoload is enabled)...")
+    try:
+        hydra_classifier.load(cfg)
+        message = f"Hydra model loaded on {hydra_classifier.status().device}."
+    except hydra_classifier.HydraError as exc:
+        message = f"Couldn't autoload Hydra model: {exc}"
+    return gr.update(value=message), gr.update(value=_hydra_status_text())
+
+
 # ------------------------------------------------------ Operation tracking
 #
 # Single source of truth for "is something long-running active, and what".
@@ -1099,7 +1135,12 @@ def restart_app_ui() -> None:
     stop our own managed llama-server first (execv skips atexit entirely),
     and abort any in-flight/queued downloads or llama.cpp install too -
     all in-memory only and won't survive this regardless, better to say
-    so cleanly.
+    so cleanly. Also unload Hydra if loaded - unlike llama-server (a
+    separate OS process _stop_managed kills outright), Hydra's model
+    lives in THIS process's own CUDA context, which execv does not
+    clean up on its own (it replaces the process image but skips normal
+    interpreter/CUDA teardown) - explicit unload() first avoids leaking
+    VRAM into the replaced process.
     """
     log.info("User triggered app restart from Settings")
     _operation_force_abort()
@@ -1107,6 +1148,7 @@ def restart_app_ui() -> None:
     _download_abort_all()
     _install_abort_all()
     _stop_managed()
+    hydra_classifier.unload()
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
@@ -1632,6 +1674,8 @@ def save_settings_ui(
     resize_enabled, resize_target_mp, snap_enabled, snap_multiple,
     prompt_template, temperature, top_p, max_tokens, request_timeout,
     trigger_word, overwrite_existing, recursive_batch, debug_tab_enabled,
+    hydra_enabled, hydra_device, hydra_metric, hydra_implications,
+    hydra_exclude_categories, hydra_exclude_tags, hydra_max_tags, hydra_autoload_model,
 ) -> str:
     """Per-category behavior on save (see the design discussion this was
     built from): image resizing/captioning defaults/prompt-template-bundle
@@ -1676,6 +1720,14 @@ def save_settings_ui(
             overwrite_existing=bool(overwrite_existing),
             recursive_batch=bool(recursive_batch),
             debug_tab_enabled=bool(debug_tab_enabled),
+            hydra_enabled=bool(hydra_enabled),
+            hydra_device=hydra_device,
+            hydra_metric=hydra_metric,
+            hydra_implications=hydra_implications,
+            hydra_exclude_categories=hydra_exclude_categories,
+            hydra_exclude_tags=hydra_exclude_tags,
+            hydra_max_tags=int(hydra_max_tags),
+            hydra_autoload_model=bool(hydra_autoload_model),
         )
         new_cfg = current_cfg
         config_mod.save(new_cfg)
@@ -1985,6 +2037,134 @@ def _llama_installed_text() -> str:
     if info is None:
         return "Not installed yet."
     return f"Installed: {info.get('label', info.get('backend_id'))} ({info.get('build_tag')})"
+
+
+# --------------------------------------------------------------- Hydra install/lifecycle
+#
+# Two separate concerns, kept apart the same way llama's own install
+# section is kept apart from _download_lock above:
+#   - Installing Hydra's Python deps (torch + friends) is a pip subprocess
+#     streaming text output over time - its own lock/thread/state below,
+#     since that's a fundamentally different shape of progress than a
+#     byte-counted file transfer.
+#   - Downloading hydra-3.5.safetensors is just another file - it reuses
+#     the EXISTING curated-model download queue (_download_enqueue et al.
+#     above) rather than inventing a second download mechanism; only the
+#     on-screen progress row is Hydra-tab-local (a Gradio component can
+#     only be laid out once, so the Models tab's own download_status_row/
+#     download_status_text can't also be reused here - but the underlying
+#     queue/worker/_download_status_html() state they poll is global and
+#     happily shared).
+# Loading/unloading the model itself is not a background job at all - it
+# blocks for a few seconds at most (~1GB), so it's a plain generator
+# click handler, the same shape as _start_managed_llama_ui/
+# _end_managed_llama_ui above (no dedicated timer needed - unlike
+# llama-server's reachability, "is Hydra loaded" can only change via our
+# own explicit actions here, never externally).
+
+_hydra_install_lock = threading.RLock()
+_hydra_install_thread: Optional[threading.Thread] = None
+_hydra_install_running = False
+_hydra_install_output: list[str] = []  # last 200 lines of pip's own output, newest last
+# One-shot message popped by the next _hydra_install_status_ui tick, same
+# single-shot idiom as llama's own _install_announce above - so a stale
+# completion message doesn't keep stomping on whatever Load/Unload wrote
+# to hydra_lifecycle_status in the meantime.
+_hydra_install_announce: Optional[str] = None
+
+
+def _hydra_status_text() -> str:
+    st = hydra_classifier.status()
+    parts = [
+        f"Dependencies: {'installed' if st.deps_installed else 'not installed'}.",
+        f"Model: {'downloaded' if st.model_downloaded else 'not downloaded'} ({HYDRA_MODEL_PATH}).",
+        f"Loaded on {st.device}." if st.loaded else "Not loaded.",
+    ]
+    return " ".join(parts)
+
+
+def _hydra_install_worker() -> None:
+    global _hydra_install_thread, _hydra_install_running, _hydra_install_announce
+    with _hydra_install_lock:
+        _hydra_install_output.clear()
+
+    def on_output(line: str) -> None:
+        with _hydra_install_lock:
+            _hydra_install_output.append(line)
+            del _hydra_install_output[:-200]
+
+    try:
+        completed = hydra_install_deps(on_output)
+        message = "Hydra dependencies installed." if completed else "Hydra dependency install failed - see output above."
+    except Exception as exc:
+        log.exception("Hydra dependency install failed")
+        message = f"Install failed: {exc}"
+    with _hydra_install_lock:
+        _hydra_install_running = False
+        _hydra_install_announce = message
+        _hydra_install_thread = None
+
+
+def _hydra_install_start_ui() -> str:
+    global _hydra_install_thread, _hydra_install_running
+    with _hydra_install_lock:
+        if _hydra_install_thread is not None and _hydra_install_thread.is_alive():
+            return "An install is already in progress."
+        _hydra_install_running = True
+        _hydra_install_thread = threading.Thread(target=_hydra_install_worker, daemon=True)
+        _hydra_install_thread.start()
+    return "Installing Hydra dependencies (torch + friends - this downloads several GB)..."
+
+
+def _hydra_install_status_ui():
+    """(output_box_visible, output_box_value, lifecycle_status_update,
+    hydra_status_md_update) - wired to the same 2s status_timer as
+    everything else, plus called directly after the Install click for
+    immediate feedback."""
+    global _hydra_install_announce
+    with _hydra_install_lock:
+        running = _hydra_install_running
+        output_text = "\n".join(_hydra_install_output[-40:])
+        announce = _hydra_install_announce
+        _hydra_install_announce = None
+
+    status_update = gr.update(value=announce) if announce is not None else gr.update()
+    hydra_status_update = gr.update(value=_hydra_status_text())
+    return gr.update(visible=running, value=output_text), status_update, hydra_status_update
+
+
+def _hydra_download_model_ui() -> str:
+    added = _download_enqueue([
+        DownloadItem(
+            url=HYDRA_MODEL_URL, dest_path=HYDRA_MODEL_PATH,
+            label="hydra-3.5.safetensors", size_bytes=HYDRA_MODEL_SIZE_BYTES,
+        )
+    ])
+    if not added:
+        return "Already downloaded, or already queued."
+    return "Queued hydra-3.5.safetensors for download (~1GB)."
+
+
+def _load_hydra_model_ui():
+    if hydra_classifier.status().loaded:
+        yield "Hydra model is already loaded.", gr.update()
+        return
+    yield "Loading Hydra model...", gr.update()
+    try:
+        hydra_classifier.load(current_cfg)
+        message = f"Hydra model loaded on {hydra_classifier.status().device}."
+    except hydra_classifier.HydraError as exc:
+        message = f"Couldn't load Hydra model: {exc}"
+    yield message, gr.update(value=_hydra_status_text())
+
+
+def _unload_hydra_model_ui():
+    if not hydra_classifier.status().loaded:
+        yield "Hydra model isn't loaded.", gr.update()
+        return
+    yield "Unloading Hydra model...", gr.update()
+    hydra_classifier.unload()
+    yield "Hydra model unloaded.", gr.update(value=_hydra_status_text())
 
 
 # Mirrors models_refresh_ui()'s 7-value return shape (Models tab section
@@ -2894,7 +3074,78 @@ def build_app() -> gr.Blocks:
                         )
 
                     with gr.Tab("Hydra", id="hydra-settings") as hydra_settings_tab:
-                        gr.Markdown("Not implemented yet.")
+                        gr.Markdown(
+                            "Hydra 3.5 (RedRocket) is an optional second-stage e621 tag "
+                            "classifier - if loaded, its tags are appended after the VLM's "
+                            "caption on every Single-image/Batch/Review caption. Loading "
+                            "competes with llama-server for VRAM, so it's never automatic - "
+                            "install its dependencies, download its model, then Load it "
+                            "explicitly below (or enable autoload for next launch)."
+                        )
+                        hydra_status_md = gr.Markdown(_hydra_status_text())
+                        with gr.Group():
+                            with gr.Row():
+                                hydra_install_btn = gr.Button("Install Hydra dependencies", scale=2)
+                                hydra_download_btn = gr.Button("Download Hydra model (~1GB)", scale=2)
+                            hydra_install_output = gr.Textbox(
+                                label="Install output", visible=False, lines=10, max_lines=10, interactive=False,
+                            )
+                            with gr.Row():
+                                hydra_load_btn = gr.Button("Load Hydra model")
+                                hydra_unload_btn = gr.Button("Unload Hydra model")
+                            hydra_autoload_model = gr.Checkbox(
+                                label="Autoload on app launch (if installed, downloaded, and enabled)",
+                                value=cfg.hydra_autoload_model,
+                            )
+                            hydra_lifecycle_status = gr.Textbox(show_label=False, container=False, interactive=False)
+
+                        with gr.Group():
+                            hydra_enabled = gr.Checkbox(
+                                label="Enable Hydra tagging (appends tags after the VLM caption)",
+                                value=cfg.hydra_enabled,
+                            )
+                            hydra_device = gr.Radio(
+                                choices=[("CUDA", "cuda"), ("CPU", "cpu")],
+                                value=cfg.hydra_device,
+                                label="Device (only takes effect after an Unload + Load)",
+                            )
+                            hydra_metric = gr.Textbox(
+                                label="Calibration metric", value=cfg.hydra_metric,
+                            )
+                            hydra_implications = gr.Dropdown(
+                                choices=[
+                                    "preserve", "inherit", "constrain", "enforce", "remove",
+                                    "constrain-remove", "enforce-inherit", "enforce-constrain",
+                                    "enforce-remove", "off",
+                                ],
+                                value=cfg.hydra_implications,
+                                label="Implications mode",
+                            )
+                            with gr.Row():
+                                hydra_exclude_categories = gr.Textbox(
+                                    label="Exclude categories (space-separated)", value=cfg.hydra_exclude_categories,
+                                )
+                                hydra_exclude_tags = gr.Textbox(
+                                    label="Exclude tags (space-separated)", value=cfg.hydra_exclude_tags,
+                                )
+                            hydra_max_tags = gr.Number(
+                                label="Max tags appended (0 = no cap)", value=cfg.hydra_max_tags, precision=0,
+                            )
+
+                        with gr.Row(visible=False) as hydra_download_status_row:
+                            hydra_download_status_text = gr.HTML(container=False)
+
+                        hydra_install_btn.click(_hydra_install_start_ui, [], [hydra_lifecycle_status]).then(
+                            _hydra_install_status_ui, [],
+                            [hydra_install_output, hydra_lifecycle_status, hydra_status_md],
+                        )
+                        hydra_download_btn.click(_hydra_download_model_ui, [], [hydra_lifecycle_status])
+                        hydra_load_btn.click(
+                            _load_hydra_model_ui, [], [hydra_lifecycle_status, hydra_status_md]
+                        )
+                        hydra_unload_btn.click(
+                            _unload_hydra_model_ui, [], [hydra_lifecycle_status, hydra_status_md]
+                        )
 
                     with gr.Tab("Image resizing", id="image-resizing-settings") as image_resizing_settings_tab:
                         with gr.Group():
@@ -2952,6 +3203,8 @@ def build_app() -> gr.Blocks:
                     resize_enabled, resize_target_mp, snap_enabled, snap_multiple,
                     prompt_template, temperature, top_p, max_tokens, request_timeout,
                     trigger_word, overwrite_existing, recursive_batch, debug_tab_enabled,
+                    hydra_enabled, hydra_device, hydra_metric, hydra_implications,
+                    hydra_exclude_categories, hydra_exclude_tags, hydra_max_tags, hydra_autoload_model,
                 ]
                 save_settings_btn.click(save_settings_ui, settings_inputs, [settings_status]).then(
                     # Saving can change server_mode (or anything else
@@ -3043,6 +3296,10 @@ def build_app() -> gr.Blocks:
         status_timer.tick(_download_status_ui, [], [download_status_row, download_status_text])
         status_timer.tick(_download_triggered_refresh_ui, [models_selected_folder_state], _models_scan_outputs)
         status_timer.tick(_llama_install_status_ui, [], _llama_install_status_outputs)
+        status_timer.tick(
+            _hydra_install_status_ui, [], [hydra_install_output, hydra_lifecycle_status, hydra_status_md]
+        )
+        status_timer.tick(_download_status_ui, [], [hydra_download_status_row, hydra_download_status_text])
         if cfg.debug_tab_enabled:
             status_timer.tick(get_python_debug_text, [], [debug_python_box])
             status_timer.tick(get_llama_debug_text, [], [debug_llama_box])
@@ -3070,6 +3327,10 @@ def build_app() -> gr.Blocks:
         demo.load(models_refresh_ui, [models_selected_folder_state], _models_scan_outputs)
         demo.load(_download_status_ui, [], [download_status_row, download_status_text])
         demo.load(_llama_install_status_ui, [], _llama_install_status_outputs)
+        demo.load(
+            _hydra_install_status_ui, [], [hydra_install_output, hydra_lifecycle_status, hydra_status_md]
+        )
+        demo.load(_download_status_ui, [], [hydra_download_status_row, hydra_download_status_text])
         demo.load(_settings_gating_ui, [], _settings_gated_tabs)
         # _update_ui_status reads the reachability cache rather than
         # checking fresh (see its own docstring) - chained after (not a
@@ -3093,6 +3354,13 @@ def build_app() -> gr.Blocks:
                 models_tab, single_tab, batch_tab, start_llama_btn, end_llama_btn, main_tabs,
                 current_tab_label_state,
             ],
+        ).then(
+            # Deliberately last in this chain, after llama's own autostart -
+            # see _autoload_hydra_model_ui's own docstring for why the
+            # ordering matters (Hydra's autoload is meant to be tested
+            # against whatever VRAM llama-server's autostart already
+            # claimed, not before it).
+            _autoload_hydra_model_ui, [], [hydra_lifecycle_status, hydra_status_md],
         )
 
     return demo

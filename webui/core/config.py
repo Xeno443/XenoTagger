@@ -141,6 +141,33 @@ class AppConfig:
     # or process startup.
     debug_tab_enabled: bool = False
 
+    # Hydra 3.5 (RedRocket) second-stage e621 tag classifier - see
+    # core.hydra_classifier. Gates *using* an already-loaded model in
+    # captioner.py; it does not itself load one (see hydra_autoload_model
+    # and Settings -> Hydra's explicit Load/Unload buttons - loading is
+    # always an explicit action, same reasoning as managed llama-server,
+    # since it competes for the same VRAM llama-server may have already
+    # claimed).
+    hydra_enabled: bool = False
+    # "cuda" or "cpu" - falls back to cpu with a logged warning if CUDA
+    # isn't actually available. Baked into the loaded model's tensors, so
+    # changing this only takes effect after an explicit Unload + Load.
+    hydra_device: str = "cuda"
+    # Calibration metric string, upstream's own CLI default (see
+    # hydra/classification.py's parse_metric). Cheap to recompute, so this
+    # (and the three settings below) apply on the very next caption with
+    # no reload needed.
+    hydra_metric: str = "f1.0@0.1"
+    hydra_implications: str = "inherit"
+    hydra_exclude_categories: str = ""  # space-separated, e.g. "meta lore"
+    hydra_exclude_tags: str = ""  # space-separated
+    hydra_max_tags: int = 0  # 0 = no cap, else keep only the top-N by probability
+    # Mirrors autostart_managed_llama exactly: only fires once, on app
+    # launch, never mid-session - see app.py's demo.load chain. Deliberately
+    # independent of hydra_enabled (using an already-loaded model vs.
+    # loading one automatically at launch are separate questions).
+    hydra_autoload_model: bool = False
+
 
 def load() -> AppConfig:
     defaults = asdict(AppConfig())

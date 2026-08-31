@@ -33,8 +33,9 @@ they describe a repo structure this one no longer has.
   - `client.py` — the one place that actually calls llama-server's
     chat API, plus in-memory image preprocessing.
   - `captioner.py` — the shared "caption one image" entry point used by
-    Single-image, Batch, and the CLI alike (and the intended hook point
-    for a future Hydra classifier pass, see below).
+    Single-image, Batch, and the CLI alike. `caption_image()` is where
+    the Hydra second-stage tag classifier hooks in (see below) —
+    exactly the single hook point its own docstring anticipated.
   - `batch.py` — directory batch-captioning loop (stateless: a `.txt`
     sidecar existing is the only "already done" record).
   - `models.py` — discovers/classifies local GGUF models under
@@ -48,6 +49,20 @@ they describe a repo structure this one no longer has.
     GitHub's releases list currently returns first, not a hardcoded
     build number. Reachable from Settings → Llama in the GUI and from
     `cli.py --install-llama <backend>`.
+  - `hydra_classifier.py` — in-process Hydra 3.5 (RedRocket) e621 tag
+    classifier: a lazily-populated singleton (`load()`/`unload()`/
+    `classify()`/`status()`), not a second managed server — see
+    "Hydra 3.5 second-stage tag classifier" below.
+  - `hydra_install.py` — pip-installs Hydra's Python deps (torch +
+    friends, into `system\python` like everything else) and downloads
+    `hydra-3.5.safetensors` into `webui/models/RedRocket-Hydra/`.
+    Reachable from Settings → Hydra and from `cli.py --install-hydra`.
+- `webui/vendor/rr_hydra/` — vendored (checked-in) inference-only source
+  from RedRocket's own `hydra/hydra/` package, renamed from upstream's
+  `hydra` to avoid colliding with PyPI's unrelated `hydra-core`. Only
+  what a synchronous single-image `classify()` call needs — not
+  upstream's GUI/HTTP-service/multi-worker-dataloader code, none of
+  which this app uses.
 - `webui/config/` — `settings.json` (gitignored, per-machine),
   `models_source.json` (checked in — curated downloadable model list),
   `models_cache.json` (gitignored).
@@ -128,6 +143,50 @@ replacing an earlier implicit-lazy-start design:
   under Layout above. This was out of scope for the lifecycle-rewrite
   pass described in this section and was added afterward.
 
+## Hydra 3.5 second-stage tag classifier (integrated 2026-08-31)
+
+A second-stage e621 tag classifier (`webui/vendor/rr_hydra/`,
+`core/hydra_classifier.py`/`core/hydra_install.py`, Settings → Hydra)
+appends Hydra's own tags after the VLM's caption
+(`"<trigger>, <VLM paragraph>, tag1, tag2, ..."`) to ground NSFW/explicit
+tagging the VLM alone is weak at. Prototyped separately first in a
+standalone `HydraTagger` repo; this is the real integration.
+
+- **In-process, not a second managed server.** Unlike llama-server,
+  Hydra is pure Python + torch running in the same interpreter as
+  webui/cli — a plain lazily-populated singleton
+  (`hydra_classifier.load()`/`unload()`/`classify()`/`status()`), not a
+  second `ManagedServer`/port/health-check apparatus.
+- **Loading is an explicit "Load Hydra model" / "Unload Hydra model"
+  action in Settings → Hydra (+ an independent autoload-on-launch
+  checkbox), never implicit.** `n_gpu_layers="auto"` means llama-server
+  can claim most/all free VRAM at startup — loading Hydra's model
+  *after* llama-server is already running could OOM or spill into slow
+  shared/system memory on cards near this project's 8GB floor. This
+  needed to be an observable, deliberate action rather than something
+  buried inside a caption call — same reasoning `core/server.py`
+  already established for llama-server itself.
+  `AppConfig.hydra_enabled` only gates *using* an already-loaded model
+  in `captioner.py`; it never triggers a load. When both
+  `autostart_managed_llama` and `hydra_autoload_model` are enabled, the
+  demo.load chain deliberately runs Hydra's autoload *after*
+  llama-server's, so the real-world VRAM-contention scenario is what
+  actually gets exercised at every launch.
+- **Hydra failures degrade gracefully** — `captioner.py` catches
+  `HydraError` (deps/model missing, not loaded, OOM, whatever) and just
+  keeps the VLM-only caption; it never fails a whole caption/batch.
+- **Heavy deps on demand, not in base `requirements.txt`** — mirrors
+  `llama_install.py`'s own precedent. The model weight
+  (`hydra-3.5.safetensors`, ~1GB) lives in `webui/models/RedRocket-Hydra/`
+  (reuses `webui/models/`'s existing gitignore treatment); `core/models.py`'s
+  GGUF scanner ignores it since it only globs `*.gguf`.
+- **`webui/vendor/rr_hydra/`'s internal imports are absolute
+  (`from vendor.rr_hydra... import ...`), never `from ..vendor...`** —
+  `core/` is imported as a top-level package (no `webui` package
+  umbrella), so a relative import climbing above it fails. Caught via a
+  real load-a-real-model-and-classify-a-real-image smoke test, not just
+  `py_compile`.
+
 ## House rules
 
 - **No venv, ever.** Everything installs straight into `system\python`.
@@ -191,11 +250,16 @@ replacing an earlier implicit-lazy-start design:
   pattern is now applied to llama.cpp itself via `core/llama_install.py`
   (CUDA 13.3/12.4, ROCm, CPU backend picker; no auto-detect heuristic —
   the dropdown just defaults to CUDA 13.3 and the user picks otherwise).
-- **Hydra tagger integration — not started in this repo.** A second-
-  stage Hydra 3.5 (RedRocket) e621-style tag classifier, meant to
-  ground NSFW/explicit tagging the VLM alone is weak at, is prototyped
-  separately in a standalone `HydraTagger` repo. `core/captioner.py`'s
-  shared entry point exists partly so this only needs wiring in once.
+- **Hydra tagger integration** — done, see "Hydra 3.5 second-stage tag
+  classifier" above. Deliberately left out of this first pass (upstream
+  supports them, just not exposed in Settings yet): exclusive-groups,
+  aliases, and per-category-prefix knobs. Also still open: the actual
+  `pip install torch...`/model download and a live GPU
+  caption-with-Hydra-enabled test haven't been run yet in this repo —
+  only a real load+classify smoke test against another repo's
+  already-downloaded weights (see the section above); a live pass
+  through Settings → Hydra on real hardware is still the real test,
+  same caveat as the rest of this file's UI verification.
 - Smaller deferred items: an "unsaved Settings changes" indicator; the
   brief tab-disabled flash before redirect on a fresh page load; a
   possible rare race between overlapping Start/End llama clicks.

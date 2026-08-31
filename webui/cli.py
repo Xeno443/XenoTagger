@@ -21,6 +21,11 @@ from pathlib import Path
 
 from core import config as config_mod
 from core.client import LlamaClient
+from core.hydra_install import (
+    MODEL_SIZE_BYTES as HYDRA_MODEL_SIZE_BYTES,
+    download_model as hydra_download_model,
+    install_deps as hydra_install_deps,
+)
 from core.llama_install import BACKENDS, DEFAULT_BACKEND, install, plan_install
 from core.models import resolve_selection, scan_model_variants
 from core.server import ServerError, resolve_server
@@ -32,6 +37,12 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--install-llama", nargs="?", const=DEFAULT_BACKEND, choices=list(BACKENDS), default=None,
         help=f"Install llama-server.exe for the given backend and exit (default: {DEFAULT_BACKEND}). "
              f"Choices: {', '.join(BACKENDS)}",
+    )
+    parser.add_argument(
+        "--install-hydra", action="store_true",
+        help="Install Hydra's Python dependencies (torch + friends) and download its "
+             "model weight (~1GB), then exit. Does not enable or load it - see "
+             "Settings -> Hydra (or hydra_enabled/hydra_autoload_model in settings.json) for that.",
     )
     parser.add_argument("--dir", required=False, help="Directory of images to caption")
     parser.add_argument("--recursive", action="store_true", default=None)
@@ -130,6 +141,34 @@ def _install_llama(log: logging.Logger, backend_id: str) -> int:
     return 0
 
 
+def _install_hydra(log: logging.Logger) -> int:
+    """Synchronous (no worker thread needed for a one-shot CLI invocation) -
+    pip-installs Hydra's deps then downloads its model weight, sharing
+    core.hydra_install with the GUI's Settings -> Hydra installer/
+    downloader so both stay in sync."""
+    log.info("Installing Hydra dependencies (torch + friends - this downloads several GB) ...")
+    if not hydra_install_deps(on_output=lambda line: log.info("pip: %s", line)):
+        log.error("Hydra dependency install failed.")
+        return 1
+
+    log.info("Downloading Hydra model (~1GB) ...")
+    last_logged_pct = -1
+
+    def on_progress(written: int) -> None:
+        nonlocal last_logged_pct
+        pct = int(written * 100 / max(HYDRA_MODEL_SIZE_BYTES, 1))
+        if pct >= last_logged_pct + 10:
+            last_logged_pct = pct
+            log.info("Downloading: %d%%", pct)
+
+    if not hydra_download_model(should_abort=lambda: False, on_progress=on_progress):
+        log.error("Hydra model download did not complete.")
+        return 1
+
+    log.info("Hydra dependencies and model installed successfully.")
+    return 0
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     setup_logging(args.log_file, args.debuglog, args.verbose)
@@ -138,8 +177,11 @@ def main(argv=None) -> int:
     if args.install_llama:
         return _install_llama(log, args.install_llama)
 
+    if args.install_hydra:
+        return _install_hydra(log)
+
     if not args.dir:
-        log.error("--dir is required (unless using --install-llama)")
+        log.error("--dir is required (unless using --install-llama or --install-hydra)")
         return 2
 
     cfg = config_mod.load()

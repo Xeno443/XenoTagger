@@ -1,9 +1,9 @@
 """The one shared "process one image" entry point - see caption_image()'s
 own docstring below for why this indirection exists (it's the thing that
 makes the Single-image tab, the Batch tab, and the CLI all behave
-identically instead of three separately-maintained call sites; a future
-second-stage tag classifier, e.g. the standalone HydraTagger prototype,
-would hook in here too rather than in each caller separately).
+identically instead of three separately-maintained call sites). The
+Hydra 3.5 second-stage tag classifier (core.hydra_classifier) hooks in
+here for exactly that reason - see caption_image() below.
 
 apply_trigger_word()'s trigger_word argument distinguishes None from ""
 deliberately, and callers rely on that: None means "no override was
@@ -21,6 +21,7 @@ import logging
 from pathlib import Path
 from typing import Optional, Union
 
+from . import hydra_classifier
 from .client import CaptionResult, LlamaClient
 from .config import AppConfig
 
@@ -62,4 +63,13 @@ def caption_image(
     if word.strip():
         log.debug("caption_image(): applying trigger word '%s'", word.strip())
     caption = apply_trigger_word(result.content, word)
+
+    if cfg.hydra_enabled:
+        try:
+            hydra_result = hydra_classifier.classify(image, cfg)
+            if hydra_result.tag_text:
+                caption = f"{caption}, {hydra_result.tag_text}"
+        except hydra_classifier.HydraError as exc:
+            log.warning("caption_image(): Hydra classification failed, continuing without it: %s", exc)
+
     return caption, result
