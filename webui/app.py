@@ -2047,14 +2047,11 @@ def _download_status_html() -> Optional[str]:
 def _download_status_ui():
     """(row_visibility_update, html_update) - wired to the same 2s
     status_timer as everything else, plus called directly after any
-    action that changes the queue so the row responds immediately
-    instead of waiting for the next tick. Also fires a one-shot _notify()
-    popup per completed/failed download popped from _download_announces -
-    this function is wired to status_timer.tick twice (once for the
-    Models tab's row, once for Hydra's), but draining the list under
-    _download_lock means only whichever of the two calls runs first in a
-    given tick actually finds anything to announce, so a finished
-    download still only pops one popup, not two."""
+    action that changes the queue (from either the VLM or Hydra section -
+    both feed the one shared _download_queue) so the row responds
+    immediately instead of waiting for the next tick. Also fires a
+    one-shot _notify() popup per completed/failed download popped from
+    _download_announces."""
     with _download_lock:
         pending = list(_download_announces)
         _download_announces.clear()
@@ -2274,10 +2271,12 @@ def _llama_install_button_label() -> str:
 #   - Downloading hydra-3.5.safetensors is just another file - it reuses
 #     the EXISTING curated-model download queue (_download_enqueue et al.
 #     above) rather than inventing a second download mechanism. The
-#     button and its progress row now live on the Models tab's "Hydra
-#     model" section (moved there from this sub-tab), sharing the same
-#     underlying queue/worker/_download_status_html() state the VLM
-#     section's own download row polls.
+#     button lives on the Models tab's "Hydra model" section (moved
+#     there from this sub-tab); its progress shows in the single shared
+#     download_status_row below both Models-tab sections, since there is
+#     only ever one item actually downloading at a time regardless of
+#     which section queued it - see download_status_row's own comment
+#     at its definition for why a second, section-local row was removed.
 # Loading/unloading the model itself is not a background job at all - it
 # blocks for a few seconds at most (~1GB), so it's a plain generator
 # click handler, the same shape as _start_managed_llama_ui/
@@ -2395,16 +2394,19 @@ def _hydra_install_status_ui():
     )
 
 
-def _hydra_download_model_ui() -> str:
+def _hydra_download_model_ui():
     added = _download_enqueue([
         DownloadItem(
             url=HYDRA_MODEL_URL, dest_path=HYDRA_MODEL_PATH,
             label="hydra-3.5.safetensors", size_bytes=HYDRA_MODEL_SIZE_BYTES,
         )
     ])
-    if not added:
-        return "Already downloaded, or already queued."
-    return "Queued hydra-3.5.safetensors for download (~1GB)."
+    message = (
+        "Already downloaded, or already queued." if not added
+        else "Queued hydra-3.5.safetensors for download (~1GB)."
+    )
+    row_u, text_u = _download_status_ui()
+    return message, row_u, text_u
 
 
 def _load_hydra_with_llama_coexistence():
@@ -3237,9 +3239,6 @@ def build_app() -> gr.Blocks:
                     models_action_btn = gr.Button("Set as active model", variant="primary", interactive=False)
                     restart_server_btn = gr.Button("Manage llama server")
                     refresh_models_btn = gr.Button("Refresh")
-                with gr.Row(visible=False) as download_status_row:
-                    download_status_text = gr.HTML(container=False, scale=4)
-                    download_abort_btn = gr.Button("Abort all downloads", scale=1)
 
                 # Deliberately minimal for now, mirroring the VLM section's
                 # look (same 4 columns) without its "set as active model"
@@ -3275,8 +3274,22 @@ def build_app() -> gr.Blocks:
                     hydra_models_download_btn = gr.Button("Download Hydra model (~1GB)")
                     hydra_models_manage_btn = gr.Button("Manage Hydra")
                     hydra_models_refresh_btn = gr.Button("Refresh")
-                with gr.Row(visible=False) as hydra_download_status_row:
-                    hydra_download_status_text = gr.HTML(container=False)
+
+                # Single shared row for the one underlying download queue -
+                # the VLM and Hydra sections above both feed the same
+                # _download_queue/_download_worker (see app.py's Download
+                # queue section), so there is only ever one thing actually
+                # downloading at a time regardless of which section queued
+                # it. Two separate status rows (one per section) used to
+                # each mirror the same global _download_current, which just
+                # showed identical, section-mismatched content in both
+                # places (e.g. the Hydra row showing a VLM download's
+                # progress) - a single row below both sections is the
+                # honest reflection of "one queue, one download bar, one
+                # abort button".
+                with gr.Row(visible=False) as download_status_row:
+                    download_status_text = gr.HTML(container=False, scale=4)
+                    download_abort_btn = gr.Button("Abort all downloads", scale=1)
 
                 models_infotext = gr.Textbox(show_label=False, container=False, interactive=False)
 
@@ -3290,7 +3303,9 @@ def build_app() -> gr.Blocks:
                     models_quant_dropdown, models_mmproj_dropdown, models_action_btn, models_infotext,
                 ]
                 refresh_models_btn.click(models_refresh_ui, [models_selected_folder_state], _models_scan_outputs)
-                hydra_models_download_btn.click(_hydra_download_model_ui, [], [models_infotext])
+                hydra_models_download_btn.click(
+                    _hydra_download_model_ui, [], [models_infotext, download_status_row, download_status_text]
+                )
                 hydra_models_refresh_btn.click(
                     models_refresh_ui, [models_selected_folder_state], _models_scan_outputs
                 )
@@ -3775,7 +3790,6 @@ def build_app() -> gr.Blocks:
         status_timer.tick(_download_triggered_refresh_ui, [models_selected_folder_state], _models_scan_outputs)
         status_timer.tick(_llama_install_status_ui, [], _llama_install_status_outputs)
         status_timer.tick(_hydra_install_status_ui, [], _hydra_install_status_outputs)
-        status_timer.tick(_download_status_ui, [], [hydra_download_status_row, hydra_download_status_text])
         if cfg.debug_tab_enabled:
             status_timer.tick(get_python_debug_text, [], [debug_python_box])
             status_timer.tick(get_llama_debug_text, [], [debug_llama_box])
@@ -3804,7 +3818,6 @@ def build_app() -> gr.Blocks:
         demo.load(_download_status_ui, [], [download_status_row, download_status_text])
         demo.load(_llama_install_status_ui, [], _llama_install_status_outputs)
         demo.load(_hydra_install_status_ui, [], _hydra_install_status_outputs)
-        demo.load(_download_status_ui, [], [hydra_download_status_row, hydra_download_status_text])
         demo.load(_settings_gating_ui, [], _settings_gated_tabs)
         # _update_ui_status reads the reachability cache rather than
         # checking fresh (see its own docstring) - chained after (not a
@@ -3848,7 +3861,7 @@ def main() -> None:
     atexit.register(_stop_managed)
     demo = build_app()
     demo.queue()
-    demo.launch(server_port=UI_PORT, footer_links=[], css=ALL_CSS)
+    demo.launch(server_port=UI_PORT, footer_links=[], css=ALL_CSS, inbrowser=True)
 
 
 if __name__ == "__main__":
