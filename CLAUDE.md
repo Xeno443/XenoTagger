@@ -528,6 +528,38 @@ mid-call.
   on page load or after a Load/Unload/Install click chains
   `_hydra_install_status_ui`), kept intentionally minimal per explicit
   user direction ("useless for now").
+- **Follow-up #3 (2026-09-01, later the same day): the Models tab's two
+  download-status rows (one per section) were merged into one.** Both
+  the VLM section's row and the Hydra section's own row were wired to
+  the same `_download_status_ui()`/global `_download_current` state, so
+  whichever download was actually active showed identically (and
+  confusingly) in both places at once — e.g. the Hydra row showing a
+  VLM download's progress, which live-read as "my Hydra download got
+  silently cancelled" when it hadn't. There's only ever one real
+  download in flight regardless of which section queued it (both share
+  `_download_enqueue`/`_download_queue`/`_download_worker`), so the fix
+  was to delete the duplicate `hydra_download_status_row`/
+  `hydra_download_status_text` entirely and move the one real
+  `download_status_row` (bar + "Abort all downloads" button) below both
+  sections, behind its own `gr.Markdown("---")` divider.
+  `_hydra_download_model_ui()` now also returns that row's update
+  directly (mirroring `models_action_ui`'s own immediate-refresh
+  pattern) instead of waiting for the next 2s poll.
+- **Batch tab: new "Send to Review" button** — a third, gray
+  (default-variant) button in the same Row as Run batch/Interrupt,
+  `interactive=` only when `batch_dir` is a real, existing directory
+  (`batch_dir.change()`-driven). There's no cheap way to know whether
+  the last batch run in that directory actually succeeded — `batch.py`
+  is deliberately stateless (see its own module docstring) — so path
+  validity is the only check, by design. Clicking it (`_send_batch_to_
+  review_ui`, wired down in the Review tab's own section since
+  `review_dir`/`review_scan_ui`/`_review_nav_outputs` aren't defined yet
+  that early in the file — same reason `hydra_models_manage_btn`'s click
+  is wired inside the Settings tab body) switches `main_tabs` to Review
+  (needed adding `id="review"` to that Tab — every `gr.update(selected=
+  ...)` target needs one, see the Gradio gotcha below), copies
+  `batch_dir` into `review_dir`, and chains into the same
+  `review_scan_ui` scan Review's own Browse button uses.
 - **Model management / llama.cpp setup UI**: curated GGUF downloading
   is built (`core/downloads.py`, `models_source.json`). The same
   pattern is now applied to llama.cpp itself via `core/llama_install.py`

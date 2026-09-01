@@ -118,6 +118,13 @@ def run_batch(
     background worker thread, see app.py's run_batch_ui), so it must be a
     plain, Gradio-free callback, never something that touches gr.*
     directly.
+
+    When cfg.hydra_enabled and Hydra actually produced tags for an image,
+    two extra sidecars are written alongside the usual .txt: "<image>.nlp"
+    (the VLM-only caption, trigger word applied, no Hydra tags) and
+    "<image>.tags" (just Hydra's tag_text) - for consumers that want the
+    two pieces separately instead of re-splitting the combined .txt.
+    Batch-only for now, not written by Single-image or Review recaption.
     """
     directory = Path(directory)
     images = find_images(directory)
@@ -145,7 +152,7 @@ def run_batch(
 
         stage_cb = (lambda s, _path=image_path: on_stage(_path, s)) if on_stage else None
         try:
-            caption, outcome = caption_image(
+            caption, outcome, vlm_caption, hydra_tags = caption_image(
                 image_path, client, cfg, trigger_word=trigger_word, on_stage=stage_cb
             )
             if outcome.truncated:
@@ -159,6 +166,9 @@ def run_batch(
 
             issue_path.unlink(missing_ok=True)
             txt_path.write_text(caption, encoding="utf-8")
+            if cfg.hydra_enabled and hydra_tags is not None:
+                image_path.with_suffix(".nlp").write_text(vlm_caption, encoding="utf-8")
+                image_path.with_suffix(".tags").write_text(hydra_tags, encoding="utf-8")
             result.processed += 1
             if outcome.resize_note:
                 log.info("Captioned: %s -> %s (resized %s)", image_path, txt_path, outcome.resize_note)

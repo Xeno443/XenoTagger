@@ -1275,7 +1275,7 @@ def run_single_ui(image_path, trigger_word_override: str):
 
         def worker():
             try:
-                result_holder["caption"], result_holder["result"] = caption_image(
+                result_holder["caption"], result_holder["result"], _, _ = caption_image(
                     image_path, client, cfg, trigger_word=trigger_word_override,
                     on_stage=on_stage_cb,
                 )
@@ -1781,7 +1781,7 @@ def review_recaption_ui(items: list[ReviewItem], index: int, current_caption: st
 
         def worker():
             try:
-                result_holder["caption"], result_holder["result"] = caption_image(
+                result_holder["caption"], result_holder["result"], _, _ = caption_image(
                     item.path, client, cfg, trigger_word=None,
                     on_stage=on_stage_cb,
                 )

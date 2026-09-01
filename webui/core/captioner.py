@@ -41,14 +41,21 @@ def caption_image(
     cfg: AppConfig,
     trigger_word: Optional[str] = None,
     on_stage: Optional[Callable[[str], None]] = None,
-) -> tuple[str, CaptionResult]:
+) -> tuple[str, CaptionResult, str, Optional[str]]:
     """The one shared "process one image" call - used by the Single-image
     tab, the Batch tab, and the CLI alike, so every caller sees the same
-    resize/trigger-word/truncation behavior. Returns (caption, result):
-    caption has the trigger word applied (result.content is the raw,
-    pre-trigger-word text); result is the full CaptionResult for callers
-    that need more detail (token counts, timing, result.truncated, resize
-    info) than just the caption string.
+    resize/trigger-word/truncation behavior. Returns (caption, result,
+    vlm_caption, hydra_tags): caption has the trigger word applied and, if
+    Hydra fired, its tags appended on their own line (result.content is the
+    raw, pre-trigger-word, pre-Hydra text); result is the full CaptionResult
+    for callers that need more detail (token counts, timing,
+    result.truncated, resize info) than just the caption string;
+    vlm_caption is caption with the trigger word applied but before any
+    Hydra tags were appended (identical to caption when Hydra didn't fire);
+    hydra_tags is Hydra's own tag_text on its own (not folded into caption)
+    when it actually fired, else None - so a caller that wants to write the
+    VLM caption and Hydra's tags to separate files doesn't have to re-split
+    caption's combined string back apart.
 
     on_stage, if given, is called with a short label ("captioning" /
     "tagging (Hydra)") right before each of this function's two possible
@@ -74,15 +81,18 @@ def caption_image(
     if word.strip():
         log.debug("caption_image(): applying trigger word '%s'", word.strip())
     caption = apply_trigger_word(result.content, word)
+    vlm_caption = caption
 
+    hydra_tags: Optional[str] = None
     if cfg.hydra_enabled:
         if on_stage:
             on_stage("tagging (Hydra)")
         try:
             hydra_result = hydra_classifier.classify(image, cfg)
             if hydra_result.tag_text:
-                caption = f"{caption}\n{hydra_result.tag_text}"
+                hydra_tags = hydra_result.tag_text
+                caption = f"{caption}\n{hydra_tags}"
         except hydra_classifier.HydraError as exc:
             log.warning("caption_image(): Hydra classification failed, continuing without it: %s", exc)
 
-    return caption, result
+    return caption, result, vlm_caption, hydra_tags
