@@ -92,32 +92,39 @@ they describe a repo structure this one no longer has.
     (`core/llama_install.py`) - both managed-mode-only gaps, external
     server mode has no platform dependency at all. Read before assuming
     "Windows only" or claiming full Linux support either way.
-- `run-tagger.cmd` / `tag-cli.cmd` — launch the GUI / CLI through the
-  portable environment.
-- `setup-env.bat` / `environment.bat` — inherited from the portable-env
+- `run.cmd` / `cli.cmd` (renamed from `run-tagger.cmd`/`tag-cli.cmd`
+  2026-09-02) — launch the GUI / CLI. Each auto-detects which
+  environment is present (`system\python\python.exe` for the portable
+  env, else `.venv\Scripts\python.exe` for the venv path) instead of
+  needing separate launchers per setup path — collapsed from the
+  previous 4 launchers, see "Bootstrap/update scripts redesign" below.
+- `setup-portable.bat` / `environment.bat` — inherited from the portable-env
   base: build/activate the portable Python + Git toolchain under
-  `system\` (gitignored), then install `webui/requirements.txt`. Still
-  accurate, unrelated to the worktree model that was dropped.
-  `setup-tagger.cmd` (which used to also install a hardcoded CUDA-only
-  llama.cpp build) is gone — that job moved to `core/llama_install.py`
-  above.
-- `setup-venv.bat` / `run-tagger-venv.cmd` / `tag-cli-venv.cmd`
-  (added 2026-09-01) — an alternative to the portable environment for
+  `system\` (gitignored), then install `webui/requirements.txt` if it's
+  already present (skipped with a note otherwise — see below). Unrelated
+  to the worktree model that was dropped. `setup-tagger.cmd` (which used
+  to also install a hardcoded CUDA-only llama.cpp build) is gone — that
+  job moved to `core/llama_install.py` above.
+- `update.bat` — pulls the latest code (`git pull`, falling back to
+  `git reset --hard` + `git pull` on failure) then refreshes
+  `webui/requirements.txt` into whichever environment(s) actually exist
+  locally (portable and/or venv, checked independently). If no `.git` is
+  present at all it adopts the folder as a checkout first instead of
+  requiring an empty directory — see "Bootstrap/update scripts redesign"
+  below.
+- `setup-venv.bat` — an alternative to the portable environment for
   anyone who already has git and Python installed systemwide and would
-  rather use a normal venv. `setup-venv.bat` creates `.venv\` (gitignored)
-  via the systemwide `python` on PATH and installs
-  `webui/requirements.txt` into it; the two `-venv.cmd` launchers mirror
-  `run-tagger.cmd`/`tag-cli.cmd` but target `.venv\Scripts\python.exe`
-  instead of `system\python\python.exe`. Doesn't touch `system\` at all
-  — both setups coexist untouched side by side in the same checkout, and
-  nothing about the portable-env path changed. `webui/requirements.txt`
-  has no version pins, so a systemwide Python that's a different version
-  than the portable env's pinned one (see `setup-env.bat`) is expected to
+  rather use a normal venv. Creates `.venv\` (gitignored) via the
+  systemwide `python` on PATH and installs `webui/requirements.txt` into
+  it. Doesn't touch `system\` at all — both setups coexist untouched
+  side by side in the same checkout. `webui/requirements.txt` has no
+  version pins, so a systemwide Python that's a different version than
+  the portable env's pinned one (see `setup-portable.bat`) is expected to
   just work. This is why `core/hydra_install.py`'s pip-install subprocess
-  was changed from a hardcoded `system\python\python.exe` path to
-  `sys.executable` — it now targets whichever interpreter is actually
-  running the app, portable or venv, instead of always assuming the
-  portable one.
+  targets `sys.executable` rather than a hardcoded
+  `system\python\python.exe` path — it targets whichever interpreter is
+  actually running the app, portable or venv, instead of always assuming
+  the portable one.
 
 ## VRAM / hardware constraint
 
@@ -423,6 +430,67 @@ Hydra" case reuses `dataclasses.replace(cfg, hydra_enabled=False)` for
 just that one `caption_image()` call instead of touching `captioner.py`
 again - `cfg` itself (used everywhere else, e.g. the truncation-reason
 message) is left untouched.
+
+## Bootstrap/update scripts redesign (2026-09-02)
+
+Reworked how someone gets from "nothing" to a running app, across the
+deployment scenarios that actually matter:
+
+1. A prepackaged full portable zip (planned, not yet built) - ships with
+   `.git`, the portable toolchain, and deps already installed, since
+   it'll be built by zipping up an already-cloned-and-set-up checkout.
+   Needs nothing beyond the shared fixes below.
+2. `git clone` (user already has git) - `setup-portable.bat`/`setup-venv.bat`
+   run once as before.
+3. GitHub's "Download ZIP" (no git, has source incl.
+   `webui/requirements.txt`, but no `.git`) - setup scripts already work
+   unchanged; `update.bat` needed a way to start tracking updates
+   without an existing `.git`.
+4. Nothing at all - just the two bootstrap scripts dropped into an empty
+   folder by hand. Deferred for further scoping; the mechanism below
+   happens to already cover it as a side effect of solving #3, since an
+   empty directory and a non-git source tree hit the same code path.
+
+Two changes cover all four:
+
+- **`update.bat` adopts a non-git folder instead of requiring an
+  empty one for cloning.** `git clone` refuses a non-empty target
+  directory, which a ZIP extraction (or a folder that already has these
+  two `.bat` files in it) always is. Instead, when no `.git` is found:
+  `git init -b main`, `git remote add origin`, `git fetch origin`,
+  `git reset --hard origin/main`, then
+  `git branch --set-upstream-to=origin/main main` so a later plain
+  `git pull` has tracking info. `git reset --hard` (unlike `checkout`)
+  has no "untracked file would be overwritten" protection - it just
+  writes the target tree over whatever's already there - which is
+  exactly the adopt-in-place behavior wanted here, and is a well-known
+  idiom for turning an existing directory into a clone without an empty
+  target. Once adopted, it falls through to the same pull logic used for
+  an already-existing checkout.
+- **Dependency install moved from a setup-time-only step to something
+  `update.bat` also does, after every pull/adopt.** Previously
+  only `setup-portable.bat`/`setup-venv.bat` ran
+  `pip install -r webui/requirements.txt`, so pulling new code via
+  `update.bat` alone never refreshed deps even if
+  `requirements.txt` changed upstream. Now `update.bat` re-runs it
+  against whichever environment(s) actually exist locally
+  (`system\python\python.exe` and/or `.venv\Scripts\python.exe`,
+  checked independently since both can coexist) every time it updates
+  the code. `pip install -r` without `--upgrade` is a no-op fast local
+  check when everything's already satisfied (no network hit), so this
+  doesn't add meaningful cost to the common case. Deliberately kept in
+  the setup scripts too, not removed - `webui/requirements.txt` is
+  already present by the time either setup script runs in scenarios 2
+  and 3, so there was no actual circular dependency to fix there; only
+  `setup-portable.bat`'s deps-install got a guard
+  (`if exist webui\requirements.txt`) so it degrades to a skip-with-a-note
+  instead of a hard failure in scenario 4, where the repo isn't in place
+  yet when it runs.
+- Also collapsed `run-tagger.cmd`/`tag-cli.cmd`/`run-tagger-venv.cmd`/
+  `tag-cli-venv.cmd` into `run.cmd`/`cli.cmd` (see Layout above) as part
+  of the same pass - one pair of cryptically-named-per-setup-path
+  launchers was extra friction for the same "make this easy for someone
+  who's never done this before" goal driving the rest of this rework.
 
 ## House rules
 

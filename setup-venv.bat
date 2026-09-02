@@ -1,14 +1,14 @@
 @echo off
 setlocal enabledelayedexpansion
 
-REM Alternative to setup-env.bat, for anyone who already has git and
+REM Alternative to setup-portable.bat, for anyone who already has git and
 REM Python installed systemwide and would rather use a normal venv than
-REM this repo's portable environment (system\python) - see run-tagger-venv.cmd
-REM / tag-cli-venv.cmd for the matching launchers. Doesn't touch system\
-REM at all; both setups can coexist side by side in the same checkout.
+REM this repo's portable environment (system\python) - run.cmd/cli.cmd
+REM auto-detect and use whichever one exists. Doesn't touch system\ at
+REM all; both setups can coexist side by side in the same checkout.
 REM
 REM The systemwide `python` on PATH may well be a different version than
-REM the one the portable env pins (see setup-env.bat) - webui/requirements.txt
+REM the one the portable env pins (see setup-portable.bat) - webui/requirements.txt
 REM has no version pins, so this is expected to just work across reasonably
 REM recent Python versions, not something this script checks for.
 
@@ -18,7 +18,7 @@ set "VENV_DIR=%ROOT%.venv"
 where python >nul 2>nul
 if errorlevel 1 (
     echo No systemwide "python" found on PATH. Install Python first, or use
-    echo setup-env.bat instead if you'd rather not install anything systemwide.
+    echo setup-portable.bat instead if you'd rather not install anything systemwide.
     goto :fail
 )
 
@@ -50,10 +50,9 @@ if errorlevel 1 (
 )
 
 echo.
-echo Done. Use run-tagger-venv.cmd / tag-cli-venv.cmd instead of
-echo run-tagger.cmd / tag-cli.cmd from now on. To finish setup, install
-echo llama.cpp via the GUI's Settings ^> Llama tab, or
-echo `tag-cli-venv.cmd --install-llama <backend>`.
+echo Done. run.cmd / cli.cmd will use this .venv automatically. To finish
+echo setup, install llama.cpp via the GUI's Settings Llama tab, or
+echo cli.cmd --install-llama backend.
 pause
 goto :eof
 

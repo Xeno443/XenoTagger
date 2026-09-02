@@ -24,13 +24,13 @@ users who prefer not to use git or the setup scripts.
 ### Portable environment
 
 ```
-setup-env.bat
+setup-portable.bat
 ```
 
 This downloads its own Python and Git into `system\`, without affecting
 any system-wide installation.
 
-**Launch:** `run-tagger.cmd` (GUI) or `tag-cli.cmd` (headless batch
+**Launch:** `run.cmd` (GUI) or `cli.cmd` (headless batch
 captioning)
 
 ### Using your own Python
@@ -43,7 +43,7 @@ setup-venv.bat
 
 This creates a `.venv\` using the systemwide Python.
 
-**Launch:** `run-tagger-venv.cmd` (GUI) or `tag-cli-venv.cmd` (headless
+**Launch:** `run.cmd` (GUI) or `cli.cmd` (headless
 batch captioning)
 
 ## First launch

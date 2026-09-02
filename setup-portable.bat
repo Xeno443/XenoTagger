@@ -39,12 +39,17 @@ if exist "%SYSTEM_DIR%\git\bin\git.exe" (
     if errorlevel 1 goto :fail
 )
 
-call :install_python_deps
-if errorlevel 1 goto :fail
-
-echo.
-echo Done. To finish setup, install llama.cpp via the GUI's Settings ^>
-echo Llama tab (run-tagger.cmd), or `tag-cli.cmd --install-llama <backend>`.
+if exist "%ROOT%webui\requirements.txt" (
+    call :install_python_deps
+    if errorlevel 1 goto :fail
+    echo.
+    echo Done. To finish setup, install llama.cpp via the GUI's Settings
+    echo Llama tab, run.cmd, or cli.cmd --install-llama backend.
+) else (
+    echo.
+    echo No webui\requirements.txt found yet, skipping dependency install.
+    echo Run update.bat next to fetch the app and finish setup.
+)
 pause
 goto :eof
 

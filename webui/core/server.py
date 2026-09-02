@@ -154,7 +154,7 @@ def _start_process(cfg: AppConfig, model_path: Path, mmproj_path: Path) -> subpr
         raise ServerError(
             f"llama-server.exe not found at {LLAMA_SERVER_EXE}. "
             f"Install it from Settings -> Llama in the GUI, or run "
-            f"`tag-cli.cmd --install-llama <backend>` (see --help)."
+            f"`cli.cmd --install-llama <backend>` (see --help)."
         )
 
     argv = [
