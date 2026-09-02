@@ -84,6 +84,14 @@ they describe a repo structure this one no longer has.
     and how `overwrite` interacts with it - see "Batch sidecar adoption"
     below for the change itself), plus how the Review tab's own per-item
     load/save handles the same three files.
+  - `faq-linux-considerations.md` — file:line audit of what is/isn't
+    actually Windows-specific in `app.py`/`cli.py`/`core/` (excluding the
+    obviously-Windows-only `.bat`/`.cmd` scripts): the managed server
+    only looks for `llama-server.exe` (`core/server.py`), and the in-app
+    llama.cpp installer only fetches Windows release assets
+    (`core/llama_install.py`) - both managed-mode-only gaps, external
+    server mode has no platform dependency at all. Read before assuming
+    "Windows only" or claiming full Linux support either way.
 - `run-tagger.cmd` / `tag-cli.cmd` — launch the GUI / CLI through the
   portable environment.
 - `setup-env.bat` / `environment.bat` — inherited from the portable-env
