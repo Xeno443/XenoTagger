@@ -1,5 +1,6 @@
 _reference/
-system/
+system/git/
+system/python/
 .venv/
 setup-env-classic.bat
 handoff.md

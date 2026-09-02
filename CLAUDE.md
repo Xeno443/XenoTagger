@@ -100,11 +100,14 @@ they describe a repo structure this one no longer has.
   previous 4 launchers, see "Bootstrap/update scripts redesign" below.
 - `setup-portable.bat` / `environment.bat` - inherited from the portable-env
   base: build/activate the portable Python + Git toolchain under
-  `system\` (gitignored), then install `webui/requirements.txt` if it's
-  already present (skipped with a note otherwise - see below). Unrelated
-  to the worktree model that was dropped. `setup-tagger.cmd` (which used
-  to also install a hardcoded CUDA-only llama.cpp build) is gone - that
-  job moved to `core/llama_install.py` above.
+  `system\git\`/`system\python\` (gitignored - the downloaded toolchain
+  itself; `system\` as a folder is tracked, since it also holds
+  `system\fix-wrappers.py`, see "Wrapper-path self-heal" below), then
+  install `webui/requirements.txt` if it's already present (skipped with
+  a note otherwise - see below). Unrelated to the worktree model that
+  was dropped. `setup-tagger.cmd` (which used to also install a
+  hardcoded CUDA-only llama.cpp build) is gone - that job moved to
+  `core/llama_install.py` above.
 - `update.bat` - pulls the latest code (`git pull`, falling back to
   `git reset --hard` + `git pull` on failure) then refreshes
   `webui/requirements.txt` into whichever environment(s) actually exist
@@ -506,6 +509,88 @@ Two changes cover all four:
   `update.bat` runs, its own `git reset --hard` supersedes both fetched
   files with their real tracked versions from the repo.
 
+## Wrapper-path self-heal (2026-09-02)
+
+A relocated portable install (build in one folder, zip it, extract
+somewhere else - the normal case for anyone downloading a release) can
+leave `system\python\Scripts\*.exe` console-script wrappers (`pip.exe`
+and friends) pointing at a `python.exe` path that no longer exists.
+These wrappers are a small precompiled PE launcher stub concatenated
+with a `#!<path-to-python.exe>\n` shebang line and a tiny zip
+(`__main__.py`) - `zipfile`/the launcher both locate the zip by scanning
+from the end of the file, tolerant of whatever precedes it, which is
+what makes patching just the shebang line safe even when the
+replacement path is a different length.
+
+`system\fix-wrappers.py` does this patching (`system\` is no longer
+wholly gitignored - only `system\git\` and `system\python\` are, see
+Layout above; `fix-wrappers.py` itself is a tracked file, not part of
+the downloaded toolchain), and `environment.bat` runs it on every launch
+(both interactive and `passive` mode, so `run.cmd`/`cli.cmd` get it
+too), silently unless it actually fixes something. It takes one arg
+(the Scripts dir) and, for any wrapper whose shebang is a non-bare path
+(has a `\` or `/`) that no longer resolves to a real file, rewrites it
+to bare `python.exe` - not the current absolute path, since that would
+just need re-fixing on the next move too. A bare reference is left alone
+(already location-independent, resolves via the `%DIR%\python` entry
+`environment.bat` already puts on `PATH` - see line 3), and an absolute
+path that still resolves (nothing moved) is left alone too. No "remember
+the last known location" marker file needed - the check is
+self-determining every time, cheap enough to run unconditionally on
+every launch.
+
+**Important finding, caught live before shipping:** the first version of
+this checked "did the environment's folder path change since last run"
+and unconditionally rewrote every wrapper's shebang to the current
+absolute path on a change. Running that for real against this repo's
+actual `system\python\Scripts\` revealed every wrapper there already had
+a bare `python.exe` shebang - that first version blindly overwrote all
+33 of them with a hardcoded absolute path, a regression (replaces an
+already-location-independent reference with a rigid one). Caught
+immediately (`pip.exe` broke without `PATH` set), reverted, redesigned
+into the "only fix what's actually broken" version described above.
+
+**Second, much bigger finding, from chasing down *why* those wrappers
+were already bare:** it is not a property of pip in general, and not
+something `setup-portable.bat` does - it turned out to be specific to
+WinPython's own bundled pip build. Confirmed by downloading WinPython
+64-3.13.15.0dot fresh from SourceForge and inspecting its pip before any
+other setup step touches it: WinPython bundles a pip that reports
+version `26.2.1` and already contains a one-line fix in its vendored
+`distlib/scripts.py` (`_get_shebang()`'s fallback branch wraps
+`get_executable()` in `os.path.basename()`, writing `python.exe` instead
+of the full `sys.executable` path). The *real*, official PyPI release of
+`pip==26.2.1` does **not** contain this line - verified independently
+against the git tag, distlib's own upstream source, and a neutral
+(non-pip) extraction of the actual `.whl` straight from
+`files.pythonhosted.org`. Two different builds are sharing one version
+string; WinPython's is a fork/patch of pip specifically for this, not
+upstream behavior.
+
+This matters because `setup-portable.bat`'s own `pip install --upgrade
+pip ...` step (the `:update_pip` label) never actually replaces
+WinPython's bundled pip in practice - pip's upgrade check only compares
+version numbers, and WinPython's copy already reports `26.2.1`, so it's
+a silent no-op every time (confirmed: `pip.exe`'s file timestamp matches
+WinPython's own build time, not the setup run time). The fixed behavior
+persists purely because no newer pip has been published on PyPI since
+WinPython 3.13.15.0 was built. The instant pip publishes anything newer
+than `26.2.1`, that upgrade step stops being a no-op, silently pulls the
+real (non-bare-shebang) PyPI release, and every wrapper installed after
+that point goes back to hardcoding an absolute path - with no warning,
+on whatever machine happens to run setup/update next. This is exactly
+the scenario `fix-wrappers.py` exists for: not a hypothetical
+future-proofing measure, but a dependency on an upstream release cadence
+this project doesn't control, and one that could flip on any given day.
+It also directly matches the class of bug seen in the earlier
+ComfyUI/Forge-portable discussion (both have real, currently-broken
+absolute-path wrappers baked in from their own CI/build-machine paths -
+confirmed by inspecting real installs of both on this machine) and in a
+plain `venv`'s pip (confirmed with a throwaway venv-build-then-move
+test) - neither of those get WinPython's patched pip at all. `.venv`
+(`setup-venv.bat`'s path) is deliberately not covered by
+`fix-wrappers.py` - see Open/deferred below.
+
 ## House rules
 
 - **No venv, ever - for this repo's own portable-env path.** Everything
@@ -568,6 +653,20 @@ Two changes cover all four:
 
 ## Open / deferred
 
+- **`.venv` (`setup-venv.bat`) relocation - not covered by the
+  wrapper-path self-heal above, deliberately.** A real, plain CPython
+  venv (unlike this repo's WinPython-based `system\python`, see
+  "Wrapper-path self-heal" above) does bake an absolute path into its
+  `Scripts\*.exe` wrappers the normal way, so it's exposed to the same
+  class of bug - but a moved/broken `.venv` is a different kind of
+  problem: the usual real-world advice for a broken venv is just "delete
+  it and recreate it," and a `.venv` can break in ways `fix-wrappers.py`
+  doesn't address at all (e.g. `pyvenv.cfg`'s own `home = <path>` line
+  pointing at a base interpreter that's moved or gone, which is a
+  different file/format than the `Scripts\*.exe` wrappers). Needs its
+  own in-flight checks (does `pyvenv.cfg`'s recorded base interpreter
+  still exist, etc.) before deciding whether to patch-in-place or just
+  tell the user to recreate it - not started yet.
 - **Broad UI-logic refactor, not yet scoped.** Much of the app predates
   this session's status-bar/infotext-bar/`_notify` consolidation (see
   "Status/notification architecture" above) and still carries older UI
