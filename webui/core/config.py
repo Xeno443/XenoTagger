@@ -41,6 +41,7 @@ log = logging.getLogger(__name__)
 
 WEBUI_DIR = Path(__file__).resolve().parent.parent
 SETTINGS_PATH = WEBUI_DIR / "config" / "settings.json"
+DEFAULT_TAG_VOCAB_PATH = str(WEBUI_DIR / "tags" / "e621.csv")
 
 DEFAULT_PROMPT = (
     "Describe this image in a single detailed paragraph, written in natural "
@@ -177,6 +178,15 @@ class AppConfig:
     # independent of hydra_enabled (using an already-loaded model vs.
     # loading one automatically at launch are separate questions).
     hydra_autoload_model: bool = False
+
+    # Tag vocabulary for Review's tag editor (core.tag_vocab) - deliberately
+    # the full e621 tag space, not limited to Hydra's own (much smaller)
+    # label set, so a tag neither model caught can still be hand-added with
+    # autocomplete. Empty path just means no autocomplete/no alias
+    # resolution - the tag editor still works as a plain free-entry field.
+    # Baked into the page at process launch (see tag_vocab.build_autocomplete_head)
+    # - changing this takes effect on next restart, not on Save.
+    hydra_tag_vocab_path: str = DEFAULT_TAG_VOCAB_PATH
 
 
 def load() -> AppConfig:

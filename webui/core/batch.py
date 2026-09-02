@@ -70,29 +70,54 @@ def find_images(directory: Path) -> list[Path]:
 @dataclass
 class ReviewItem:
     path: Path
-    status: str  # "new" (no .txt, no .issue), "captioned" (.txt exists), "error" (.issue exists)
+    status: str  # see review_item_status() below for exactly what this can be
+
+
+def review_item_status(image_path: Path) -> str:
+    """Classifies a single image by which of .txt/.nlp/.tags/.issue exist
+    next to it - shared by scan_review_status() below and app.py's
+    _review_maybe_save (so the table's status stays consistent with
+    whatever a save just did, not just re-derived from a fresh directory
+    scan):
+
+    - "Captioned" - .txt exists, no .nlp/.tags sidecars (Hydra was off, or
+      this predates the sidecar feature).
+    - "Captioned (nlp)" / "Captioned (tags)" / "Captioned (nlp tags)" -
+      .txt exists alongside whichever of the two sidecars are also there
+      (see core.batch.run_batch's own sidecar-writing logic).
+    - "Mismatch" - a .nlp/.tags sidecar exists but .txt doesn't - an
+      inconsistent state (shouldn't normally happen since all three are
+      written/kept in sync together, but worth surfacing plainly rather
+      than silently falling back to "New" if it ever does, e.g. from a
+      hand-deleted .txt).
+    - "Error" - no .txt, no sidecars, but a .issue file exists (a batch
+      run failed/truncated on this image).
+    - "New" - none of the above exist yet.
+    """
+    txt_path = image_path.with_suffix(".txt")
+    issue_path = Path(f"{txt_path}{ISSUE_SUFFIX}")
+    sidecars = [
+        name for name, suffix in (("nlp", ".nlp"), ("tags", ".tags"))
+        if image_path.with_suffix(suffix).exists()
+    ]
+
+    if txt_path.exists():
+        return f"Captioned ({' '.join(sidecars)})" if sidecars else "Captioned"
+    if sidecars:
+        return "Mismatch"
+    if issue_path.exists():
+        return "Error"
+    return "New"
 
 
 def scan_review_status(directory: Path) -> list[ReviewItem]:
     """For the Review tab: classifies every image in `directory` by its
-    current on-disk state, using the exact same file-presence rules
-    run_batch() itself uses to decide skip/retry. A pure snapshot, same
-    statelessness as the rest of this module - there's nothing to go
-    stale, just call again after edits or another batch run to get a
-    fresh read."""
+    current on-disk state (see review_item_status() above) - a pure
+    snapshot, same statelessness as the rest of this module - there's
+    nothing to go stale, just call again after edits or another batch run
+    to get a fresh read."""
     directory = Path(directory)
-    items = []
-    for image_path in find_images(directory):
-        txt_path = image_path.with_suffix(".txt")
-        issue_path = Path(f"{txt_path}{ISSUE_SUFFIX}")
-        if txt_path.exists():
-            status = "captioned"
-        elif issue_path.exists():
-            status = "error"
-        else:
-            status = "new"
-        items.append(ReviewItem(path=image_path, status=status))
-    return items
+    return [ReviewItem(path=p, status=review_item_status(p)) for p in find_images(directory)]
 
 
 def run_batch(
