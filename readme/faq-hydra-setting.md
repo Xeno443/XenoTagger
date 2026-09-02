@@ -1,7 +1,7 @@
 # Hydra Confidence & Threshold FAQ
 
 Plain-English notes on what Settings → Hydra's **Confidence** and
-**Threshold** sliders actually do. Companion to `hydra-implications-faq.md`
+**Threshold** sliders actually do. Companion to `faq-hydra-implications.md`
 (which covers the separate "Implications mode" setting — nested/redundant
 tag families like `canine` + `dog` + `dobermann`). This one is about how an
 individual tag gets included or excluded in the first place.
@@ -108,7 +108,7 @@ Confidence, is the right move.
 ## What we found testing against a real image
 
 A sweep across `hydra_metric` values on one real caption image (with
-`hydra_implications = "remove"`, see `hydra-implications-faq.md`) showed:
+`hydra_implications = "remove"`, see `faq-hydra-implications.md`) showed:
 
 - **Threshold barely moved the tag count** (a handful of tags at most,
   across `0.1`–`0.2`) — this particular image just didn't have many

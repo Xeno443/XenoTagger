@@ -66,11 +66,24 @@ they describe a repo structure this one no longer has.
 - `webui/config/` — `settings.json` (gitignored, per-machine),
   `models_source.json` (checked in — curated downloadable model list),
   `models_cache.json` (gitignored).
-- `hydra-implications-faq.md` — a worked walkthrough (concrete 4-level
-  tag-hierarchy example) of how Hydra's `remove`/`constrain-remove`/
-  `enforce-remove` implications modes actually resolve nested e621 tag
-  families differently. The behavior isn't obvious from the option names
-  alone — read before touching `hydra_implications` again.
+- `readme/` — deep-dive/FAQ docs too long for a CLAUDE.md paragraph; any
+  new one goes here too, not the repo root.
+  - `faq-hydra-implications.md` — a worked walkthrough (concrete 4-level
+    tag-hierarchy example) of how Hydra's `remove`/`constrain-remove`/
+    `enforce-remove` implications modes actually resolve nested e621 tag
+    families differently. The behavior isn't obvious from the option
+    names alone — read before touching `hydra_implications` again.
+  - `faq-hydra-setting.md` — plain-English walkthrough of Settings →
+    Hydra's Confidence/Threshold sliders (the `hydra_metric` F-beta/
+    min-precision pair) - what each one actually does to which tags and
+    why, plus the same real-image sweep result referenced in "Hydra 3.5
+    second-stage tag classifier" below.
+  - `faq-caption.md` — the case table for `core.batch.run_batch()`'s
+    sidecar adoption (what happens to an image with no `.txt` yet but an
+    existing `.txt.nlp`/`.txt.tags`, e.g. renamed in from another tool,
+    and how `overwrite` interacts with it - see "Batch sidecar adoption"
+    below for the change itself), plus how the Review tab's own per-item
+    load/save handles the same three files.
 - `run-tagger.cmd` / `tag-cli.cmd` — launch the GUI / CLI through the
   portable environment.
 - `setup-env.bat` / `environment.bat` — inherited from the portable-env
@@ -217,7 +230,7 @@ standalone `HydraTagger` repo; this is the real integration.
   `py_compile`.
 - **`hydra_implications` defaults to `"remove"`, not `"inherit"`** — a
   real-image sweep (varying `hydra_metric` at a fixed image; see
-  `hydra-implications-faq.md` for the mechanism) found `inherit`'s
+  `readme/faq-hydra-implications.md` for the mechanism) found `inherit`'s
   whole-ancestor-chain propagation (e.g. `mammal` + `canid` + `canine` +
   `domestic dog` + `herding dog` + `pastoral dog` + `german shepherd` all
   firing together for one dog) roughly doubled the tag count at every
@@ -367,6 +380,41 @@ and only yielded once before, once after) - both got the same
 background-thread-+-queue treatment added specifically so `on_stage` has
 something to push into and the generator has something to yield from
 mid-call.
+
+## Batch sidecar adoption (2026-09-02)
+
+`core.batch.run_batch()` used to only ever check whether `.txt` existed
+before deciding to (re)generate an image from scratch - a pre-existing
+`.txt.nlp`/`.txt.tags` sidecar with no `.txt` yet (e.g. hand-renamed in
+from another captioning/tagging tool) was ignored and clobbered by a full
+fresh `caption_image()` call. Now that content is adopted instead: only
+whichever half is actually missing gets a real model call. Full case
+table in `readme/faq-caption.md` (see Layout above); short version:
+
+- `.txt.tags` exists, `.txt.nlp` doesn't → VLM runs as normal, but Hydra
+  is skipped for that image even if `hydra_enabled` - an adopted
+  `.txt.tags` is trusted as-is, never touched by a second tag source.
+- `.txt.nlp` exists, `.txt.tags` doesn't → the VLM call is skipped
+  entirely (the adopted caption is reused verbatim, no trigger word
+  reapplied), and Hydra runs to fill in the missing tags if enabled.
+- Both sidecars already exist → zero model calls, `.txt` is just
+  synthesized from the two of them directly.
+- `overwrite` checked bypasses all of this - every image is treated as
+  fully fresh, sidecars included, exactly like it already did for a
+  pre-existing `.txt`.
+
+Implementation-wise, `core.captioner.caption_image()` gained an
+`existing_caption` parameter: when given, it skips the VLM call and
+reuses that text as `vlm_caption` verbatim, still falling through to
+Hydra tagging as normal below it - letting `run_batch()` route the
+"adopt caption, still need tags" case through the exact same call/outcome
+handling as a normal run (a zero-cost stand-in `CaptionResult` keeps
+`outcome.truncated`/`resize_note` readable uniformly either way), rather
+than needing a separately-maintained code path. The "adopt tags, skip
+Hydra" case reuses `dataclasses.replace(cfg, hydra_enabled=False)` for
+just that one `caption_image()` call instead of touching `captioner.py`
+again - `cfg` itself (used everywhere else, e.g. the truncation-reason
+message) is left untouched.
 
 ## House rules
 

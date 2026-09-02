@@ -41,6 +41,7 @@ def caption_image(
     cfg: AppConfig,
     trigger_word: Optional[str] = None,
     on_stage: Optional[Callable[[str], None]] = None,
+    existing_caption: Optional[str] = None,
 ) -> tuple[str, CaptionResult, str, Optional[str]]:
     """The one shared "process one image" call - used by the Single-image
     tab, the Batch tab, and the CLI alike, so every caller sees the same
@@ -57,6 +58,18 @@ def caption_image(
     VLM caption and Hydra's tags to separate files doesn't have to re-split
     caption's combined string back apart.
 
+    existing_caption, if given, skips the VLM call entirely and reuses this
+    text verbatim as vlm_caption - no trigger word reapplied, since callers
+    pass already-final text (e.g. an adopted .txt.nlp sidecar, which is
+    documented to already carry the trigger word if any). Lets a caller
+    that already has a caption - from a previous run, or adopted from
+    another tool - still route through Hydra tagging below without paying
+    for a redundant VLM call. result is then a zero-cost stand-in
+    (finish_reason="stop", no real token/timing/resize data) so callers can
+    keep reading outcome.truncated/resize_note uniformly either way - see
+    core.batch.run_batch's sidecar-adoption logic, the only current caller
+    of this parameter.
+
     on_stage, if given, is called with a short label ("captioning" /
     "tagging (Hydra)") right before each of this function's two possible
     model calls - this is the hook the GUI uses to show which stage a
@@ -64,24 +77,32 @@ def caption_image(
     optional and side-effect-only - core/ itself has no UI, this is just
     a plain callback so it stays framework-agnostic; the CLI simply
     doesn't pass one."""
-    if on_stage:
-        on_stage("captioning")
-    result = client.caption(
-        image,
-        prompt=cfg.prompt_template,
-        temperature=cfg.temperature,
-        top_p=cfg.top_p,
-        max_tokens=cfg.max_tokens,
-        resize_enabled=cfg.resize_enabled,
-        resize_target_mp=cfg.resize_target_mp,
-        snap_enabled=cfg.snap_enabled,
-        snap_multiple=cfg.snap_multiple,
-    )
-    word = cfg.trigger_word if trigger_word is None else trigger_word
-    if word.strip():
-        log.debug("caption_image(): applying trigger word '%s'", word.strip())
-    caption = apply_trigger_word(result.content, word)
-    vlm_caption = caption
+    if existing_caption is not None:
+        vlm_caption = existing_caption
+        caption = vlm_caption
+        result = CaptionResult(
+            content=existing_caption, finish_reason="stop",
+            completion_tokens=0, prompt_tokens=0, elapsed_s=0.0,
+        )
+    else:
+        if on_stage:
+            on_stage("captioning")
+        result = client.caption(
+            image,
+            prompt=cfg.prompt_template,
+            temperature=cfg.temperature,
+            top_p=cfg.top_p,
+            max_tokens=cfg.max_tokens,
+            resize_enabled=cfg.resize_enabled,
+            resize_target_mp=cfg.resize_target_mp,
+            snap_enabled=cfg.snap_enabled,
+            snap_multiple=cfg.snap_multiple,
+        )
+        word = cfg.trigger_word if trigger_word is None else trigger_word
+        if word.strip():
+            log.debug("caption_image(): applying trigger word '%s'", word.strip())
+        caption = apply_trigger_word(result.content, word)
+        vlm_caption = caption
 
     hydra_tags: Optional[str] = None
     if cfg.hydra_enabled:

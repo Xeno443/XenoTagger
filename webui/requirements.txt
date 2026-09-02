@@ -1,4 +1,5 @@
 gradio
 Pillow
+pandas
 requests
 gguf

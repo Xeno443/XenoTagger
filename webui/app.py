@@ -113,6 +113,7 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Optional
 
+import pandas as pd
 from PIL import Image as PILImage
 
 # Must be set before `import gradio` - some of its telemetry checks read
@@ -124,7 +125,10 @@ import gradio as gr
 from core import config as config_mod
 from core import hydra_classifier
 from core import tag_vocab
-from core.batch import ISSUE_SUFFIX, ReviewItem, find_images, review_item_status, run_batch, scan_review_status
+from core.batch import (
+    ISSUE_SUFFIX, NLP_SUFFIX, TAGS_SUFFIX, ReviewItem, find_images, review_item_status, run_batch,
+    scan_review_status,
+)
 from core.captioner import caption_image
 from core.client import ClientError, LlamaClient
 from core.config import AppConfig
@@ -1629,13 +1633,13 @@ def interrupt_batch_ui():
 # caption detection (see status column instead), matching how TagGUI and
 # similar tools handle this: a human looks, a human decides.
 #
-# State lives in three gr.State components (Gradio has no server-side
+# State lives in two gr.State components (Gradio has no server-side
 # per-session storage otherwise): review_items_state (list[ReviewItem],
-# the current directory's scan_review_status() snapshot),
-# review_index_state (int, which item is currently shown, -1 if none),
-# review_loaded_caption_state (str, exactly what was on disk when the
-# CURRENT item was loaded - compared against the live Textbox value to
-# detect a real edit before auto-saving on navigate-away).
+# the current directory's scan_review_status() snapshot) and
+# review_index_state (int, which item is currently shown, -1 if none).
+# No separate "loaded baseline" state - _review_maybe_save compares
+# against a fresh read of each file's current on-disk content instead,
+# same statelessness as the rest of this module.
 #
 # Recaption is its own "review" operation kind (not reusing "single",
 # even though it's literally the same caption_image() call the
@@ -1648,29 +1652,57 @@ def interrupt_batch_ui():
 # exact same proven two-Column-swap pattern used elsewhere.
 
 
-def _review_status_table(items: list[ReviewItem]) -> list[list[str]]:
-    return [[item.path.name, item.status] for item in items]
+def _review_status_table(items: list[ReviewItem], current_index: int = -1):
+    """Builds review_table's value, highlighting current_index's row (the
+    image currently loaded in the Caption/Tags fields) via a pandas
+    Styler - gr.Dataframe(value=...) natively accepts a Styler (checked
+    its constructor signature: `pd.DataFrame | Styler | ...`), so this
+    needs no custom CSS (see this project's CSS house rule). Uses
+    --table-row-focus, the same theme variable Gradio's own Dataframe
+    already applies to a hovered row's background, so the highlight
+    matches whatever theme/light-dark mode is active automatically rather
+    than a hardcoded color."""
+    df = pd.DataFrame(
+        [[item.path.name, item.status] for item in items], columns=["File", "Status"],
+    )
+    if not (0 <= current_index < len(df)):
+        return df
+    return df.style.apply(
+        lambda row: (
+            ["background-color: var(--table-row-focus)"] * len(row)
+            if row.name == current_index else [""] * len(row)
+        ),
+        axis=1,
+    )
 
 
-def _review_is_split(item: ReviewItem) -> bool:
-    """True if this image has a .nlp sidecar (written by batch captioning
-    when Hydra fired - see core.batch.run_batch) - Review shows the
-    separate Caption/Tags editor for these, and falls back to a single
-    combined Caption box for everything else (Hydra was off, or the
-    caption predates this feature). Recomputed fresh wherever needed
-    rather than cached, same statelessness as scan_review_status() itself."""
-    return item.path.with_suffix(".nlp").exists()
+def _review_tags_enabled(item: ReviewItem) -> bool:
+    """Whether the Tags field should be interactive for this item.
+
+    The real switch isn't "does this item currently show split fields" -
+    it's whether a .txt.nlp/.txt.tags sidecar has ever been committed to
+    disk for it (by a batch run, or an earlier Review save - see
+    _review_maybe_save's own docstring for the full two-phase model this
+    mirrors). Tags is disabled only for a pure legacy/flat caption: .txt
+    exists and neither sidecar ever has - editing that caption always just
+    rewrites .txt directly, never spins up a lone .txt.nlp on its own.
+    Recomputed fresh wherever needed rather than cached, same
+    statelessness as scan_review_status() itself."""
+    txt_path = item.path.with_suffix(".txt")
+    has_txt = txt_path.exists()
+    has_nlp = Path(f"{txt_path}{NLP_SUFFIX}").exists()
+    has_tags = Path(f"{txt_path}{TAGS_SUFFIX}").exists()
+    return (has_nlp or has_tags) or not has_txt
 
 
 def _review_load(items: list[ReviewItem], index: int):
-    """Returns (image, caption_text, tags_text, split, loaded_caption_text)
-    for items[index], or (None, "", "", False, "") if index is out of
-    range. loaded_caption_text is exactly the on-disk .txt content right
-    now (regardless of split/fallback mode) - the baseline later compared
-    against the live fields, recombined, to detect an edit worth
-    auto-saving (see _review_maybe_save)."""
+    """Returns (image, caption_text, tags_text, tags_enabled) for
+    items[index], or (None, "", "", True) if index is out of range.
+    Caption prefers .txt.nlp content (falling back to .txt when there's no
+    .txt.nlp to draw the prose-only part from); Tags is .txt.tags content,
+    or empty if there is none."""
     if not items or not (0 <= index < len(items)):
-        return None, "", "", False, ""
+        return None, "", "", True
     item = items[index]
     try:
         with PILImage.open(item.path) as img:
@@ -1680,64 +1712,101 @@ def _review_load(items: list[ReviewItem], index: int):
         image = None
 
     txt_path = item.path.with_suffix(".txt")
-    try:
-        loaded_caption = txt_path.read_text(encoding="utf-8") if txt_path.exists() else ""
-    except OSError as exc:
-        log.warning("Review: could not read %s: %s", txt_path, exc)
-        loaded_caption = ""
+    nlp_path = Path(f"{txt_path}{NLP_SUFFIX}")
+    tags_path = Path(f"{txt_path}{TAGS_SUFFIX}")
+    has_txt = txt_path.exists()
+    has_nlp = nlp_path.exists()
+    has_tags = tags_path.exists()
 
-    split = _review_is_split(item)
-    if split:
-        nlp_path = item.path.with_suffix(".nlp")
-        tags_path = item.path.with_suffix(".tags")
+    def _read(p: Path) -> str:
         try:
-            caption = nlp_path.read_text(encoding="utf-8") if nlp_path.exists() else ""
+            return p.read_text(encoding="utf-8")
         except OSError as exc:
-            log.warning("Review: could not read %s: %s", nlp_path, exc)
-            caption = ""
-        try:
-            tags_text = tags_path.read_text(encoding="utf-8") if tags_path.exists() else ""
-        except OSError as exc:
-            log.warning("Review: could not read %s: %s", tags_path, exc)
-            tags_text = ""
+            log.warning("Review: could not read %s: %s", p, exc)
+            return ""
+
+    if has_nlp:
+        caption = _read(nlp_path)
+    elif has_txt:
+        caption = _read(txt_path)
     else:
-        caption = loaded_caption
-        tags_text = ""
+        caption = ""
+    tags_text = _read(tags_path) if has_tags else ""
+    tags_enabled = (has_nlp or has_tags) or not has_txt
 
-    return image, caption, tags_text, split, loaded_caption
+    return image, caption, tags_text, tags_enabled
 
 
-def _review_maybe_save(
-    items: list[ReviewItem], index: int, loaded_caption: str, current_caption: str, current_tags: str
-) -> None:
-    """Auto-save on navigate-away. Only writes if the recombined caption
-    actually changed AND isn't empty - clearing the box(es) to blank never
-    deletes an existing caption, it just leaves the files untouched (agreed:
-    deleting a caption should be a deliberate act, not an accident from
-    clearing text to retype it - may want an explicit clear/delete action
-    later).
+def _review_maybe_save(items: list[ReviewItem], index: int, current_caption: str, current_tags: str) -> None:
+    """Auto-save on navigate-away. Never writes an empty file, and never
+    deletes/blanks an existing one just because a field was cleared -
+    clearing text to retype it should never delete a caption by accident.
 
-    For a split item, .nlp and .tags are rewritten alongside .txt on every
-    save so all three stay in sync with the edit - not just .txt - so a
-    later Review reload never shows sidecars that have drifted from what's
-    actually in .txt."""
+    Two-phase model keyed on whether a .txt.nlp/.txt.tags sidecar already
+    exists ("committed") - not the same question as whether Tags is
+    currently enabled (see _review_tags_enabled):
+
+    - Not yet committed (no .txt.nlp, no .txt.tags exist yet): the two
+      fields aren't independent yet. Only if BOTH are non-empty is a real
+      split born now - .txt.nlp/.txt.tags get created alongside .txt. If
+      only one is non-empty, nothing sidecar-shaped is created - that
+      content goes straight into .txt alone (this is also exactly what
+      happens when editing a plain flat caption, since Tags is disabled -
+      and so always empty - whenever .txt exists with no sidecar yet).
+    - Already committed: each field is independent - a non-empty, changed
+      field updates its own sidecar; an empty field is left alone. .txt
+      gets resynced from whatever's currently non-empty in either field
+      whenever anything changed - which, since a missing .txt's "current
+      content" reads as "", also naturally covers a Sidecar-only item (no
+      .txt yet) picking one up the first time it's touched, with no
+      separate case needed for that.
+    """
     if not items or not (0 <= index < len(items)):
         return
     item = items[index]
-    split = _review_is_split(item)
-    tags_text = (current_tags or "").strip() if split else ""
-    current_caption = current_caption or ""
-    current_combined = f"{current_caption}\n{tags_text}" if (split and tags_text) else current_caption
-    if current_combined.strip() == "" or current_combined == loaded_caption:
-        return
     txt_path = item.path.with_suffix(".txt")
-    txt_path.write_text(current_combined, encoding="utf-8")
-    if split:
-        item.path.with_suffix(".nlp").write_text(current_caption, encoding="utf-8")
-        item.path.with_suffix(".tags").write_text(tags_text, encoding="utf-8")
-    Path(f"{txt_path}{ISSUE_SUFFIX}").unlink(missing_ok=True)
-    item.status = review_item_status(item.path)
-    log.info("Review: saved caption for %s", item.path)
+    nlp_path = Path(f"{txt_path}{NLP_SUFFIX}")
+    tags_path = Path(f"{txt_path}{TAGS_SUFFIX}")
+    has_txt = txt_path.exists()
+    has_nlp = nlp_path.exists()
+    has_tags = tags_path.exists()
+    committed = has_nlp or has_tags
+
+    cap = current_caption or ""
+    tags = current_tags or ""
+    cap_nonempty = cap.strip() != ""
+    tags_nonempty = tags.strip() != ""
+
+    def _read(p: Path) -> str:
+        try:
+            return p.read_text(encoding="utf-8")
+        except OSError:
+            return ""
+
+    wrote = False
+    if committed or (cap_nonempty and tags_nonempty):
+        if cap_nonempty:
+            old_nlp = _read(nlp_path) if has_nlp else ""
+            if cap != old_nlp:
+                nlp_path.write_text(cap, encoding="utf-8")
+                wrote = True
+        if tags_nonempty:
+            old_tags = _read(tags_path) if has_tags else ""
+            if tags != old_tags:
+                tags_path.write_text(tags, encoding="utf-8")
+                wrote = True
+
+    combined = "\n".join(text for text, nonempty in ((cap, cap_nonempty), (tags, tags_nonempty)) if nonempty)
+    if combined:
+        old_txt = _read(txt_path) if has_txt else ""
+        if combined != old_txt:
+            txt_path.write_text(combined, encoding="utf-8")
+            wrote = True
+
+    if wrote:
+        Path(f"{txt_path}{ISSUE_SUFFIX}").unlink(missing_ok=True)
+        item.status = review_item_status(item.path)
+        log.info("Review: saved caption for %s", item.path)
 
 
 def _review_position_text(items: list[ReviewItem], index: int, prefix: str = "") -> str:
@@ -1753,59 +1822,54 @@ def review_scan_ui(directory_str: str):
     directory = Path(directory_str) if directory_str else None
     if not directory or not directory.is_dir():
         log.warning("Review: not a directory: %s", directory_str)
-        return f"Not a directory: {directory_str}", [], -1, "", None, "", gr.update(value="", visible=False), _review_status_table([])
+        return f"Not a directory: {directory_str}", [], -1, None, "", gr.update(value="", interactive=True), _review_status_table([])
 
     items = scan_review_status(directory)
     log.info("Review: scanned %s - %d image(s)", directory, len(items))
     if not items:
         return (
-            f"No images found in {directory}", items, -1, "", None, "",
-            gr.update(value="", visible=False), _review_status_table(items),
+            f"No images found in {directory}", items, -1, None, "",
+            gr.update(value="", interactive=True), _review_status_table(items),
         )
 
-    image, caption, tags, split, loaded = _review_load(items, 0)
+    image, caption, tags, tags_enabled = _review_load(items, 0)
     return (
         _review_position_text(items, 0),
-        items, 0, loaded,
-        image, caption, gr.update(value=tags, visible=split),
-        _review_status_table(items),
+        items, 0,
+        image, caption, gr.update(value=tags, interactive=tags_enabled),
+        _review_status_table(items, 0),
     )
 
 
-def review_prev_ui(
-    items: list[ReviewItem], index: int, loaded_caption: str, current_caption: str, current_tags: str
-):
-    _review_maybe_save(items, index, loaded_caption, current_caption, current_tags)
+def review_prev_ui(items: list[ReviewItem], index: int, current_caption: str, current_tags: str):
+    _review_maybe_save(items, index, current_caption, current_tags)
     new_index = max(0, index - 1) if items else -1
-    image, caption, tags, split, loaded = _review_load(items, new_index)
+    image, caption, tags, tags_enabled = _review_load(items, new_index)
     return (
-        _review_position_text(items, new_index), items, new_index, loaded,
-        image, caption, gr.update(value=tags, visible=split), _review_status_table(items),
+        _review_position_text(items, new_index), items, new_index,
+        image, caption, gr.update(value=tags, interactive=tags_enabled), _review_status_table(items, new_index),
     )
 
 
-def review_next_ui(
-    items: list[ReviewItem], index: int, loaded_caption: str, current_caption: str, current_tags: str
-):
-    _review_maybe_save(items, index, loaded_caption, current_caption, current_tags)
+def review_next_ui(items: list[ReviewItem], index: int, current_caption: str, current_tags: str):
+    _review_maybe_save(items, index, current_caption, current_tags)
     new_index = min(len(items) - 1, index + 1) if items else -1
-    image, caption, tags, split, loaded = _review_load(items, new_index)
+    image, caption, tags, tags_enabled = _review_load(items, new_index)
     return (
-        _review_position_text(items, new_index), items, new_index, loaded,
-        image, caption, gr.update(value=tags, visible=split), _review_status_table(items),
+        _review_position_text(items, new_index), items, new_index,
+        image, caption, gr.update(value=tags, interactive=tags_enabled), _review_status_table(items, new_index),
     )
 
 
 def review_table_select_ui(
-    items: list[ReviewItem], index: int, loaded_caption: str, current_caption: str, current_tags: str,
-    evt: gr.SelectData,
+    items: list[ReviewItem], index: int, current_caption: str, current_tags: str, evt: gr.SelectData,
 ):
-    _review_maybe_save(items, index, loaded_caption, current_caption, current_tags)
+    _review_maybe_save(items, index, current_caption, current_tags)
     row = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
-    image, caption, tags, split, loaded = _review_load(items, row)
+    image, caption, tags, tags_enabled = _review_load(items, row)
     return (
-        _review_position_text(items, row), items, row, loaded,
-        image, caption, gr.update(value=tags, visible=split), _review_status_table(items),
+        _review_position_text(items, row), items, row,
+        image, caption, gr.update(value=tags, interactive=tags_enabled), _review_status_table(items, row),
     )
 
 
@@ -1899,13 +1963,14 @@ def review_recaption_ui(items: list[ReviewItem], index: int, current_caption: st
         if result.resize_note:
             status = f"Resized {result.resize_note}. {status}"
 
-        # Split items get the VLM-only caption and Hydra's own tags in
-        # their separate fields; fallback items get the full combined
-        # string in the one Caption box, same as before this split
-        # existed. A run where Hydra didn't produce anything this time
-        # (e.g. temporarily disabled) leaves the Tags field untouched
-        # rather than wiping out whatever was already loaded there.
-        if _review_is_split(item):
+        # Items with Tags enabled get the VLM-only caption and Hydra's own
+        # tags in their separate fields; a flat legacy caption (Tags
+        # disabled) gets the full combined string in the one Caption box
+        # instead, same as before this split existed. A run where Hydra
+        # didn't produce anything this time (e.g. temporarily disabled)
+        # leaves the Tags field untouched rather than wiping out whatever
+        # was already loaded there.
+        if _review_tags_enabled(item):
             caption_out = result_holder["vlm_caption"]
             hydra_tags = result_holder["hydra_tags"]
             tags_out = gr.update(value=hydra_tags) if hydra_tags else gr.update()
@@ -3149,9 +3214,9 @@ def build_app() -> gr.Blocks:
         # confirmed live that doing so still corrupts the rendered tab
         # strip (labels duplicating/shifting on click), so it's declared
         # here instead, before main_tabs even opens.
-        current_tab_label_state = gr.State("Single image")
+        current_tab_label_state = gr.State("Review")
 
-        with gr.Tabs() as main_tabs:
+        with gr.Tabs(selected="review") as main_tabs:
             # interactive=False at construction (option B from the design
             # discussion - the simpler fallback, not a dedicated splash
             # overlay): the very first paint, before demo.load's chain has
@@ -3300,21 +3365,21 @@ def build_app() -> gr.Blocks:
                         review_interrupt_btn = gr.Button("Interrupt", variant="stop")
 
                 review_caption = gr.Textbox(label="Caption", lines=4, interactive=True)
-                # Only shown for images with a .nlp sidecar (Hydra fired
-                # during batch captioning - see _review_is_split); everything
-                # else keeps the single combined Caption box above, as
-                # before this split existed. A plain comma-separated
-                # Textbox, not a gr.Dropdown - a Dropdown with the full
-                # e621 vocabulary as its `choices` was confirmed unusably
-                # slow (a known, unfixed Gradio limitation, not a tuning
-                # problem - see the elem_id below). elem_id is what lets
+                # Always visible now - interactive= (not visible=) is what
+                # toggles based on _review_tags_enabled(), since a flat
+                # legacy caption still has nothing to show here, just
+                # nothing to edit either. A plain Textbox, not a
+                # gr.Dropdown - a Dropdown with the full e621 vocabulary as
+                # its `choices` was confirmed unusably slow (a known,
+                # unfixed Gradio limitation, not a tuning problem - see the
+                # elem_id below). elem_id is what lets
                 # static/tag_autocomplete.js (injected via
                 # core.tag_vocab.build_autocomplete_head, see
                 # demo.launch(head=...) below) attach its own hand-rolled
                 # popup to this field specifically - review_caption
                 # deliberately has no elem_id and is never touched by it.
                 review_tags = gr.Textbox(
-                    label="Tags", lines=2, interactive=True, visible=False,
+                    label="Tags", lines=2, interactive=True,
                     elem_id="review_tags_box",
                 )
 
@@ -3326,13 +3391,12 @@ def build_app() -> gr.Blocks:
                 review_infotext = gr.Textbox(show_label=False, container=False, interactive=False)
 
                 # See the Review tab's handler-function docstrings above for
-                # what each of these three actually holds.
+                # what each of these two actually holds.
                 review_items_state = gr.State([])
                 review_index_state = gr.State(-1)
-                review_loaded_caption_state = gr.State("")
 
                 _review_nav_outputs = [
-                    review_infotext, review_items_state, review_index_state, review_loaded_caption_state,
+                    review_infotext, review_items_state, review_index_state,
                     review_image, review_caption, review_tags, review_table,
                 ]
                 review_browse_btn.click(browse_directory_ui, [review_dir], [review_dir]).then(
@@ -3341,17 +3405,17 @@ def build_app() -> gr.Blocks:
                 review_scan_btn.click(review_scan_ui, [review_dir], _review_nav_outputs)
                 review_prev_btn.click(
                     review_prev_ui,
-                    [review_items_state, review_index_state, review_loaded_caption_state, review_caption, review_tags],
+                    [review_items_state, review_index_state, review_caption, review_tags],
                     _review_nav_outputs,
                 )
                 review_next_btn.click(
                     review_next_ui,
-                    [review_items_state, review_index_state, review_loaded_caption_state, review_caption, review_tags],
+                    [review_items_state, review_index_state, review_caption, review_tags],
                     _review_nav_outputs,
                 )
                 review_table.select(
                     review_table_select_ui,
-                    [review_items_state, review_index_state, review_loaded_caption_state, review_caption, review_tags],
+                    [review_items_state, review_index_state, review_caption, review_tags],
                     _review_nav_outputs,
                 )
                 review_recaption_btn.click(

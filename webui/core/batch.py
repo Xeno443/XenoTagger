@@ -24,7 +24,7 @@ a zero-argument callable returning a bool.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -49,6 +49,13 @@ ProgressCallback = Callable[[int, int, Path, str, Optional[str], Optional[str]],
 # (no .txt means it isn't "already captioned"). Content is a one-line
 # human-readable reason, meant for a future review UI to surface.
 ISSUE_SUFFIX = ".issue"
+# Chained onto txt_path exactly like ISSUE_SUFFIX above (so
+# "<image>.txt" + NLP_SUFFIX = "<image>.txt.nlp", never "<image>.nlp") -
+# matches ISSUE_SUFFIX's own convention, which was already this shape.
+# See core.captioner.caption_image/run_batch below for what each actually
+# holds (VLM-only caption / Hydra's own tag text).
+NLP_SUFFIX = ".nlp"
+TAGS_SUFFIX = ".tags"
 
 
 @dataclass
@@ -74,37 +81,38 @@ class ReviewItem:
 
 
 def review_item_status(image_path: Path) -> str:
-    """Classifies a single image by which of .txt/.nlp/.tags/.issue exist
-    next to it - shared by scan_review_status() below and app.py's
-    _review_maybe_save (so the table's status stays consistent with
-    whatever a save just did, not just re-derived from a fresh directory
-    scan):
+    """Classifies a single image by which of .txt/.txt.nlp/.txt.tags/
+    .txt.issue exist next to it - shared by scan_review_status() below and
+    app.py's _review_maybe_save (so the table's status stays consistent
+    with whatever a save just did, not just re-derived from a fresh
+    directory scan):
 
-    - "Captioned" - .txt exists, no .nlp/.tags sidecars (Hydra was off, or
-      this predates the sidecar feature).
+    - "Captioned" - .txt exists, no .txt.nlp/.txt.tags sidecars (Hydra was
+      off, or this predates the sidecar feature).
     - "Captioned (nlp)" / "Captioned (tags)" / "Captioned (nlp tags)" -
       .txt exists alongside whichever of the two sidecars are also there
       (see core.batch.run_batch's own sidecar-writing logic).
-    - "Mismatch" - a .nlp/.tags sidecar exists but .txt doesn't - an
+    - "Sidecar only (nlp)" / "Sidecar only (tags)" / "Sidecar only (nlp tags)"
+      - one or both of .txt.nlp/.txt.tags exist but .txt doesn't - an
       inconsistent state (shouldn't normally happen since all three are
-      written/kept in sync together, but worth surfacing plainly rather
-      than silently falling back to "New" if it ever does, e.g. from a
-      hand-deleted .txt).
-    - "Error" - no .txt, no sidecars, but a .issue file exists (a batch
-      run failed/truncated on this image).
+      written/kept in sync together, but worth surfacing plainly, with
+      which sidecar(s) are the orphans, rather than silently falling back
+      to "New" if it ever does, e.g. from a hand-deleted .txt).
+    - "Error" - no .txt, no sidecars, but a .txt.issue file exists (a
+      batch run failed/truncated on this image).
     - "New" - none of the above exist yet.
     """
     txt_path = image_path.with_suffix(".txt")
     issue_path = Path(f"{txt_path}{ISSUE_SUFFIX}")
     sidecars = [
-        name for name, suffix in (("nlp", ".nlp"), ("tags", ".tags"))
-        if image_path.with_suffix(suffix).exists()
+        name for name, suffix in (("nlp", NLP_SUFFIX), ("tags", TAGS_SUFFIX))
+        if Path(f"{txt_path}{suffix}").exists()
     ]
 
     if txt_path.exists():
         return f"Captioned ({' '.join(sidecars)})" if sidecars else "Captioned"
     if sidecars:
-        return "Mismatch"
+        return f"Sidecar only ({' '.join(sidecars)})"
     if issue_path.exists():
         return "Error"
     return "New"
@@ -145,11 +153,22 @@ def run_batch(
     directly.
 
     When cfg.hydra_enabled and Hydra actually produced tags for an image,
-    two extra sidecars are written alongside the usual .txt: "<image>.nlp"
-    (the VLM-only caption, trigger word applied, no Hydra tags) and
-    "<image>.tags" (just Hydra's tag_text) - for consumers that want the
-    two pieces separately instead of re-splitting the combined .txt.
-    Batch-only for now, not written by Single-image or Review recaption.
+    two extra sidecars are written alongside the usual .txt:
+    "<image>.txt.nlp" (the VLM-only caption, trigger word applied, no
+    Hydra tags) and "<image>.txt.tags" (just Hydra's tag_text) - for
+    consumers that want the two pieces separately instead of re-splitting
+    the combined .txt. Batch-only for now, not written by Single-image or
+    Review recaption.
+
+    Sidecar adoption: an image with no .txt yet but an existing .txt.nlp
+    and/or .txt.tags (e.g. hand-renamed in from another tool, or left over
+    from an interrupted run) has that content reused rather than
+    regenerated - only whichever half is actually missing gets a fresh
+    model call, and an adopted .txt.tags is never touched by Hydra even if
+    cfg.hydra_enabled, so it can't be silently overwritten by a second tag
+    source. overwrite=True bypasses all of this and treats every image as
+    fresh, exactly like it already does for a pre-existing .txt. See
+    readme/faq-caption.md for the full case table.
     """
     directory = Path(directory)
     images = find_images(directory)
@@ -168,6 +187,8 @@ def run_batch(
 
         txt_path = image_path.with_suffix(".txt")
         issue_path = Path(f"{txt_path}{ISSUE_SUFFIX}")
+        nlp_path = Path(f"{txt_path}{NLP_SUFFIX}")
+        tags_path = Path(f"{txt_path}{TAGS_SUFFIX}")
         if txt_path.exists() and not overwrite:
             result.skipped += 1
             log.info("Skipping (caption exists): %s", image_path)
@@ -175,10 +196,20 @@ def run_batch(
                 progress_cb(i, total, image_path, "skipped", None, None)
             continue
 
+        # Adopt whatever sidecar(s) already exist unless overwrite says to
+        # ignore everything on disk and start fresh (see run_batch's own
+        # docstring above and readme/faq-caption.md).
+        adopted_nlp = nlp_path.read_text(encoding="utf-8") if not overwrite and nlp_path.exists() else None
+        adopted_tags = tags_path.read_text(encoding="utf-8") if not overwrite and tags_path.exists() else None
+
         stage_cb = (lambda s, _path=image_path: on_stage(_path, s)) if on_stage else None
         try:
+            # An adopted .txt.tags is trusted as-is - Hydra never runs for
+            # this image, so it can't clobber or duplicate it.
+            call_cfg = replace(cfg, hydra_enabled=False) if adopted_tags is not None else cfg
             caption, outcome, vlm_caption, hydra_tags = caption_image(
-                image_path, client, cfg, trigger_word=trigger_word, on_stage=stage_cb
+                image_path, client, call_cfg, trigger_word=trigger_word, on_stage=stage_cb,
+                existing_caption=adopted_nlp,
             )
             if outcome.truncated:
                 result.truncated += 1
@@ -190,10 +221,13 @@ def run_batch(
                 continue
 
             issue_path.unlink(missing_ok=True)
+            if adopted_tags is not None:
+                nlp_path.write_text(vlm_caption, encoding="utf-8")
+                caption = f"{vlm_caption}\n{adopted_tags}" if adopted_tags.strip() else vlm_caption
+            elif cfg.hydra_enabled and hydra_tags is not None:
+                nlp_path.write_text(vlm_caption, encoding="utf-8")
+                tags_path.write_text(hydra_tags, encoding="utf-8")
             txt_path.write_text(caption, encoding="utf-8")
-            if cfg.hydra_enabled and hydra_tags is not None:
-                image_path.with_suffix(".nlp").write_text(vlm_caption, encoding="utf-8")
-                image_path.with_suffix(".tags").write_text(hydra_tags, encoding="utf-8")
             result.processed += 1
             if outcome.resize_note:
                 log.info("Captioned: %s -> %s (resized %s)", image_path, txt_path, outcome.resize_note)
