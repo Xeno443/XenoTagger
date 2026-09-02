@@ -1,4 +1,4 @@
-# Batch captioning — sidecar & overwrite FAQ
+# Batch captioning - sidecar & overwrite FAQ
 
 Notes on exactly what `core.batch.run_batch()` (the Batch tab and the CLI
 share this one loop, see `webui/core/batch.py`) does with each image,

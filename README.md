@@ -10,7 +10,7 @@ grounded e621-style tags alongside the caption.
 
 Tested on Windows; may work on Linux too. The setup scripts and the
 in-app llama.cpp installer are Windows-specific, but the core app has no
-platform-specific code — running against an external, self-managed
+platform-specific code - running against an external, self-managed
 llama-server should work fine.
 
 A prepackaged release zip with everything already set up is planned for
@@ -77,10 +77,10 @@ tab to detect it.
   external llama-server
 - An Nvidia or AMD GPU is recommended (CUDA and ROCm builds are
   available). CPU-only operation is supported but slow.
-- 8GB VRAM is the practical floor — llama.cpp's partial offload handles
-  the rest — with 12–16GB more comfortable. Additional VRAM allows larger
+- 8GB VRAM is the practical floor - llama.cpp's partial offload handles
+  the rest - with 12–16GB more comfortable. Additional VRAM allows larger
   vision models at higher quality.
-- Sufficient disk space for models — vision GGUFs commonly run several GB
+- Sufficient disk space for models - vision GGUFs commonly run several GB
   each.
 - The optional Hydra tag classifier downloads its own ~1GB model and a
   PyTorch install on demand; it is not required for basic captioning.

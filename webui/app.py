@@ -1315,7 +1315,7 @@ def run_single_ui(image_path, trigger_word_override: str):
                 advice = (
                     f"prompt used {result.prompt_tokens} tokens, leaving no room "
                     f"in the {cfg.context_size}-token context for the requested "
-                    f"{cfg.max_tokens} — raise Context size in Settings"
+                    f"{cfg.max_tokens} - raise Context size in Settings"
                 )
             else:
                 advice = "raise Max tokens in Settings for a full caption"
@@ -1815,7 +1815,7 @@ def _review_position_text(items: list[ReviewItem], index: int, prefix: str = "")
     if not (0 <= index < len(items)):
         return f"{len(items)} image(s) found."
     item = items[index]
-    return f"{prefix}{index + 1}/{len(items)} — {item.path.name} ({item.status})"
+    return f"{prefix}{index + 1}/{len(items)} - {item.path.name} ({item.status})"
 
 
 def review_scan_ui(directory_str: str):
@@ -1959,7 +1959,7 @@ def review_recaption_ui(items: list[ReviewItem], index: int, current_caption: st
         result = result_holder["result"]
         speed = f", {result.tokens_per_second:.1f} tok/s" if result.tokens_per_second else ""
         note = f"CUT OFF at {result.completion_tokens} tokens{speed}" if result.truncated else f"{result.completion_tokens} tokens{speed}"
-        status = f"Recaptioned in {result.elapsed_s:.1f}s ({note}) — not saved yet, navigate away or edit to keep it"
+        status = f"Recaptioned in {result.elapsed_s:.1f}s ({note}) - not saved yet, navigate away or edit to keep it"
         if result.resize_note:
             status = f"Resized {result.resize_note}. {status}"
 
@@ -2992,11 +2992,11 @@ def models_table_select_ui(groups: list[ModelGroup], evt: gr.SelectData):
     quant_update, mmproj_update, action_update = _models_dropdown_updates(group)
     if not group.quants:
         if group.curated:
-            note = " — not downloaded yet; pick a quant below to see download info"
+            note = " - not downloaded yet; pick a quant below to see download info"
         else:
-            note = " — no model file found (download incomplete?), can't be selected"
+            note = " - no model file found (download incomplete?), can't be selected"
     elif not group.mmprojs:
-        note = " — no mmproj found, can't be selected"
+        note = " - no mmproj found, can't be selected"
     else:
         note = ""
     return str(group.folder), quant_update, mmproj_update, action_update, f"Viewing {group.name}{note}."
@@ -3015,7 +3015,7 @@ def models_set_active_ui(groups: list[ModelGroup], quant_name: str, mmproj_name:
             "(external mode, or an unrecognized server already using the managed port)."
         )
     if not quant_name or quant_name == "N/A":
-        return _models_table_rows(groups), *noop, "No model selected — click a row in the table first."
+        return _models_table_rows(groups), *noop, "No model selected - click a row in the table first."
 
     group = next((g for g in groups if any(q.name == quant_name for q in g.quants)), None)
     if group is None:
@@ -3031,7 +3031,7 @@ def models_set_active_ui(groups: list[ModelGroup], quant_name: str, mmproj_name:
         # silently commit an unselectable model, only failing later at
         # server-start time instead of refusing here where the reason is
         # actually known).
-        return _models_table_rows(groups), *noop, "This model has no mmproj — can't be set as active."
+        return _models_table_rows(groups), *noop, "This model has no mmproj - can't be set as active."
     if mmproj_name and not any(m.name == mmproj_name for m in group.mmprojs):
         shown = mmproj_name.rsplit("/", 1)[-1]
         return _models_table_rows(groups), *noop, (
@@ -3069,7 +3069,7 @@ def models_download_ui(groups: list[ModelGroup], quant_name: str, mmproj_name: s
     has actually changed yet."""
     noop = (gr.update(), gr.update(), gr.update())
     if not quant_name or quant_name == "N/A":
-        return _models_table_rows(groups), *noop, "No model selected — click a row in the table first."
+        return _models_table_rows(groups), *noop, "No model selected - click a row in the table first."
 
     group = _group_for_quant_value(groups, quant_name)
     if group is None or group.curated is None:
@@ -3094,7 +3094,7 @@ def models_download_ui(groups: list[ModelGroup], quant_name: str, mmproj_name: s
             ))
 
     if not to_queue:
-        return _models_table_rows(groups), *noop, "Already downloaded — nothing to queue."
+        return _models_table_rows(groups), *noop, "Already downloaded - nothing to queue."
 
     added = _download_enqueue(to_queue)
     if not added:
@@ -3202,7 +3202,7 @@ def build_app() -> gr.Blocks:
     cfg = current_cfg
 
     with gr.Blocks(title="XenoTagger", analytics_enabled=False) as demo:
-        gr.Markdown("# XenoTagger — LoRA dataset captioning")
+        gr.Markdown("# XenoTagger - LoRA dataset captioning")
 
         # Declared up front, outside main_tabs (rather than down by the
         # rest of the reachability wiring, where it's used more locally) -
