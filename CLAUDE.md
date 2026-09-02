@@ -591,6 +591,25 @@ test) - neither of those get WinPython's patched pip at all. `.venv`
 (`setup-venv.bat`'s path) is deliberately not covered by
 `fix-wrappers.py` - see Open/deferred below.
 
+**`system\fix-pip-shebang.py`** (added 2026-09-02, standalone/manual for
+now - see Open/deferred below) directly counters the scenario above: if
+a pip upgrade ever does silently replace WinPython's patched
+`distlib\scripts.py` with the official unpatched one, this restores the
+one-line patch (wraps `get_executable()` in `os.path.basename(...)` in
+`_get_shebang()`'s `elif not sysconfig.is_python_build():` branch) so
+newly-installed packages keep getting relocatable bare-`python.exe`
+wrappers instead of hardcoded paths. Deliberately not a blind text
+replacement - it parses the file with `ast`, locates that exact
+assignment structurally, and only touches it if the right-hand side is
+confidently recognized as either the patched or unpatched form; anything
+else (pip's internals having changed in some unrelated way) is left
+untouched with a warning rather than guessed at. Verified against a live
+unpatched `system\python` (patches successfully, confirmed idempotent,
+confirmed a fresh package install afterward actually produces a bare
+shebang again), an already-patched copy (correctly no-ops), and a
+synthetic "unrecognized shape" file (correctly refuses rather than
+touching it).
+
 ## House rules
 
 - **No venv, ever - for this repo's own portable-env path.** Everything
@@ -667,6 +686,13 @@ test) - neither of those get WinPython's patched pip at all. `.venv`
   own in-flight checks (does `pyvenv.cfg`'s recorded base interpreter
   still exist, etc.) before deciding whether to patch-in-place or just
   tell the user to recreate it - not started yet.
+- **`system\fix-pip-shebang.py` is standalone/manual, not wired into
+  `environment.bat`.** Asked and explicitly deferred (2026-09-02, "yeah
+  just leave it as it is for now") - unlike `fix-wrappers.py`, this one
+  patches pip's own vendored source rather than just repairing already-
+  generated wrapper files, which felt like it warranted a check-in
+  before making it run automatically on every launch. Revisit if the
+  user brings it back up.
 - **Broad UI-logic refactor, not yet scoped.** Much of the app predates
   this session's status-bar/infotext-bar/`_notify` consolidation (see
   "Status/notification architecture" above) and still carries older UI

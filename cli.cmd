@@ -11,5 +11,8 @@ call "%~dp0environment.bat" passive
 exit /b %errorlevel%
 
 :venv
-"%~dp0.venv\Scripts\python.exe" "%~dp0webui\cli.py" %*
-exit /b %errorlevel%
+call "%~dp0.venv\Scripts\activate.bat"
+python "%~dp0webui\cli.py" %*
+set "EXITCODE=%errorlevel%"
+call "%~dp0.venv\Scripts\deactivate.bat"
+exit /b %EXITCODE%

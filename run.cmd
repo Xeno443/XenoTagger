@@ -13,6 +13,8 @@ pause
 exit /b 0
 
 :venv
-"%~dp0.venv\Scripts\python.exe" "%~dp0webui\app.py"
+call "%~dp0.venv\Scripts\activate.bat"
+python "%~dp0webui\app.py"
+call "%~dp0.venv\Scripts\deactivate.bat"
 pause
 exit /b 0
