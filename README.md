@@ -13,13 +13,23 @@ in-app llama.cpp installer are Windows-specific, but the core app has no
 platform-specific code — running against an external, self-managed
 llama-server should work fine.
 
-```
-git clone https://github.com/Xeno443/XenoTagger.git
-cd XenoTagger
-```
+A prepackaged release zip with everything already set up is planned for
+later. Until then, get the code one of these ways:
 
-Two setup paths are available. A prepackaged release zip is planned for
-users who prefer not to use git or the setup scripts.
+- **No git needed, single file:** download just `setup-portable.bat` on
+  its own into an empty folder and run it. It installs a portable Python
+  and Git, fetches the rest of the app from GitHub, and finishes setup
+  automatically.
+- **No git needed, whole repo:** use GitHub's "Download ZIP" button and
+  extract it, then run a setup script below.
+- **git clone:**
+  ```
+  git clone https://github.com/Xeno443/XenoTagger.git
+  cd XenoTagger
+  ```
+  then run a setup script below.
+
+Two setup scripts are available:
 
 ### Portable environment
 
@@ -28,10 +38,8 @@ setup-portable.bat
 ```
 
 This downloads its own Python and Git into `system\`, without affecting
-any system-wide installation.
-
-**Launch:** `run.cmd` (GUI) or `cli.cmd` (headless batch
-captioning)
+any system-wide installation. If the app code isn't there yet (the
+single-file case above), it fetches that too before finishing.
 
 ### Using your own Python
 
@@ -43,8 +51,14 @@ setup-venv.bat
 
 This creates a `.venv\` using the systemwide Python.
 
-**Launch:** `run.cmd` (GUI) or `cli.cmd` (headless
-batch captioning)
+## Launch
+
+```
+run.cmd
+```
+
+(GUI) or `cli.cmd` (headless batch captioning). Both auto-detect
+whichever setup you used above.
 
 ## First launch
 
