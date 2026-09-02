@@ -1,6 +1,6 @@
 # XenoTagger
 
-A Gradio + CLI tool for captioning images for LoRA dataset preparation.
+A vibe-coded Gradio + CLI tool for captioning images for LoRA dataset preparation.
 Point it at a folder of images and it writes a `.txt` caption next to
 each one, using a local (or remote) llama.cpp vision model. An optional
 second pass with a RedRocket Hydra e621 tag classifier can fold in
@@ -16,20 +16,16 @@ llama-server should work fine.
 A prepackaged release zip with everything already set up is planned for
 later. Until then, get the code one of these ways:
 
-- **No git needed, single file:** download just `setup-portable.bat` on
-  its own into an empty folder and run it. It installs a portable Python
-  and Git, fetches the rest of the app from GitHub, and finishes setup
-  automatically.
-- **No git needed, whole repo:** use GitHub's "Download ZIP" button and
-  extract it, then run a setup script below.
-- **git clone:**
+- Download [`setup-portable.bat`](https://github.com/Xeno443/XenoTagger/blob/main/setup-portable.bat) into an empty folder and run it. It installs a portable Python and Git, fetches the rest of the app from GitHub, and finishes setup automatically.
+- Download the whole repo as  a Zip using GitHub's ["Download ZIP"](https://github.com/Xeno443/XenoTagger/archive/refs/heads/main.zip) button, extract it, then run a setup script (see below).
+
+- If you already have Git installed on your system, do a standard `git clone`
   ```
   git clone https://github.com/Xeno443/XenoTagger.git
   cd XenoTagger
   ```
-  then run a setup script below.
 
-Two setup scripts are available:
+Then run one of the following setup scripts:
 
 ### Portable environment
 
@@ -38,8 +34,7 @@ setup-portable.bat
 ```
 
 This downloads its own Python and Git into `system\`, without affecting
-any system-wide installation. If the app code isn't there yet (the
-single-file case above), it fetches that too before finishing.
+any system-wide installation. If the app code isn't there yet, it fetches that too before finishing.
 
 ### Using your own Python
 
