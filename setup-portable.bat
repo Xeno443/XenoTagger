@@ -15,6 +15,8 @@ set "GIT_TAG=v2.55.0.windows.5"
 set "GIT_ASSET_VERSION=2.55.0.5"
 set "GIT_URL=https://github.com/git-for-windows/git/releases/download/%GIT_TAG%/PortableGit-%GIT_ASSET_VERSION%-64-bit.7z.exe"
 
+set "RAW_BASE=https://raw.githubusercontent.com/Xeno443/XenoTagger/main"
+
 set "PYDIR=%SYSTEM_DIR%\python"
 
 if not exist "%SYSTEM_DIR%" (
@@ -45,12 +47,26 @@ if exist "%ROOT%webui\requirements.txt" (
     echo.
     echo Done. To finish setup, install llama.cpp via the GUI's Settings
     echo Llama tab, run.cmd, or cli.cmd --install-llama backend.
-) else (
-    echo.
-    echo No webui\requirements.txt found yet, skipping dependency install.
-    echo Run update.bat next to fetch the app and finish setup.
+    pause
+    goto :eof
 )
-pause
+
+set "NEED_FETCH="
+if not exist "%ROOT%environment.bat" set "NEED_FETCH=1"
+if not exist "%ROOT%update.bat" set "NEED_FETCH=1"
+
+if defined NEED_FETCH (
+    echo.
+    echo App code not found here yet.
+    echo Press any key to fetch files from GitHub ...
+    pause >nul
+    call :fetch_app_files
+    if errorlevel 1 goto :fail
+)
+
+echo.
+echo Fetching the app and finishing setup ...
+call "%ROOT%update.bat"
 goto :eof
 
 :install_python
@@ -118,6 +134,23 @@ echo Extracting Git ...
 if not exist "%SYSTEM_DIR%\git" md "%SYSTEM_DIR%\git"
 "%TMP_DIR%\PortableGit.exe" -y -o"%SYSTEM_DIR%\git"
 del /q "%TMP_DIR%\PortableGit.exe"
+exit /b 0
+
+:fetch_app_files
+if not exist "%ROOT%environment.bat" (
+    curl -L --fail "%RAW_BASE%/environment.bat" -o "%ROOT%environment.bat"
+    if errorlevel 1 (
+        echo Failed to download environment.bat.
+        exit /b 1
+    )
+)
+if not exist "%ROOT%update.bat" (
+    curl -L --fail "%RAW_BASE%/update.bat" -o "%ROOT%update.bat"
+    if errorlevel 1 (
+        echo Failed to download update.bat.
+        exit /b 1
+    )
+)
 exit /b 0
 
 :fail

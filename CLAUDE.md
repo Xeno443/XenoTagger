@@ -446,10 +446,14 @@ deployment scenarios that actually matter:
    `webui/requirements.txt`, but no `.git`) - setup scripts already work
    unchanged; `update.bat` needed a way to start tracking updates
    without an existing `.git`.
-4. Nothing at all - just the two bootstrap scripts dropped into an empty
-   folder by hand. Deferred for further scoping; the mechanism below
-   happens to already cover it as a side effect of solving #3, since an
-   empty directory and a non-git source tree hit the same code path.
+4. Nothing at all - just `setup-portable.bat` downloaded by hand into an
+   empty folder. The adopt-in-place mechanism below already covered this
+   as a side effect of solving #3 (an empty directory and a non-git
+   source tree hit the same code path), so this only needed
+   `setup-portable.bat` to fetch `environment.bat` and `update.bat`
+   itself (both guarded on "not already present", so a re-run never
+   clobbers a real checkout's tracked copies) and auto-chain into
+   `update.bat` once they land - a true one-file bootstrap.
 
 Two changes cover all four:
 
@@ -491,6 +495,16 @@ Two changes cover all four:
   of the same pass - one pair of cryptically-named-per-setup-path
   launchers was extra friction for the same "make this easy for someone
   who's never done this before" goal driving the rest of this rework.
+- **`setup-portable.bat` fetches `environment.bat`/`update.bat` from
+  `raw.githubusercontent.com` (via the same `curl` it already uses for
+  WinPython/Git) and auto-chains into `update.bat` when
+  `webui\requirements.txt` isn't present yet** - scenario 4 above. Only
+  fetches whichever of the two is actually missing, and pauses first
+  with an explicit "Press any key to fetch files from GitHub ..."
+  message before doing so, so a truly single-file download doesn't
+  silently reach out to the network without the user noticing. Once
+  `update.bat` runs, its own `git reset --hard` supersedes both fetched
+  files with their real tracked versions from the repo.
 
 ## House rules
 
