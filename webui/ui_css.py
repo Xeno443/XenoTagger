@@ -48,9 +48,10 @@ ruled out and why, when there's genuinely no other way.
 # user's own follow-up ask to match that instead.
 STATUS_BAR_CSS = (
     "#status-bar { text-align: center; } "
-    "#status-bar .prose { font-size: calc(1em - 2px); } "
-    "#status-bar .prose * { color: var(--button-secondary-background-fill); }"
+    "#status-bar .prose { font-size: calc(1em - 1px); } "
 )
+#     "#status-bar .prose * { color: var(--button-secondary-background-fill); }"
+
 
 # gr.Radio has no orientation/layout parameter (checked its constructor -
 # only choices/value/type/label/etc, nothing about how the choice buttons

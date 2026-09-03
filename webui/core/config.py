@@ -40,8 +40,28 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 WEBUI_DIR = Path(__file__).resolve().parent.parent
+ROOT_DIR = WEBUI_DIR.parent
 SETTINGS_PATH = WEBUI_DIR / "config" / "settings.json"
 DEFAULT_TAG_VOCAB_PATH = str(WEBUI_DIR / "tags" / "e621.csv")
+
+APP_VERSION = "0.8-beta"
+
+
+def app_version() -> str:
+    """APP_VERSION, with the current commit's short hash appended when
+    running from a git checkout - read directly from .git/HEAD, no git
+    binary required. Silently falls back to just the bare version for a
+    ZIP download (no .git at all) or any other reason it can't be read
+    (e.g. a repacked ref with no loose file left under .git/refs)."""
+    try:
+        ref = (ROOT_DIR / ".git" / "HEAD").read_text(encoding="utf-8").strip()
+        commit = (
+            (ROOT_DIR / ".git" / ref[5:].strip()).read_text(encoding="utf-8").strip()
+            if ref.startswith("ref:") else ref
+        )
+        return f"v{APP_VERSION} ({commit[:7]})" if commit else f"v{APP_VERSION}"
+    except OSError:
+        return f"v{APP_VERSION}"
 
 DEFAULT_PROMPT = (
     "Describe this image in a single detailed paragraph, written in natural "
@@ -170,7 +190,7 @@ class AppConfig:
     # no reload needed.
     hydra_metric: str = "f0.5@0.1"
     hydra_implications: str = "remove"
-    hydra_exclude_categories: str = ""  # space-separated, e.g. "meta lore"
+    hydra_exclude_categories: str = "artist copyright meta rating lore"  # space-separated - irrelevant for LoRA tagging
     hydra_exclude_tags: str = ""  # space-separated
     hydra_max_tags: int = 0  # 0 = no cap, else keep only the top-N by probability
     # Mirrors autostart_managed_llama exactly: only fires once, on app

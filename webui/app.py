@@ -1864,6 +1864,9 @@ def review_next_ui(items: list[ReviewItem], index: int, current_caption: str, cu
 def review_table_select_ui(
     items: list[ReviewItem], index: int, current_caption: str, current_tags: str, evt: gr.SelectData,
 ):
+    with _operation_lock:
+        if _active_operation is not None and _active_operation.kind == "review":
+            return tuple(gr.update() for _ in range(7))
     _review_maybe_save(items, index, current_caption, current_tags)
     row = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
     image, caption, tags, tags_enabled = _review_load(items, row)
@@ -1879,8 +1882,23 @@ def review_table_select_ui(
 # anywhere" treatment as part of the requirement that recaptioning
 # disables the rest of this tab's navigation, not just morph its own
 # button. See _review_nav_state below and _update_ui_status.
-_REVIEW_NAV_BUSY = tuple(gr.update(interactive=False) for _ in range(6))
-_REVIEW_NAV_IDLE = tuple(gr.update(interactive=True) for _ in range(6))
+#
+# review_table's own slot is deliberately always a no-op gr.update(),
+# never interactive=True/False - it's built interactive=False at
+# construction and must stay that way, since _review_status_table()
+# hands it a pandas Styler for the current-row highlight and Gradio's
+# Dataframe.postprocess silently discards a Styler (with a console
+# warning) whenever interactive is True. Blocking a row click during an
+# active recaption is instead handled server-side in
+# review_table_select_ui, not via this client-side flag.
+_REVIEW_NAV_BUSY = (
+    gr.update(interactive=False), gr.update(interactive=False), gr.update(),
+    gr.update(interactive=False), gr.update(interactive=False), gr.update(interactive=False),
+)
+_REVIEW_NAV_IDLE = (
+    gr.update(interactive=True), gr.update(interactive=True), gr.update(),
+    gr.update(interactive=True), gr.update(interactive=True), gr.update(interactive=True),
+)
 # 3 (recaption_col, interrupt_col, interrupt_btn) + 6 (_REVIEW_NAV_BUSY/IDLE
 # width) = 9 - must match running_state/idle_state's length below exactly,
 # so it's a named constant rather than a repeated magic number.
@@ -3155,12 +3173,13 @@ def get_status_text() -> str:
     model = get_loaded_model_name(base_url) if healthy else None
     model = model or "n/a"
     return (
-        f"Python {platform.python_version()} &nbsp;·&nbsp; "
-        f"Gradio {gr.__version__} &nbsp;·&nbsp; "
-        f"llama-server: {_status_label(cfg, healthy, installed)} &nbsp;·&nbsp; "
+        f"Version: {config_mod.app_version()} &nbsp;·&nbsp; "
+        f"Python: {platform.python_version()} &nbsp;·&nbsp; "
+        f"Gradio: {gr.__version__} &nbsp;·&nbsp; "
+        f"llama: {_status_label(cfg, healthy, installed)} &nbsp;·&nbsp; "
         f"Model: {model} &nbsp;·&nbsp; "
         f"Hydra: {_hydra_footer_label(cfg)} &nbsp;·&nbsp; "
-        f"{_operation_status_text()}"
+        f"Status: {_operation_status_text()}"
     )
 
 
@@ -3842,7 +3861,7 @@ def build_app() -> gr.Blocks:
                         with gr.Row():
                             hydra_tag_vocab_path = gr.Textbox(
                                 label="Tag vocabulary CSV (Review tag autocomplete, restart to apply)",
-                                value=cfg.hydra_tag_vocab_path, scale=4,
+                                value=cfg.hydra_tag_vocab_path, scale=4, interactive=False,
                             )
                             hydra_tag_vocab_browse_btn = gr.Button("Browse...", scale=1)
                         hydra_tag_vocab_browse_btn.click(

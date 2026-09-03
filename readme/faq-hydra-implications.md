@@ -178,7 +178,7 @@ score was enough to veto everything more specific than it.
 
 For contrast, the other implications modes go the opposite direction instead
 of collapsing:
-- **`inherit`** (XenoTagger's current default) - boosts a general ancestor's
+- **`inherit`** - boosts a general ancestor's
   displayed confidence up to match a specific descendant's, and force-keeps
   it in the output. Would show `mammal`, `canine`, `domestic_dog`, and
   `dobermann` all together, with the weaker ones bumped up toward 0.95.

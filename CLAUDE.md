@@ -277,6 +277,17 @@ standalone `HydraTagger` repo; this is the real integration.
   This also drops `csi<weight>@<precision>` from the reachable UI
   (judged not worth a second control for; the field still accepts it if
   hand-edited into `settings.json`).
+- **`exclusive-groups`, `aliases`, and per-category-prefix rewriting
+  (all real upstream Hydra capabilities - see `webui/vendor/rr_hydra/`)
+  are permanently out of scope, not just deferred (decided 2026-09-03).**
+  Anyone needing that level of tag-curation control for a second-stage
+  classifier is better served by a dedicated tool than by XenoTagger's
+  own "enrich the caption with some tags" feature - don't re-propose
+  exposing these in Settings → Hydra without the user raising it first.
+  `hydra_exclude_categories` defaults to `"artist copyright meta rating
+  lore"` (changed from empty 2026-09-03) - irrelevant categories for
+  LoRA tagging, filtered out of the box rather than left for every user
+  to discover and type in themselves.
 
 ## Hydra/llama VRAM coexistence (2026-09-01)
 
@@ -833,9 +844,9 @@ touching it).
   live GPU classify passes (a throwaway metric-sweep script and the real
   Settings → Hydra sliders in the running GUI) have now happened against
   real images on real hardware, and `hydra_metric`/`hydra_implications`
-  defaults were retuned as a result. Still deliberately left out
-  (upstream supports them, just not exposed in Settings): exclusive-
-  groups, aliases, and per-category-prefix knobs.
+  defaults were retuned as a result. `exclusive-groups`/`aliases`/
+  per-category-prefix rewriting are permanently out of scope, not an
+  open item - see that section's own closing note.
 - **Llama tab's download progress bar - user-owned follow-up, not yet
   scheduled.** During the 2026-09-01 harmonization pass, whether Hydra's
   model-download progress display (on the Models tab's "Hydra model"
