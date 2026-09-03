@@ -925,7 +925,7 @@ def _update_ui_status():
     batch_interrupt_col, batch_interrupt_btn, review_recaption_btn,
     review_recaption_col, review_interrupt_col, review_interrupt_btn,
     review_prev_btn, review_next_btn, review_table, review_dir,
-    review_browse_btn, review_scan_btn).
+    review_browse_btn, review_scan_btn, review_clear_btn).
     """
     reachable = _cached_reachable()
     with _operation_lock:
@@ -1841,6 +1841,18 @@ def review_scan_ui(directory_str: str):
     )
 
 
+def review_clear_ui(items: list[ReviewItem], index: int, current_caption: str, current_tags: str):
+    """Resets the whole Review tab - directory field, scanned table, and
+    the currently loaded item - back to its just-opened state. Saves any
+    pending edit on the current item first, same as navigating away via
+    Prev/Next/the table."""
+    _review_maybe_save(items, index, current_caption, current_tags)
+    return (
+        "", _review_position_text([], -1), [], -1, None, "",
+        gr.update(value="", interactive=True), _review_status_table([]),
+    )
+
+
 def review_prev_ui(items: list[ReviewItem], index: int, current_caption: str, current_tags: str):
     _review_maybe_save(items, index, current_caption, current_tags)
     new_index = max(0, index - 1) if items else -1
@@ -1894,15 +1906,18 @@ def review_table_select_ui(
 _REVIEW_NAV_BUSY = (
     gr.update(interactive=False), gr.update(interactive=False), gr.update(),
     gr.update(interactive=False), gr.update(interactive=False), gr.update(interactive=False),
+    gr.update(interactive=False),
 )
 _REVIEW_NAV_IDLE = (
     gr.update(interactive=True), gr.update(interactive=True), gr.update(),
     gr.update(interactive=True), gr.update(interactive=True), gr.update(interactive=True),
+    gr.update(interactive=True),
 )
-# 3 (recaption_col, interrupt_col, interrupt_btn) + 6 (_REVIEW_NAV_BUSY/IDLE
-# width) = 9 - must match running_state/idle_state's length below exactly,
-# so it's a named constant rather than a repeated magic number.
-_REVIEW_STATE_NOOP = tuple(gr.update() for _ in range(9))
+# 3 (recaption_col, interrupt_col, interrupt_btn) + 7 (_REVIEW_NAV_BUSY/IDLE
+# width - prev/next/table/dir/browse/scan/clear) = 10 - must match
+# running_state/idle_state's length below exactly, so it's a named constant
+# rather than a repeated magic number.
+_REVIEW_STATE_NOOP = tuple(gr.update() for _ in range(10))
 
 
 def review_recaption_ui(items: list[ReviewItem], index: int, current_caption: str):
@@ -3222,6 +3237,14 @@ def build_app() -> gr.Blocks:
 
     with gr.Blocks(title="XenoTagger", analytics_enabled=False) as demo:
         gr.Markdown("# XenoTagger - LoRA dataset captioning")
+        # Plain markdown link, not raw HTML - Gradio's own Markdown
+        # renderer already rewrites any real (non "#...") link to
+        # target="_blank" rel="noopener noreferrer" client-side, so this
+        # opens in a new browser tab with no extra markup needed.
+        gr.Markdown(
+            "Check the "
+            "[readme](https://github.com/Xeno443/XenoTagger/blob/main/readme/README.md)!"
+        )
 
         # Declared up front, outside main_tabs (rather than down by the
         # rest of the reachability wiring, where it's used more locally) -
@@ -3366,6 +3389,7 @@ def build_app() -> gr.Blocks:
                     with gr.Column(scale=1, min_width=120):
                         review_browse_btn = gr.Button("Browse...")
                         review_scan_btn = gr.Button("Scan")
+                        review_clear_btn = gr.Button("Clear")
 
                 with gr.Row(equal_height=True):
                     review_prev_btn = gr.Button("←", scale=1, min_width=60)
@@ -3422,6 +3446,11 @@ def build_app() -> gr.Blocks:
                     review_scan_ui, [review_dir], _review_nav_outputs
                 )
                 review_scan_btn.click(review_scan_ui, [review_dir], _review_nav_outputs)
+                review_clear_btn.click(
+                    review_clear_ui,
+                    [review_items_state, review_index_state, review_caption, review_tags],
+                    [review_dir, *_review_nav_outputs],
+                )
                 review_prev_btn.click(
                     review_prev_ui,
                     [review_items_state, review_index_state, review_caption, review_tags],
@@ -3444,7 +3473,7 @@ def build_app() -> gr.Blocks:
                         review_caption, review_tags, review_infotext,
                         review_recaption_col, review_interrupt_col, review_interrupt_btn,
                         review_prev_btn, review_next_btn, review_table,
-                        review_dir, review_browse_btn, review_scan_btn,
+                        review_dir, review_browse_btn, review_scan_btn, review_clear_btn,
                     ],
                 )
                 review_interrupt_btn.click(interrupt_review_ui, [], [review_interrupt_btn])
@@ -3996,7 +4025,7 @@ def build_app() -> gr.Blocks:
             batch_run_btn, batch_run_col, batch_interrupt_col, batch_interrupt_btn,
             review_recaption_btn, review_recaption_col, review_interrupt_col, review_interrupt_btn,
             review_prev_btn, review_next_btn, review_table,
-            review_dir, review_browse_btn, review_scan_btn,
+            review_dir, review_browse_btn, review_scan_btn, review_clear_btn,
         ]
         # Switching to any of these tabs remounts their Columns back to
         # whatever visibility was declared at Blocks-build time, not the

@@ -1,865 +1,264 @@
 # XenoTagger
 
-A Gradio + CLI Python app that captions images for LoRA dataset creation,
+Gradio + CLI Python app that captions images for LoRA dataset creation,
 using a local (or remote) llama.cpp multimodal vision server. Point it at
-a folder of images, it writes a `.txt` caption sidecar next to each one.
+a folder of images, it writes a `.txt` caption sidecar per image.
 
-This repo used to be the `portable-env` common-base toolchain (worktrees,
-`main`/`webui`/etc. branches). That model is gone - XenoTagger is now a
-**standalone single-branch repo**
-(`https://github.com/Xeno443/XenoTagger.git`). Ignore any leftover
-references elsewhere to worktrees or a `portable-env-<branch>` layout;
-they describe a repo structure this one no longer has.
+Standalone single-branch repo (`https://github.com/Xeno443/XenoTagger.git`).
+Ignore stray references elsewhere to worktrees or `portable-env-<branch>`
+- not this repo's structure.
 
 ## Layout
 
-- `webui/app.py` - the Gradio GUI. Single-image, Batch processing,
-  Review (edit/recaption existing captions), Models (local + curated
-  downloads), Settings (Llama/Hydra/Image resizing/Captioning defaults/
-  Debug sub-tabs), an opt-in Debuglog tab. Its own module docstring
-  documents the concurrency model (`_session_lock`/`_operation_lock`/
-  `_config_lock`) and several Gradio layout workarounds in detail - read
-  that before changing button/tab wiring, don't re-derive it.
-- `webui/cli.py` - headless batch captioning, independent entry point.
-  Shares `core/batch.py`/`core/captioner.py` with the GUI; reads/writes
-  the same `webui/config/settings.json`. No UI-specific code ever
-  belongs in `core/`.
-- `webui/core/` - framework-agnostic logic shared by both entry points:
-  - `config.py` - `AppConfig` dataclass, the single source of truth for
-    every setting; `load()`/`save()` for `settings.json`.
-  - `server.py` - llama-server process lifecycle (`managed` mode: we
-    spawn/own it; `external` mode: we just talk to a URL) and
-    `check_status()` for cheap read-only UI gating.
-  - `client.py` - the one place that actually calls llama-server's
-    chat API, plus in-memory image preprocessing.
-  - `captioner.py` - the shared "caption one image" entry point used by
-    Single-image, Batch, and the CLI alike. `caption_image()` is where
-    the Hydra second-stage tag classifier hooks in (see below) -
-    exactly the single hook point its own docstring anticipated.
-  - `batch.py` - directory batch-captioning loop (stateless: a `.txt`
-    sidecar existing is the only "already done" record).
-  - `models.py` - discovers/classifies local GGUF models under
-    `webui/models/`.
+- `webui/app.py` - Gradio GUI (Single-image, Batch, Review, Models,
+  Settings, opt-in Debuglog). Module docstring covers the concurrency
+  model (`_session_lock`/`_operation_lock`/`_config_lock`) and Gradio
+  layout workarounds - read before touching button/tab wiring.
+- `webui/cli.py` - headless batch captioning. Shares `core/batch.py`/
+  `core/captioner.py` with the GUI, same `settings.json`. No UI code in
+  `core/`.
+- `webui/core/` - framework-agnostic shared logic:
+  - `config.py` - `AppConfig` dataclass, `load()`/`save()`.
+  - `server.py` - llama-server lifecycle (`managed` spawn/own vs.
+    `external` URL-only), `check_status()`.
+  - `client.py` - llama-server chat API calls, image preprocessing.
+  - `captioner.py` - shared "caption one image" entry point (Single,
+    Batch, CLI). `caption_image()` is the Hydra hook point.
+  - `batch.py` - directory batch loop. Stateless - `.txt` existing is
+    the only "done" record.
+  - `models.py` - discovers/classifies local GGUF models.
   - `downloads.py` - background curated-model downloader.
-  - `llama_install.py` - installs llama-server.exe (+ matching CUDA
-    runtime where applicable) from ggml-org/llama.cpp's GitHub releases
-    into `llama/` (gitignored, backend-agnostic - one canonical
-    install, not one dir per backend). Backend choices: CUDA 13.3
-    (default)/12.4, ROCm 7.14, CPU - resolved against whichever build
-    GitHub's releases list currently returns first, not a hardcoded
-    build number. Reachable from Settings → Llama in the GUI and from
-    `cli.py --install-llama <backend>`.
+  - `llama_install.py` - installs llama-server.exe from ggml-org/llama.cpp
+    releases into `llama/` (gitignored). CUDA 13.3 (default)/12.4, ROCm
+    7.14, CPU - resolved against GitHub's current release listing, not a
+    hardcoded build. Settings → Llama, or `cli.py --install-llama`.
   - `hydra_classifier.py` - in-process Hydra 3.5 (RedRocket) e621 tag
-    classifier: a lazily-populated singleton (`load()`/`unload()`/
-    `classify()`/`status()`), not a second managed server - see
-    "Hydra 3.5 second-stage tag classifier" below.
-  - `hydra_install.py` - pip-installs Hydra's Python deps (torch +
-    friends, into `system\python` like everything else) and downloads
-    `hydra-3.5.safetensors` into `webui/models/RedRocket-Hydra/`.
-    Reachable from Settings → Hydra and from `cli.py --install-hydra`.
-- `webui/vendor/rr_hydra/` - vendored (checked-in) inference-only source
-  from RedRocket's own `hydra/hydra/` package, renamed from upstream's
-  `hydra` to avoid colliding with PyPI's unrelated `hydra-core`. Only
-  what a synchronous single-image `classify()` call needs - not
-  upstream's GUI/HTTP-service/multi-worker-dataloader code, none of
-  which this app uses.
-- `webui/config/` - `settings.json` (gitignored, per-machine),
-  `models_source.json` (checked in - curated downloadable model list),
-  `models_cache.json` (gitignored).
-- `readme/` - deep-dive/FAQ docs too long for a CLAUDE.md paragraph; any
-  new one goes here too, not the repo root.
-  - `faq-hydra-implications.md` - a worked walkthrough (concrete 4-level
-    tag-hierarchy example) of how Hydra's `remove`/`constrain-remove`/
-    `enforce-remove` implications modes actually resolve nested e621 tag
-    families differently. The behavior isn't obvious from the option
-    names alone - read before touching `hydra_implications` again.
-  - `faq-hydra-setting.md` - plain-English walkthrough of Settings →
-    Hydra's Confidence/Threshold sliders (the `hydra_metric` F-beta/
-    min-precision pair) - what each one actually does to which tags and
-    why, plus the same real-image sweep result referenced in "Hydra 3.5
-    second-stage tag classifier" below.
-  - `faq-caption.md` - the case table for `core.batch.run_batch()`'s
-    sidecar adoption (what happens to an image with no `.txt` yet but an
-    existing `.txt.nlp`/`.txt.tags`, e.g. renamed in from another tool,
-    and how `overwrite` interacts with it - see "Batch sidecar adoption"
-    below for the change itself), plus how the Review tab's own per-item
-    load/save handles the same three files.
-  - `faq-linux-considerations.md` - file:line audit of what is/isn't
-    actually Windows-specific in `app.py`/`cli.py`/`core/` (excluding the
-    obviously-Windows-only `.bat`/`.cmd` scripts): the managed server
-    only looks for `llama-server.exe` (`core/server.py`), and the in-app
-    llama.cpp installer only fetches Windows release assets
-    (`core/llama_install.py`) - both managed-mode-only gaps, external
-    server mode has no platform dependency at all. Read before assuming
-    "Windows only" or claiming full Linux support either way.
-- `run.cmd` / `cli.cmd` (renamed from `run-tagger.cmd`/`tag-cli.cmd`
-  2026-09-02) - launch the GUI / CLI. Each auto-detects which
-  environment is present (`system\python\python.exe` for the portable
-  env, else `.venv\Scripts\python.exe` for the venv path) instead of
-  needing separate launchers per setup path - collapsed from the
-  previous 4 launchers, see "Bootstrap/update scripts redesign" below.
-- `setup-portable.bat` / `environment.bat` - inherited from the portable-env
-  base: build/activate the portable Python + Git toolchain under
-  `system\git\`/`system\python\` (gitignored - the downloaded toolchain
-  itself; `system\` as a folder is tracked, since it also holds
-  `system\fix-wrappers.py`, see "Wrapper-path self-heal" below), then
-  install `webui/requirements.txt` if it's already present (skipped with
-  a note otherwise - see below). Unrelated to the worktree model that
-  was dropped. `setup-tagger.cmd` (which used to also install a
-  hardcoded CUDA-only llama.cpp build) is gone - that job moved to
-  `core/llama_install.py` above.
-- `update.bat` - pulls the latest code (`git pull`, falling back to
-  `git reset --hard` + `git pull` on failure) then refreshes
-  `webui/requirements.txt` into whichever environment(s) actually exist
-  locally (portable and/or venv, checked independently). If no `.git` is
-  present at all it adopts the folder as a checkout first instead of
-  requiring an empty directory - see "Bootstrap/update scripts redesign"
-  below.
-- `setup-venv.bat` - an alternative to the portable environment for
-  anyone who already has git and Python installed systemwide and would
-  rather use a normal venv. Creates `.venv\` (gitignored) via the
-  systemwide `python` on PATH and installs `webui/requirements.txt` into
-  it. Doesn't touch `system\` at all - both setups coexist untouched
-  side by side in the same checkout. `webui/requirements.txt` has no
-  version pins, so a systemwide Python that's a different version than
-  the portable env's pinned one (see `setup-portable.bat`) is expected to
-  just work. This is why `core/hydra_install.py`'s pip-install subprocess
-  targets `sys.executable` rather than a hardcoded
-  `system\python\python.exe` path - it targets whichever interpreter is
-  actually running the app, portable or venv, instead of always assuming
-  the portable one.
+    classifier. Lazy singleton (`load()`/`unload()`/`classify()`/
+    `status()`), not a managed server.
+  - `hydra_install.py` - installs Hydra's deps + `hydra-3.5.safetensors`.
+    Settings → Hydra, or `cli.py --install-hydra`.
+- `webui/vendor/rr_hydra/` - vendored inference-only source from
+  RedRocket's `hydra` package (renamed to avoid colliding with PyPI's
+  `hydra-core`). Imports are absolute (`from vendor.rr_hydra...`), never
+  relative - `core/` is a top-level package.
+- `webui/config/` - `settings.json` (gitignored), `models_source.json`
+  (checked in), `models_cache.json` (gitignored).
+- `readme/` - deep-dive/FAQ docs. New ones go here, not repo root.
+  - `faq-hydra-implications.md` - how `remove`/`constrain-remove`/
+    `enforce-remove` resolve nested e621 tag families.
+  - `faq-hydra-setting.md` - what the Confidence/Threshold sliders
+    (`hydra_metric`) do.
+  - `faq-caption.md` - sidecar-adoption case table (see below).
+  - `faq-linux-considerations.md` - what's actually Windows-specific.
+    Managed server only finds `llama-server.exe`; installer only fetches
+    Windows assets. External server mode has no platform dependency.
+- `run.cmd` / `cli.cmd` - launch GUI / CLI, auto-detect portable env vs.
+  `.venv`.
+- `setup-portable.bat` / `environment.bat` - build/activate portable
+  Python+Git under `system\git\`/`system\python\` (gitignored; `system\`
+  itself is tracked, holds `fix-wrappers.py`), install requirements.
+- `update.bat` - `git pull` (or reset+pull), refresh requirements. No
+  `.git`? Adopts the folder as a checkout (`git init` + remote + fetch +
+  `reset --hard`) instead of requiring an empty dir.
+- `setup-venv.bat` - `.venv\` alternative for systemwide git/Python.
+  Doesn't touch `system\`. No version pins in requirements.txt, so
+  `hydra_install.py` targets `sys.executable`, not a hardcoded path.
 
 ## VRAM / hardware constraint
 
-Consumer GPUs this needs to work on commonly have 8–16GB VRAM, often
-with several GB already spoken for by the desktop/browser/editor before
-the app even starts - actual free VRAM at caption time can end up
-smaller than a single model quant under `webui/models/`. Don't assume a
-high-VRAM card: `n_gpu_layers="auto"` (partial CPU offload) is relied on
-as the default behavior, not an optional fallback for edge cases, and
-that needs to keep working down to 12GB and 8GB cards, not just
-whatever the developer happens to have. Development/testing so far has
-mainly been on an RTX 5080 (16GB, typically ~9.5–10.5GB actually free)
-- treat that as one data point, not the floor.
+- Target: 8-16GB consumer GPUs, often with several GB already used by
+  desktop/browser/editor.
+- `n_gpu_layers="auto"` (partial CPU offload) is the default, not a
+  fallback - must work down to 8GB.
+- Dev machine: RTX 5080, 16GB, ~9.5-10.5GB actually free. One data
+  point, not the floor.
+- huihui-ai's abliteration lineage is the reliable refusal-free choice.
+  Other uploaders' "abliterated" tags have been confirmed to still
+  refuse - check lineage back to huihui-ai.
 
-huihui-ai's abliteration lineage has been the reliable choice for
-refusal-free vision models; other uploaders' "abliterated" tags have
-been confirmed to still refuse on the same content - check a model
-card's lineage back to huihui-ai before trusting the tag alone.
+## Server lifecycle
 
-## Major design decisions (llama-server lifecycle rewrite, 2026-08-28/30)
+- Modes: `"managed"` (spawn/own) / `"external"` (URL only). Managed
+  binds `127.0.0.1`, port **8901**.
+- No implicit lazy-start from the UI - explicit Start button or
+  once-at-launch autostart checkbox only. CLI's `get_client()`/
+  `resolve_server()` still lazy-start (no button to click headless).
+- "End llama server" gated on session ownership
+  (`_is_server_managed_by_us`) - never kills a server we didn't start.
+- Status: N/A / idle / error / running (managed) / unreachable /
+  connected (external). idle = never started; error = was running, then
+  stopped unexpectedly (edge-detect vs. previous poll). A deliberate
+  "End" click is never labeled error (`_expected_stop`).
+- Settings sub-tabs: Llama/Hydra/Image resizing/Captioning defaults/
+  Debug. The four non-Debug sub-tabs get `interactive=` disabled during
+  a caption job (`_settings_gating_ui`) - **tab-level only, not
+  per-field**. Entering Settings while disabled redirects to Debug,
+  restores the real sub-tab once re-enabled
+  (`current_settings_subtab_state`) - known-strange edge case, see
+  Open/deferred.
+- Save Settings: prompt-template applies immediately; switch to external
+  kills an owned managed server; switch to managed never auto-starts;
+  server-arg changes kill (if owned) + optionally restart. Guarded by
+  `_config_lock`.
 
-The server-management UX went through a full rewrite this session,
-replacing an earlier implicit-lazy-start design:
+## Hydra 3.5 second-stage tag classifier
 
-- Server modes are `"managed"` / `"external"` everywhere (renamed from
-  `"auto"`/`"remote"`; `config.load()` migrates an old `settings.json`
-  automatically). Managed always binds `127.0.0.1` (`server.MANAGED_HOST`)
-  - no more user-configurable host for it. Default managed port is
-  **8901** (was 8080).
-- No more implicit lazy-start from the UI: starting the managed server
-  is always an explicit action - a "Start llama server" button in
-  Settings→Llama, or an "autostart on launch" checkbox that only fires
-  once at app startup, never mid-session. (`get_client()`/
-  `resolve_server()` still lazy-start for the CLI - headless has no
-  "disabled button" concept and still needs that.)
-- "End llama server" is gated on **session ownership**
-  (`_is_server_managed_by_us` / `_session` dict) - this app only ever
-  offers to kill a process it itself started, never someone else's
-  server found already running on the same port.
-- Status is a 5-state label: N/A, idle, error, running (managed) /
-  unreachable, connected (external) - distinguishing "fresh, never
-  started" (idle) from "was running, then unexpectedly stopped" (error,
-  with a crash warning) via an edge-detect on the previous poll. A
-  deliberate "End llama server" click is explicitly NOT labeled "error"
-  (`_expected_stop` flag, set inside `_stop_managed()` itself).
-- Settings is restructured into Llama/Hydra/Image resizing/Captioning
-  defaults/Debug sub-tabs. The four operation-sensitive sub-tabs (not
-  Debug) get their own `interactive=` disabled while a caption job is
-  running (`_settings_gating_ui`) - **deliberately tab-level only, not
-  the fields inside them** (a field-level version was drafted and then
-  reverted - see git history around 2026-08-30 - because it wasn't what
-  was wanted). Separately, entering the Settings tab while those
-  sub-tabs are disabled redirects to Debug and remembers which sub-tab
-  you were genuinely on, restoring it once things re-enable
-  (`_settings_subtab_entry_ui`/`_on_settings_subtab_select`,
-  `current_settings_subtab_state`) - see the file for a known-strange,
-  not-fully-diagnosed edge case still open below.
-- Save Settings behavior differs per field category: the prompt-template
-  bundle applies immediately; switching to external kills an owned
-  managed server; switching to managed never auto-starts; server-process
-  args changed while managed kill (if owned) and optionally restart per
-  the autostart checkbox. A `_config_lock` guards the read-modify-write
-  of `current_cfg` + `config_mod.save()`.
-- Installing llama.cpp itself now has an in-UI installer (Settings →
-  Llama, plus `cli.py --install-llama`) - see `core/llama_install.py`
-  under Layout above. This was out of scope for the lifecycle-rewrite
-  pass described in this section and was added afterward.
+Appends Hydra's e621 tags after the VLM caption on their own line
+(`"<trigger>, <caption>\ntag1, tag2, ..."`) - grounds NSFW/explicit
+tagging the VLM is weak at.
 
-## Hydra 3.5 second-stage tag classifier (integrated 2026-08-31)
+- In-process (pure Python/torch), not a managed server.
+- Load/Unload is explicit (button + independent autoload-on-launch
+  checkbox), never implicit - `n_gpu_layers="auto"` can claim most/all
+  VRAM first, so loading Hydra after risks OOM. `hydra_enabled` only
+  gates *use* of an already-loaded model, never triggers a load.
+- Failures degrade gracefully everywhere (`captioner.py`, `cli.py`) -
+  catches `HydraError`, keeps VLM-only caption, never fails the job.
+- Heavy deps on demand, not in base requirements.txt (mirrors
+  `llama_install.py`). Weight (~1GB) in
+  `webui/models/RedRocket-Hydra/`, ignored by the GGUF scanner.
+- `hydra_implications` defaults to `"remove"` (collapse to most specific
+  tag per family), not `"inherit"` (whole-chain propagation ~doubled tag
+  counts in testing). `constrain-remove`/`enforce-remove` rejected -
+  see `readme/faq-hydra-implications.md`.
+- `hydra_metric` defaults to `"f0.5@0.1"`, not `"f1.0@0.1"` - best
+  tag-count/contradiction tradeoff in testing. Exposed as two sliders
+  (Confidence `f<beta>`, Threshold `@<min_precision>`) via a direct
+  linear mapping (`_hydra_metric_to_sliders`/`_hydra_sliders_to_metric`
+  in `app.py`), not upstream's non-linear curve. `csi<weight>@<precision>`
+  still works hand-edited into settings.json, just not in the UI.
+- `exclusive-groups`/`aliases`/per-category-prefix rewriting are
+  permanently out of scope - don't re-propose without the user raising
+  it. `hydra_exclude_categories` defaults to
+  `"artist copyright meta rating lore"`.
 
-A second-stage e621 tag classifier (`webui/vendor/rr_hydra/`,
-`core/hydra_classifier.py`/`core/hydra_install.py`, Settings → Hydra)
-appends Hydra's own tags after the VLM's caption, on their own line
-(`"<trigger>, <VLM paragraph>\ntag1, tag2, ..."`) to ground NSFW/explicit
-tagging the VLM alone is weak at. Prototyped separately first in a
-standalone `HydraTagger` repo; this is the real integration.
+### Hydra/llama VRAM coexistence
 
-- **In-process, not a second managed server.** Unlike llama-server,
-  Hydra is pure Python + torch running in the same interpreter as
-  webui/cli - a plain lazily-populated singleton
-  (`hydra_classifier.load()`/`unload()`/`classify()`/`status()`), not a
-  second `ManagedServer`/port/health-check apparatus.
-- **Loading is an explicit "Load Hydra model" / "Unload Hydra model"
-  action in Settings → Hydra (+ an independent autoload-on-launch
-  checkbox), never implicit.** `n_gpu_layers="auto"` means llama-server
-  can claim most/all free VRAM at startup - loading Hydra's model
-  *after* llama-server is already running could OOM or spill into slow
-  shared/system memory on cards near this project's 8GB floor. This
-  needed to be an observable, deliberate action rather than something
-  buried inside a caption call - same reasoning `core/server.py`
-  already established for llama-server itself.
-  `AppConfig.hydra_enabled` only gates *using* an already-loaded model
-  in `captioner.py`; it never triggers a load. When both
-  `autostart_managed_llama` and `hydra_autoload_model` are enabled, the
-  demo.load chain runs Hydra's autoload **before** llama-server's own
-  autostart (reversed 2026-09-01 - see "Hydra/llama VRAM coexistence"
-  below for why and for the belt-and-suspenders mechanism that makes
-  this safe regardless of ordering).
-- **Hydra failures degrade gracefully** - `captioner.py` catches
-  `HydraError` (deps/model missing, not loaded, OOM, whatever) and just
-  keeps the VLM-only caption; it never fails a whole caption/batch. Same
-  philosophy in `cli.py` (added 2026-09-01 - see "Hydra/llama VRAM
-  coexistence" below): `cli.py` previously never called
-  `hydra_classifier.load()` anywhere, so `hydra_enabled: true` in
-  `settings.json` silently did nothing on every CLI caption; now it
-  attempts a load before `resolve_server()`, logs a warning and
-  continues VLM-only on failure.
-- **Heavy deps on demand, not in base `requirements.txt`** - mirrors
-  `llama_install.py`'s own precedent. The model weight
-  (`hydra-3.5.safetensors`, ~1GB) lives in `webui/models/RedRocket-Hydra/`
-  (reuses `webui/models/`'s existing gitignore treatment); `core/models.py`'s
-  GGUF scanner ignores it since it only globs `*.gguf`.
-- **`webui/vendor/rr_hydra/`'s internal imports are absolute
-  (`from vendor.rr_hydra... import ...`), never `from ..vendor...`** -
-  `core/` is imported as a top-level package (no `webui` package
-  umbrella), so a relative import climbing above it fails. Caught via a
-  real load-a-real-model-and-classify-a-real-image smoke test, not just
-  `py_compile`.
-- **`hydra_implications` defaults to `"remove"`, not `"inherit"`** - a
-  real-image sweep (varying `hydra_metric` at a fixed image; see
-  `readme/faq-hydra-implications.md` for the mechanism) found `inherit`'s
-  whole-ancestor-chain propagation (e.g. `mammal` + `canid` + `canine` +
-  `domestic dog` + `herding dog` + `pastoral dog` + `german shepherd` all
-  firing together for one dog) roughly doubled the tag count at every
-  tested `hydra_metric` setting versus `remove`, which collapses each
-  family down to just its most specific present tag. `constrain-remove`/
-  `enforce-remove` were considered and rejected: `constrain-remove`'s
-  confidence-clamping has no visible effect here since `classify()`'s
-  `tag_text` discards probabilities entirely and `hydra_max_tags`
-  defaults to 0 (uncapped), and `enforce-remove` risks vetoing an
-  otherwise-confident specific tag over an unrelated ancestor's unlucky
-  score - undesirable when Hydra's whole purpose is grounding the
-  specific tags the VLM is weak at.
-- **`hydra_metric` defaults to `"f0.5@0.1"`, not `"f1.0@0.1"`** - same
-  sweep, at `remove`: `f0.5` landed in a "complements the caption, not a
-  wall of text" range (35–52 tags on the test image) without the
-  contradictory tags (e.g. `male penetrating female` beside `male/male`
-  content) that started reappearing above `~f0.9`.
-- **Settings → Hydra exposes `hydra_metric` as two sliders - Confidence
-  (`f<beta>`, 0.1–1.5) and Threshold (the `@<min_precision>` floor,
-  0.0–0.5) - not a raw text field.** `_hydra_metric_to_sliders()`/
-  `_hydra_sliders_to_metric()` in `app.py` convert directly (the slider
-  value *is* the number in the metric string), deliberately not
-  replicating upstream's non-linear slider-to-beta curve
-  (`classification.py`'s `simple_slider`/`log_interval`) - more
-  transparent, and it's what the actual tuning above happened against.
-  This also drops `csi<weight>@<precision>` from the reachable UI
-  (judged not worth a second control for; the field still accepts it if
-  hand-edited into `settings.json`).
-- **`exclusive-groups`, `aliases`, and per-category-prefix rewriting
-  (all real upstream Hydra capabilities - see `webui/vendor/rr_hydra/`)
-  are permanently out of scope, not just deferred (decided 2026-09-03).**
-  Anyone needing that level of tag-curation control for a second-stage
-  classifier is better served by a dedicated tool than by XenoTagger's
-  own "enrich the caption with some tags" feature - don't re-propose
-  exposing these in Settings → Hydra without the user raising it first.
-  `hydra_exclude_categories` defaults to `"artist copyright meta rating
-  lore"` (changed from empty 2026-09-03) - irrelevant categories for
-  LoRA tagging, filtered out of the box rather than left for every user
-  to discover and type in themselves.
+llama's `"auto"` adapts to reduced VRAM; Hydra's load doesn't -
+whichever claims VRAM first wins.
 
-## Hydra/llama VRAM coexistence (2026-09-01)
+- `_load_hydra_with_llama_coexistence()` (`app.py`) - shared by manual
+  Load and startup autoload. If Hydra is on CUDA and a managed server we
+  own is running: stop it, load Hydra, restart the server so `"auto"`
+  resizes around it. Skipped if Hydra is on CPU or a caption job is
+  active.
+- Startup order: Hydra autoload runs *before* llama autostart, so Hydra
+  gets first pick of clean VRAM.
 
-Flagged live: `hydra_enabled: true` with the model not actually loaded
-(never loaded, autoload off, or a load failed) was being silently
-ignored - `captioner.py` just keeps the VLM-only caption with no
-user-visible sign Hydra didn't fire. Investigating that surfaced a
-second, more fundamental issue: llama-server's own `n_gpu_layers="auto"`
-is the one piece in this app that gracefully adapts to reduced free VRAM
-(partial CPU offload) - `hydra_classifier.load()` has no such fallback,
-it's all-or-nothing onto one device. So whichever of the two claims VRAM
-*first* matters: if llama's "auto" goes first and grabs most of it,
-Hydra loading second is the one likely to just OOM.
+## Status/notification architecture
 
-Two things this drove, both in `app.py` unless noted:
+- **status bar** - single global `status_bar` (server health, loaded
+  model, active op), polled every 2s, shown on every tab.
+- **infotext bar** - per-tab textboxes, written only by that tab's own
+  handlers. Kept separate so live-progress writers don't stomp one-off
+  action feedback.
+- `_notify(text, level)` - the one place a popup toast fires. `"error"`
+  maps to a `gr.Warning`-styled toast, not `gr.Error` (see gotcha
+  below). Log-only messages call `log.<level>()` directly.
+- Background work (batch, downloads, installs) fires a one-shot
+  `_notify()` on completion/failure, not just a silent infotext update -
+  so finishing doesn't require staying on the tab. Downloads/installs run
+  off-thread, so they queue an announcement the next 2s poll relays.
+- Captioning shows live per-image stage in its tab's infotext bar (not
+  status bar). `caption_image()` takes `on_stage(text)`
+  (`"captioning"`/`"tagging (Hydra)"`), threaded from `run_batch()`.
+  Single-image/Review got the same background-thread + `queue.Queue`
+  treatment Batch already had, so there's something to yield from
+  mid-call.
 
-- **`_load_hydra_with_llama_coexistence()`** - the one shared generator
-  behind both the manual "Load Hydra model" button (`_load_hydra_model_ui`)
-  and the startup autoload path (`_autoload_hydra_model_ui`), so
-  correctness doesn't depend on either caller getting the details right
-  independently. If `hydra_device == "cuda"` and a **managed** llama-
-  server **this session owns** (`_is_server_managed_by_us` - same
-  ownership gate "Stop llama server" already uses; never touches an
-  external server, an orphaned process from a crashed previous run, or
-  someone else's server on that port) is currently running, it's stopped
-  first, Hydra loads against a clean VRAM budget, then llama-server is
-  restarted via `_try_start_managed_llama()` (the same shared start
-  primitive already reused by the Start button/autostart/a settings-save
-  restart) so `"auto"` resizes itself around whatever Hydra actually
-  claimed. Skipped entirely if `hydra_device == "cpu"` (no VRAM
-  contention) or if `_operation_blocked_by()` says a caption job is
-  active (killing the server mid-request would break it - in practice
-  the Hydra sub-tab is already disabled while one runs, so this is a
-  second-line-of-defense check, not the primary gate, same idiom
-  `_operation_blocked_by()` uses everywhere else). Fires one `_notify()`
-  popup on the final outcome, since a stop+restart can now take as long
-  as a full llama-server reload (10-30GB), not just Hydra's own ~1GB.
-- **Startup autoload order reversed**: the `demo.load` chain now runs
-  `_autoload_hydra_model_ui` *before* `_autostart_managed_llama_ui`
-  (previously the other way around, deliberately, specifically to
-  exercise the contention case during initial Hydra integration testing -
-  see the git history around 2026-08-31 for that older reasoning, now
-  superseded). With both autostart-llama and autoload-Hydra enabled,
-  Hydra now gets first pick of a clean VRAM budget at every launch,
-  llama's "auto" adapts around it. This is an optimization on top of
-  the shared function above, not a substitute for it - at true startup
-  `_load_hydra_with_llama_coexistence()`'s own stop/restart branch is
-  normally a no-op (nothing's started yet this early), but it's still
-  live as the real safety net for the orphaned-process edge case.
-- **`cli.py`** now calls `hydra_classifier.load(cfg)` (if `hydra_enabled`)
-  right before `resolve_server()` - same ordering logic, no stop/restart
-  dance needed since a fresh CLI process hasn't started (or connected to)
-  llama-server yet at that point. A load failure logs a warning and
-  continues VLM-only, matching `captioner.py`'s own degrade-gracefully
-  philosophy. Doesn't help if `resolve_server()` ends up *connecting to*
-  an already-running server owned by something else (e.g. the GUI) that
-  already claimed VRAM before this process even started - out of scope,
-  same "never touch what we don't own" boundary as everywhere else.
+## Batch sidecar adoption
 
-## Status/notification architecture (2026-08-31)
+`run_batch()` adopts a pre-existing `.txt.nlp`/`.txt.tags` sidecar
+instead of clobbering it - only the missing half gets a real model call.
+Full table in `readme/faq-caption.md`:
 
-Two distinct UI concepts, named deliberately differently so they're never
-confused in conversation or code:
+- `.txt.tags` only → VLM runs, Hydra skipped (tags trusted as-is).
+- `.txt.nlp` only → VLM skipped (caption reused verbatim), Hydra runs if
+  enabled.
+- Both exist → zero model calls, `.txt` synthesized directly.
+- `overwrite` checked → bypasses all of this, same as pre-existing `.txt`.
 
-- **status bar** - the single global `status_bar` component (Python/
-  Gradio version, llama-server health, loaded model, active operation),
-  polled every 2s by `status_timer` and shown on every tab.
-- **infotext bar** - the per-tab textboxes (`single_infotext`,
-  `batch_infotext`, `review_infotext`, `models_infotext`,
-  `settings_infotext`, `llama_lifecycle_infotext`,
-  `hydra_lifecycle_infotext`), each written only by its own tab's own
-  handlers. Deliberately kept per-tab, not merged into one shared field -
-  a merged box would have live-progress writers (e.g. batch's per-image
-  yield loop) stomping on one-off action feedback (e.g. Save Settings)
-  landing in the same tick.
+`caption_image()`'s `existing_caption` param skips the VLM call and
+reuses that text, still falling through to Hydra.
 
-`_notify(text, level="info"|"warning"|"error")` is the one place a
-Gradio popup toast gets fired, replacing what used to be scattered direct
-`gr.Info`/`gr.Warning` calls. `level` drives both the `log.<level>()`
-call (auto-captured by the debug log when enabled) and the popup type -
-see the `gr.Error` gotcha above for why `"error"` still pops a
-`gr.Warning`-styled toast, not a red one. A message that should only be
-logged, never popped, still just calls `log.<level>()` directly - `_notify`
-always pops.
+## Wrapper-path self-heal
 
-Long-running background work (batch captioning, curated-model/Hydra-model
-downloads, llama.cpp/Hydra-deps installs) now fires a one-shot `_notify()`
-popup on completion or failure, not just a silent infotext-box update -
-so finding out something finished doesn't require still being on the tab
-that started it (the original ask: "I start a few model downloads, let
-Hydra deps install, then go run a batch - I have no idea what's happening
-to the other things"). Batch fires it directly from its own generator
-(already a live Gradio callback throughout the run). Downloads/installs
-run on raw background threads with no Gradio request context, so each
-queues a one-shot (message, level) announcement (`_download_announces`,
-`_install_announce`, `_hydra_install_announce`) that the next 2s
-`status_timer` poll pops and relays through `_notify` - the same
-single-shot-flag idiom `_download_needs_refresh` already established, now
-also used to drive a popup instead of only a silent infotext update.
+A relocated portable install can leave `system\python\Scripts\*.exe`
+wrappers pointing at a dead `python.exe` path.
 
-Captioning now shows a live per-image stage in its own tab's **infotext
-bar** (not the status bar - that was tried first and reverted; the status
-bar doesn't need this level of detail, and it's the wrong field for it
-per the status-bar/infotext-bar split above). `core.captioner.caption_image()`
-takes an optional `on_stage(text)` callback, called with `"captioning"`
-before the VLM call and `"tagging (Hydra)"` before Hydra's, threaded
-through unchanged from `core.batch.run_batch()`.
-
-Infotext boxes only update on a yield, never on an independent poll, so
-showing a *live* stage change means the caller has to actually yield
-when the stage changes, not just before/after the whole call. Batch
-already ran `caption_image()` inside a background worker thread feeding
-a `queue.Queue` that its generator drains and yields from (needed for
-per-image progress) - `on_stage` there just pushes a `("stage", text)`
-item onto the same queue, tagged separately from `("progress", ...)`
-items so the drain loop can tell them apart. Single-image and Review
-didn't have that shape at all (they called `caption_image()` directly
-and only yielded once before, once after) - both got the same
-background-thread-+-queue treatment added specifically so `on_stage` has
-something to push into and the generator has something to yield from
-mid-call.
-
-## Batch sidecar adoption (2026-09-02)
-
-`core.batch.run_batch()` used to only ever check whether `.txt` existed
-before deciding to (re)generate an image from scratch - a pre-existing
-`.txt.nlp`/`.txt.tags` sidecar with no `.txt` yet (e.g. hand-renamed in
-from another captioning/tagging tool) was ignored and clobbered by a full
-fresh `caption_image()` call. Now that content is adopted instead: only
-whichever half is actually missing gets a real model call. Full case
-table in `readme/faq-caption.md` (see Layout above); short version:
-
-- `.txt.tags` exists, `.txt.nlp` doesn't → VLM runs as normal, but Hydra
-  is skipped for that image even if `hydra_enabled` - an adopted
-  `.txt.tags` is trusted as-is, never touched by a second tag source.
-- `.txt.nlp` exists, `.txt.tags` doesn't → the VLM call is skipped
-  entirely (the adopted caption is reused verbatim, no trigger word
-  reapplied), and Hydra runs to fill in the missing tags if enabled.
-- Both sidecars already exist → zero model calls, `.txt` is just
-  synthesized from the two of them directly.
-- `overwrite` checked bypasses all of this - every image is treated as
-  fully fresh, sidecars included, exactly like it already did for a
-  pre-existing `.txt`.
-
-Implementation-wise, `core.captioner.caption_image()` gained an
-`existing_caption` parameter: when given, it skips the VLM call and
-reuses that text as `vlm_caption` verbatim, still falling through to
-Hydra tagging as normal below it - letting `run_batch()` route the
-"adopt caption, still need tags" case through the exact same call/outcome
-handling as a normal run (a zero-cost stand-in `CaptionResult` keeps
-`outcome.truncated`/`resize_note` readable uniformly either way), rather
-than needing a separately-maintained code path. The "adopt tags, skip
-Hydra" case reuses `dataclasses.replace(cfg, hydra_enabled=False)` for
-just that one `caption_image()` call instead of touching `captioner.py`
-again - `cfg` itself (used everywhere else, e.g. the truncation-reason
-message) is left untouched.
-
-## Bootstrap/update scripts redesign (2026-09-02)
-
-Reworked how someone gets from "nothing" to a running app, across the
-deployment scenarios that actually matter:
-
-1. A prepackaged full portable zip (planned, not yet built) - ships with
-   `.git`, the portable toolchain, and deps already installed, since
-   it'll be built by zipping up an already-cloned-and-set-up checkout.
-   Needs nothing beyond the shared fixes below.
-2. `git clone` (user already has git) - `setup-portable.bat`/`setup-venv.bat`
-   run once as before.
-3. GitHub's "Download ZIP" (no git, has source incl.
-   `webui/requirements.txt`, but no `.git`) - setup scripts already work
-   unchanged; `update.bat` needed a way to start tracking updates
-   without an existing `.git`.
-4. Nothing at all - just `setup-portable.bat` downloaded by hand into an
-   empty folder. The adopt-in-place mechanism below already covered this
-   as a side effect of solving #3 (an empty directory and a non-git
-   source tree hit the same code path), so this only needed
-   `setup-portable.bat` to fetch `environment.bat` and `update.bat`
-   itself (both guarded on "not already present", so a re-run never
-   clobbers a real checkout's tracked copies) and auto-chain into
-   `update.bat` once they land - a true one-file bootstrap.
-
-Two changes cover all four:
-
-- **`update.bat` adopts a non-git folder instead of requiring an
-  empty one for cloning.** `git clone` refuses a non-empty target
-  directory, which a ZIP extraction (or a folder that already has these
-  two `.bat` files in it) always is. Instead, when no `.git` is found:
-  `git init -b main`, `git remote add origin`, `git fetch origin`,
-  `git reset --hard origin/main`, then
-  `git branch --set-upstream-to=origin/main main` so a later plain
-  `git pull` has tracking info. `git reset --hard` (unlike `checkout`)
-  has no "untracked file would be overwritten" protection - it just
-  writes the target tree over whatever's already there - which is
-  exactly the adopt-in-place behavior wanted here, and is a well-known
-  idiom for turning an existing directory into a clone without an empty
-  target. Once adopted, it falls through to the same pull logic used for
-  an already-existing checkout.
-- **Dependency install moved from a setup-time-only step to something
-  `update.bat` also does, after every pull/adopt.** Previously
-  only `setup-portable.bat`/`setup-venv.bat` ran
-  `pip install -r webui/requirements.txt`, so pulling new code via
-  `update.bat` alone never refreshed deps even if
-  `requirements.txt` changed upstream. Now `update.bat` re-runs it
-  against whichever environment(s) actually exist locally
-  (`system\python\python.exe` and/or `.venv\Scripts\python.exe`,
-  checked independently since both can coexist) every time it updates
-  the code. `pip install -r` without `--upgrade` is a no-op fast local
-  check when everything's already satisfied (no network hit), so this
-  doesn't add meaningful cost to the common case. Deliberately kept in
-  the setup scripts too, not removed - `webui/requirements.txt` is
-  already present by the time either setup script runs in scenarios 2
-  and 3, so there was no actual circular dependency to fix there; only
-  `setup-portable.bat`'s deps-install got a guard
-  (`if exist webui\requirements.txt`) so it degrades to a skip-with-a-note
-  instead of a hard failure in scenario 4, where the repo isn't in place
-  yet when it runs.
-- Also collapsed `run-tagger.cmd`/`tag-cli.cmd`/`run-tagger-venv.cmd`/
-  `tag-cli-venv.cmd` into `run.cmd`/`cli.cmd` (see Layout above) as part
-  of the same pass - one pair of cryptically-named-per-setup-path
-  launchers was extra friction for the same "make this easy for someone
-  who's never done this before" goal driving the rest of this rework.
-- **`setup-portable.bat` fetches `environment.bat`/`update.bat` from
-  `raw.githubusercontent.com` (via the same `curl` it already uses for
-  WinPython/Git) and auto-chains into `update.bat` when
-  `webui\requirements.txt` isn't present yet** - scenario 4 above. Only
-  fetches whichever of the two is actually missing, and pauses first
-  with an explicit "Press any key to fetch files from GitHub ..."
-  message before doing so, so a truly single-file download doesn't
-  silently reach out to the network without the user noticing. Once
-  `update.bat` runs, its own `git reset --hard` supersedes both fetched
-  files with their real tracked versions from the repo.
-
-## Wrapper-path self-heal (2026-09-02)
-
-A relocated portable install (build in one folder, zip it, extract
-somewhere else - the normal case for anyone downloading a release) can
-leave `system\python\Scripts\*.exe` console-script wrappers (`pip.exe`
-and friends) pointing at a `python.exe` path that no longer exists.
-These wrappers are a small precompiled PE launcher stub concatenated
-with a `#!<path-to-python.exe>\n` shebang line and a tiny zip
-(`__main__.py`) - `zipfile`/the launcher both locate the zip by scanning
-from the end of the file, tolerant of whatever precedes it, which is
-what makes patching just the shebang line safe even when the
-replacement path is a different length.
-
-`system\fix-wrappers.py` does this patching (`system\` is no longer
-wholly gitignored - only `system\git\` and `system\python\` are, see
-Layout above; `fix-wrappers.py` itself is a tracked file, not part of
-the downloaded toolchain), and `environment.bat` runs it on every launch
-(both interactive and `passive` mode, so `run.cmd`/`cli.cmd` get it
-too), silently unless it actually fixes something. It takes one arg
-(the Scripts dir) and, for any wrapper whose shebang is a non-bare path
-(has a `\` or `/`) that no longer resolves to a real file, rewrites it
-to bare `python.exe` - not the current absolute path, since that would
-just need re-fixing on the next move too. A bare reference is left alone
-(already location-independent, resolves via the `%DIR%\python` entry
-`environment.bat` already puts on `PATH` - see line 3), and an absolute
-path that still resolves (nothing moved) is left alone too. No "remember
-the last known location" marker file needed - the check is
-self-determining every time, cheap enough to run unconditionally on
-every launch.
-
-**Important finding, caught live before shipping:** the first version of
-this checked "did the environment's folder path change since last run"
-and unconditionally rewrote every wrapper's shebang to the current
-absolute path on a change. Running that for real against this repo's
-actual `system\python\Scripts\` revealed every wrapper there already had
-a bare `python.exe` shebang - that first version blindly overwrote all
-33 of them with a hardcoded absolute path, a regression (replaces an
-already-location-independent reference with a rigid one). Caught
-immediately (`pip.exe` broke without `PATH` set), reverted, redesigned
-into the "only fix what's actually broken" version described above.
-
-**Second, much bigger finding, from chasing down *why* those wrappers
-were already bare:** it is not a property of pip in general, and not
-something `setup-portable.bat` does - it turned out to be specific to
-WinPython's own bundled pip build. Confirmed by downloading WinPython
-64-3.13.15.0dot fresh from SourceForge and inspecting its pip before any
-other setup step touches it: WinPython bundles a pip that reports
-version `26.2.1` and already contains a one-line fix in its vendored
-`distlib/scripts.py` (`_get_shebang()`'s fallback branch wraps
-`get_executable()` in `os.path.basename()`, writing `python.exe` instead
-of the full `sys.executable` path). The *real*, official PyPI release of
-`pip==26.2.1` does **not** contain this line - verified independently
-against the git tag, distlib's own upstream source, and a neutral
-(non-pip) extraction of the actual `.whl` straight from
-`files.pythonhosted.org`. Two different builds are sharing one version
-string; WinPython's is a fork/patch of pip specifically for this, not
-upstream behavior.
-
-This matters because `setup-portable.bat`'s own `pip install --upgrade
-pip ...` step (the `:update_pip` label) never actually replaces
-WinPython's bundled pip in practice - pip's upgrade check only compares
-version numbers, and WinPython's copy already reports `26.2.1`, so it's
-a silent no-op every time (confirmed: `pip.exe`'s file timestamp matches
-WinPython's own build time, not the setup run time). The fixed behavior
-persists purely because no newer pip has been published on PyPI since
-WinPython 3.13.15.0 was built. The instant pip publishes anything newer
-than `26.2.1`, that upgrade step stops being a no-op, silently pulls the
-real (non-bare-shebang) PyPI release, and every wrapper installed after
-that point goes back to hardcoding an absolute path - with no warning,
-on whatever machine happens to run setup/update next. This is exactly
-the scenario `fix-wrappers.py` exists for: not a hypothetical
-future-proofing measure, but a dependency on an upstream release cadence
-this project doesn't control, and one that could flip on any given day.
-It also directly matches the class of bug seen in the earlier
-ComfyUI/Forge-portable discussion (both have real, currently-broken
-absolute-path wrappers baked in from their own CI/build-machine paths -
-confirmed by inspecting real installs of both on this machine) and in a
-plain `venv`'s pip (confirmed with a throwaway venv-build-then-move
-test) - neither of those get WinPython's patched pip at all. `.venv`
-(`setup-venv.bat`'s path) is deliberately not covered by
-`fix-wrappers.py` - see Open/deferred below.
-
-**`system\fix-pip-shebang.py`** (added 2026-09-02, standalone/manual for
-now - see Open/deferred below) directly counters the scenario above: if
-a pip upgrade ever does silently replace WinPython's patched
-`distlib\scripts.py` with the official unpatched one, this restores the
-one-line patch (wraps `get_executable()` in `os.path.basename(...)` in
-`_get_shebang()`'s `elif not sysconfig.is_python_build():` branch) so
-newly-installed packages keep getting relocatable bare-`python.exe`
-wrappers instead of hardcoded paths. Deliberately not a blind text
-replacement - it parses the file with `ast`, locates that exact
-assignment structurally, and only touches it if the right-hand side is
-confidently recognized as either the patched or unpatched form; anything
-else (pip's internals having changed in some unrelated way) is left
-untouched with a warning rather than guessed at. Verified against a live
-unpatched `system\python` (patches successfully, confirmed idempotent,
-confirmed a fresh package install afterward actually produces a bare
-shebang again), an already-patched copy (correctly no-ops), and a
-synthetic "unrecognized shape" file (correctly refuses rather than
-touching it).
+- `system\fix-wrappers.py` (tracked) rewrites any broken non-bare
+  shebang to bare `python.exe` (not the current absolute path - would
+  need re-fixing again next move). Bare/still-resolving shebangs left
+  alone. Runs silently on every launch via `environment.bat`.
+- WinPython's bundled pip already writes bare shebangs (patched
+  `distlib/scripts.py`) - but only until PyPI publishes a newer pip than
+  WinPython's patched build, at which point `pip install --upgrade pip`
+  silently pulls the unpatched version.
+- `system\fix-pip-shebang.py` (standalone/manual, not wired in - see
+  Open/deferred) restores that one-line patch if it ever regresses.
+  Parses with `ast`, only touches the exact recognized assignment,
+  refuses on anything unrecognized.
+- `.venv` (`setup-venv.bat`) isn't covered by either script.
 
 ## House rules
 
-- **No venv, ever - for this repo's own portable-env path.** Everything
-  installs straight into `system\python`. Never invoke
-  `system\python\Scripts\*.exe` directly - always
-  `system\python\python.exe -m pip install ...` / `python.exe script.py`.
-  This is about `system\python` specifically, not a blanket objection to
-  venvs everywhere: `setup-venv.bat` (see Layout above) offers an
-  end-user-facing `.venv\` as an explicit alternative for anyone who'd
-  rather not use the portable environment at all. Don't reintroduce a
-  venv *inside* the portable-env workflow itself, e.g. as some
-  in-between layer under `system\python` - that's what this rule
-  actually rules out.
-- **No custom CSS unless a real built-in Gradio option was checked and
-  confirmed absent first.** `webui/ui_css.py` holds the only two custom
-  rules, each commented with the built-in option that was ruled out.
-- **Never elevate the root logger to DEBUG** - elevate only
-  `logging.getLogger("core")` and the app's own `"app"` logger (fixed
-  name, not `__name__`). Third-party libraries get noisy fast otherwise.
-- Before committing, review `git status`/`git diff` - nothing here
-  needs the old "don't touch main-originated files" branch discipline,
-  that was portable-env-specific and no longer applies.
+- **No venv inside the portable-env path, ever.** Everything installs
+  into `system\python`. Never call `system\python\Scripts\*.exe`
+  directly - always `system\python\python.exe -m pip ...` /
+  `python.exe script.py`. `setup-venv.bat`'s `.venv\` is a separate,
+  explicit alternative - fine on its own, just don't nest one inside
+  the portable-env workflow.
+- **No custom CSS unless a built-in Gradio option was checked and ruled
+  out first.** `webui/ui_css.py` has the only two rules, each commented
+  with what was ruled out.
+- **Never elevate the root logger to DEBUG** - only
+  `logging.getLogger("core")` and `"app"` (fixed name).
+- Review `git status`/`git diff` before committing.
 
-## Gradio gotchas hit in this codebase (don't re-discover these)
+## Gradio gotchas (don't re-discover these)
 
-- `gr.SelectData.value` for a `Tab` is **always its label, never its
-  `id`** - confirmed via `gradio/layouts/tabs.py`'s own docstring. An
-  `id` is required to ever target a tab via `gr.update(selected=...)`;
-  without one, a push silently matches nothing. Every `gr.Tab(...)`
-  that's ever a `selected=` target needs an explicit `id=`.
-- A bare `gr.update()` does **not** reliably self-correct/forget a prior
-  real push to a `Tabs` component's `selected=` once the user navigates
-  away and back - always explicitly assert the destination in both
-  directions, never rely on a no-op to "leave it alone."
-- `.select()` fires only on a genuine user click, never on a server-
-  pushed `gr.update(selected=...)` - reliable for top-level `Tabs`, but
-  a **nested** `Tabs` inside a `Tab` that's itself being switched into
-  has, at least once, appeared to fire `.select()` anyway (never fully
-  root-caused - see the open item below).
-- Switching away from and back to a top-level tab remounts nested
-  `Column`s back to their build-time-declared `visible=`, not the
-  latest server-pushed state.
-- `gr.Group()` produces ugly stretched/gapped layouts with mismatched-
-  height siblings - only use for uniform-height stacked rows.
-- `gr.Image` output components refuse to serve a raw file path outside
-  the app's CWD/system temp dir - load via PIL into memory instead.
-- `os.execv`-based restart on Windows spawns a fresh process under an
-  untracked PID - look up whatever's bound to port 7901, don't trust a
-  previously-known task ID.
-- `tkinter` save/browse dialogs only work when the browser and Python
-  process are on the same machine.
-- `gr.Error` is not a fire-and-forget popup like `gr.Info`/`gr.Warning` -
-  calling it just constructs an exception object; it only displays
-  anything if actually `raise`d, and raising it aborts whatever function
-  raised it (Gradio's own dispatcher catches it to render the modal).
-  `app.py`'s `_notify()` deliberately maps its `"error"` level to a
-  `gr.Warning`-styled toast for this reason, not `gr.Error` - none of
-  its callers (mostly 2s-timer polling handlers) can afford to have a
-  popup silently abort them mid-function.
+- `gr.SelectData.value` for a `Tab` is always its label, never `id`.
+  Every `Tab` targeted by `gr.update(selected=...)` needs an explicit
+  `id=`.
+- A bare `gr.update()` doesn't self-correct a prior `Tabs.selected=`
+  push - always assert the destination explicitly, both directions.
+- `.select()` fires only on genuine user click, not a server push -
+  except a nested `Tabs` inside a `Tab` being switched into has, at
+  least once, fired it anyway (not root-caused).
+- Leaving and returning to a top-level tab remounts nested `Column`s to
+  build-time `visible=`, not latest server state.
+- `gr.Group()` gives ugly stretched/gapped layouts with mismatched-height
+  siblings - only use for uniform-height stacked rows.
+- `gr.Image` output won't serve a raw file path outside CWD/temp - load
+  via PIL into memory instead.
+- `os.execv` restart on Windows spawns an untracked PID - look up
+  whatever's bound to port 7901, don't trust a known task ID.
+- `tkinter` dialogs only work when browser and Python are the same
+  machine.
+- `gr.Error` only displays if actually `raise`d, and raising aborts the
+  function. `_notify()` maps `"error"` to `gr.Warning`-styled, not
+  `gr.Error` - most callers are 2s-poll handlers that can't afford an
+  abort.
 
 ## Open / deferred
 
-- **`.venv` (`setup-venv.bat`) relocation - not covered by the
-  wrapper-path self-heal above, deliberately.** A real, plain CPython
-  venv (unlike this repo's WinPython-based `system\python`, see
-  "Wrapper-path self-heal" above) does bake an absolute path into its
-  `Scripts\*.exe` wrappers the normal way, so it's exposed to the same
-  class of bug - but a moved/broken `.venv` is a different kind of
-  problem: the usual real-world advice for a broken venv is just "delete
-  it and recreate it," and a `.venv` can break in ways `fix-wrappers.py`
-  doesn't address at all (e.g. `pyvenv.cfg`'s own `home = <path>` line
-  pointing at a base interpreter that's moved or gone, which is a
-  different file/format than the `Scripts\*.exe` wrappers). Needs its
-  own in-flight checks (does `pyvenv.cfg`'s recorded base interpreter
-  still exist, etc.) before deciding whether to patch-in-place or just
-  tell the user to recreate it - not started yet.
-- **`system\fix-pip-shebang.py` is standalone/manual, not wired into
-  `environment.bat`.** Asked and explicitly deferred (2026-09-02, "yeah
-  just leave it as it is for now") - unlike `fix-wrappers.py`, this one
-  patches pip's own vendored source rather than just repairing already-
-  generated wrapper files, which felt like it warranted a check-in
-  before making it run automatically on every launch. Revisit if the
-  user brings it back up.
-- **Broad UI-logic refactor, not yet scoped.** Much of the app predates
-  this session's status-bar/infotext-bar/`_notify` consolidation (see
-  "Status/notification architecture" above) and still carries older UI
-  patterns from before that. Revisit the rest of the app against the new
-  logic once it's settled. User's own remark on this, verbatim: "no more
-  lazy start and ui elements enabled/disabled redesign" - i.e. don't let
-  the old implicit-lazy-start style creep back in anywhere during the
-  refactor, and the widespread `interactive=True/False` enable/disable
-  pattern (Run/Interrupt gating, Settings sub-tab gating, etc.) is itself
-  a candidate for redesign here, not just something to preserve as-is.
-- **Settings sub-tab redirect has a known "strange effect," not fully
-  diagnosed** - mostly works (tab-level disable while a job runs,
-  redirect-to-Debug on entry, restore the real sub-tab afterward via
-  `current_settings_subtab_state`), but the user flagged residual odd
-  behavior after live testing on 2026-08-30. Revisit before relying on
-  it further; the nested-`Tabs`-fires-`.select()`-anyway gotcha above is
-  the leading suspect.
-- **Settings tab visual harmonization (Llama vs. Hydra sub-tabs) - done
-  (2026-09-01).** Both sub-tabs now share the same shape: a top intro
-  Markdown pulled from a `core.config` variable (`LLAMA_TAB_INTRO`,
-  mirroring `MODELS_TAB_INTRO`'s own precedent), a management `gr.Group()`
-  with side-by-side action buttons, an autostart/autoload checkbox above
-  the lifecycle buttons, and a lifecycle infotext moved to the very
-  bottom of the sub-tab (lands right above the shared Save settings/
-  Restart app row, since both sub-tabs stack inside one `Tabs()` that
-  sits above that row). Llama's install/reinstall flow now reads real
-  installed-backend state (`llama_installed_info()`) to preselect the
-  backend dropdown and swap the button between "Install llama.cpp"/
-  "Reinstall llama.cpp"; `abort_install_btn` is now actually gated on
-  install-in-progress (previously always clickable). Hydra's pip-output
-  Textbox was removed - `core.hydra_install.install_deps()` already
-  unconditionally `log.debug()`s every line regardless of any UI
-  callback, so nothing was lost; only completion/failure surfaces to the
-  UI now, via infotext + a `_notify()` popup. Hydra's "Download Hydra
-  model" button/progress row moved off this sub-tab entirely, onto the
-  Models tab's new "Hydra model" section (see below).
-  `installed_backend_text` (the "Installed: CUDA 12.4 ... (b10701)" line)
-  now sits right under the tab's intro Markdown, the same position
-  `hydra_status_md` occupies on the Hydra tab.
-- **Follow-up (2026-09-01, same day): the gr.Group()-squashes-buttons
-  problem confirmed live on the Models tab (see below) turned out to
-  also affect the Llama sub-tab's button rows** - `managed_server_group`/
-  `external_server_group` were `gr.Group(visible=...)`, used purely to
-  toggle a whole section's visibility together, but Group's bordered/
-  connected-siblings styling was squashing "Install llama.cpp"/"Abort
-  install"/"Start llama server"/"Stop llama server"/"Verify" into merged
-  slabs the same way it did on Models. Fixed by swapping both to
-  `gr.Column(visible=...)` - same visible= toggle behavior, no bordering
-  side effect. Hydra's Install/Load/Unload button Row had its own
-  dedicated (single-child) `gr.Group()` wrapper too, removed the same
-  way. A plain `gr.Markdown("---")` (real CommonMark `<hr>`, no CSS) now
-  separates the Models tab's two sections.
-- **Follow-up #2 (2026-09-01): the Llama sub-tab's config fields (port,
-  GPU layers, context size, extra args, install-status caption,
-  Autostart) now sit inside their own `gr.Group()` for a shared grey
-  background matching Server mode's box** - requested live after seeing
-  that range sitting on the plain black background next to Server
-  mode's own box. The backend-dropdown+Install+Abort Row was
-  deliberately kept OUTSIDE this Group (same reasoning as the fix right
-  above - a Row of buttons inside a Group loses its inter-button gaps
-  and merges into one flat bar), so the grey box actually starts at the
-  install-status row, not literally at the dropdown. `autostart_managed_
-  llama` moved from below Extra args to right after the installed-
-  backend caption (above Port) and is now only `interactive=` once
-  `llama_installed_info()` is not None (there's nothing to autostart
-  otherwise) - kept live via the same `_llama_install_status_ui` poll
-  that already drives the Install button's label/interactive.
-- **Other 2026-09-01 UI redesign items, all done alongside the Settings
-  harmonization above**: recursive batch/review scanning was removed
-  entirely (UI checkbox, `AppConfig.recursive_batch`, `find_images()`/
-  `run_batch()`/`scan_review_status()` params, `cli.py --recursive`) -
-  batch/review only ever process the given root directory now, no
-  subfolder walk. Batch's Run/Interrupt buttons moved to just above
-  `batch_infotext`. Review's Browse button now chains an automatic
-  `review_scan_ui` call (Scan button label unchanged - typing a path by
-  hand still needs a manual Scan/click, no auto-scan-on-Enter). The
-  Models tab is now two plain (ungrouped) sections under a `### VLM
-  model`/`### Hydra model` Markdown title each - a `gr.Group()` wrap was
-  tried first and reverted live: it merged the mismatched-height
-  Markdown/Dataframe/button-Row children into one stretched grey slab
-  instead of leaving each its own look (the exact failure mode the
-  gr.Group() gotcha below already warns about - Group is only safe for
-  genuinely uniform stacked rows, confirmed again here the hard way).
-  "VLM model" is the pre-existing table/dropdowns/buttons, now with
-  `buttons=[]` on
-  `models_table` to drop Gradio's default copy/fullscreen toolbar
-  buttons - a real `gr.Dataframe(buttons=...)` param, not CSS, following
-  `review_table`'s existing precedent) and a new "Hydra model" section:
-  a matching 4-column one-row `gr.Dataframe` (`_hydra_models_table_rows()`),
-  a Download button (moved here from Settings → Hydra, now writes to
-  `models_infotext` instead of `hydra_lifecycle_infotext`), a "Manage
-  Hydra" button (`_goto_hydra_settings_ui()`, mirrors the pre-existing
-  `_goto_llama_settings_ui()`), and a Refresh button that's deliberately
-  just the same `models_refresh_ui` handler as the VLM section's own
-  Refresh - it doesn't actually rescan the Hydra row (that only happens
-  on page load or after a Load/Unload/Install click chains
-  `_hydra_install_status_ui`), kept intentionally minimal per explicit
-  user direction ("useless for now").
-- **Follow-up #3 (2026-09-01, later the same day): the Models tab's two
-  download-status rows (one per section) were merged into one.** Both
-  the VLM section's row and the Hydra section's own row were wired to
-  the same `_download_status_ui()`/global `_download_current` state, so
-  whichever download was actually active showed identically (and
-  confusingly) in both places at once - e.g. the Hydra row showing a
-  VLM download's progress, which live-read as "my Hydra download got
-  silently cancelled" when it hadn't. There's only ever one real
-  download in flight regardless of which section queued it (both share
-  `_download_enqueue`/`_download_queue`/`_download_worker`), so the fix
-  was to delete the duplicate `hydra_download_status_row`/
-  `hydra_download_status_text` entirely and move the one real
-  `download_status_row` (bar + "Abort all downloads" button) below both
-  sections, behind its own `gr.Markdown("---")` divider.
-  `_hydra_download_model_ui()` now also returns that row's update
-  directly (mirroring `models_action_ui`'s own immediate-refresh
-  pattern) instead of waiting for the next 2s poll.
-- **Batch tab: new "Send to Review" button** - a third, gray
-  (default-variant) button in the same Row as Run batch/Interrupt,
-  `interactive=` only when `batch_dir` is a real, existing directory
-  (`batch_dir.change()`-driven). There's no cheap way to know whether
-  the last batch run in that directory actually succeeded - `batch.py`
-  is deliberately stateless (see its own module docstring) - so path
-  validity is the only check, by design. Clicking it (`_send_batch_to_
-  review_ui`, wired down in the Review tab's own section since
-  `review_dir`/`review_scan_ui`/`_review_nav_outputs` aren't defined yet
-  that early in the file - same reason `hydra_models_manage_btn`'s click
-  is wired inside the Settings tab body) switches `main_tabs` to Review
-  (needed adding `id="review"` to that Tab - every `gr.update(selected=
-  ...)` target needs one, see the Gradio gotcha below), copies
-  `batch_dir` into `review_dir`, and chains into the same
-  `review_scan_ui` scan Review's own Browse button uses.
-- **Model management / llama.cpp setup UI**: curated GGUF downloading
-  is built (`core/downloads.py`, `models_source.json`). The same
-  pattern is now applied to llama.cpp itself via `core/llama_install.py`
-  (CUDA 13.3/12.4, ROCm, CPU backend picker; no auto-detect heuristic -
-  the dropdown just defaults to CUDA 13.3 and the user picks otherwise).
-- **Hydra tagger integration** - done, see "Hydra 3.5 second-stage tag
-  classifier" above. A real `pip install torch...`/model download plus
-  live GPU classify passes (a throwaway metric-sweep script and the real
-  Settings → Hydra sliders in the running GUI) have now happened against
-  real images on real hardware, and `hydra_metric`/`hydra_implications`
-  defaults were retuned as a result. `exclusive-groups`/`aliases`/
-  per-category-prefix rewriting are permanently out of scope, not an
-  open item - see that section's own closing note.
-- **Llama tab's download progress bar - user-owned follow-up, not yet
-  scheduled.** During the 2026-09-01 harmonization pass, whether Hydra's
-  model-download progress display (on the Models tab's "Hydra model"
-  section) should visually match llama.cpp's own byte-progress `<progress>`
-  bar (`llama_install_status_text`, `_llama_install_status_ui`) came up
-  but was explicitly deferred: "I will revisit the llama download bar,
-  leave as is for now." Don't start on this without the user bringing it
-  back up first.
-- Smaller deferred items: an "unsaved Settings changes" indicator; the
-  brief tab-disabled flash before redirect on a fresh page load; a
-  possible rare race between overlapping Start/End llama clicks.
-- Live UI behavior in this environment can only be verified by
-  scripted simulation (`py_compile` + `build_app()` + mocked event
-  handlers) - there is no browser access here. Treat "verified" claims
-  in git history/PR descriptions accordingly; a live pass by the user
-  is still the real test.
+- `.venv` relocation - not covered by self-heal. Needs its own checks
+  (`pyvenv.cfg`'s base-interpreter path, etc.) before deciding
+  patch-in-place vs. recreate. Not started.
+- `fix-pip-shebang.py` not wired into `environment.bat` - deferred
+  pending user check-in.
+- Broad UI-logic refactor, not scoped. Much of the app predates the
+  status-bar/infotext-bar/`_notify` consolidation. User: "no more lazy
+  start and ui elements enabled/disabled redesign" - don't let old
+  implicit-lazy-start patterns creep back in; the `interactive=True/False`
+  pattern itself is a redesign candidate.
+- Settings sub-tab redirect has a known "strange effect," not diagnosed
+  - nested-`Tabs`-fires-`.select()` gotcha is the leading suspect.
+- Llama tab's download progress bar vs. Hydra's - visual match deferred
+  by user, don't start without it being raised again.
+- Smaller: "unsaved Settings changes" indicator; brief tab-disabled
+  flash before redirect on fresh load; possible rare race on overlapping
+  Start/End llama clicks.
+- No browser access here - UI behavior can only be verified by scripted
+  simulation (`py_compile` + `build_app()` + mocked handlers). A live
+  pass by the user is still the real test.

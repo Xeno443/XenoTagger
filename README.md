@@ -61,6 +61,10 @@ XenoTagger requires a llama.cpp build and a vision-capable GGUF model to
 caption images. Both can be installed from within the app, from the
 Models and Settings tabs, after the first launch.
 
+For a full walkthrough of these steps, and a reference for every tab in
+the interface, see the [user manual](readme/README.md) - start with its
+[first run walkthrough](readme/firstrun.md).
+
 ## Models
 
 The Models tab offers a curated selection of vision models for download,
