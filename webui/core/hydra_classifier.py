@@ -115,9 +115,18 @@ def load(cfg: AppConfig) -> None:
             raise HydraError(f"Could not import Hydra's dependencies: {exc}") from exc
 
         device = cfg.hydra_device
-        if device == "cuda" and not torch.cuda.is_available():
-            log.warning("hydra_classifier.load(): CUDA requested but not available - falling back to CPU")
-            device = "cpu"
+        try:
+            if device == "cuda" and not torch.cuda.is_available():
+                log.warning("hydra_classifier.load(): CUDA requested but not available - falling back to CPU")
+                device = "cpu"
+        except Exception as exc:  # noqa: BLE001 - e.g. a CUDA runtime left in a bad
+            # state by a torch import that raced an in-progress dependency
+            # install (see _hydra_install_status_ui's own comment) - must
+            # not escape as a raw, uncaught exception, since torch.cuda
+            # can stay broken for the rest of this process even after the
+            # install finishes, and every retry would otherwise crash the
+            # same way instead of surfacing a clean, dismissable message.
+            raise HydraError(f"Could not query CUDA availability: {exc}") from exc
 
         log.info("Loading Hydra model from %s onto %s ...", MODEL_PATH, device)
         try:

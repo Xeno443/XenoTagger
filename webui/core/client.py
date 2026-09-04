@@ -131,6 +131,19 @@ def _resize_for_target_mp(
             left, top = (resized_w - final_w) // 2, (resized_h - final_h) // 2
             result = resized.crop((left, top, left + final_w, top + final_h))
 
+        # Snapping to the *nearest* multiple of snap_multiple (not always
+        # down) can round the shorter side right back to its original
+        # value when the source is already close to a clean multiple just
+        # above target_mp (e.g. 1152x896 at target 1.0MP: 896 is already
+        # a multiple of 64, and the ~1.6% downscale isn't enough to round
+        # it down to 832) - final size ends up identical to the source
+        # even though orig_mp > target_mp triggered this path. Re-encoding
+        # as JPEG at that point would be a pure quality loss for zero
+        # actual size change, so bail out to the original bytes instead,
+        # same as the already-under-target case above.
+        if (final_w, final_h) == (orig_w, orig_h):
+            return data, None
+
         buf = io.BytesIO()
         result.save(buf, format="JPEG", quality=92)
 

@@ -52,7 +52,7 @@ and which one. On a fresh install this reads `Not installed yet.`
   currently free GPU memory allows), `all` (force every layer onto the
   GPU), or an exact integer layer count. `auto` is the recommended
   starting point on GPUs with 8–16GB of VRAM.
-- **Context size** - default `4096`. The model's context window in
+- **Context size** - default `6144`. The model's context window in
   tokens; must accommodate the prompt template, the image's own token
   cost, and **Max tokens** of output combined.
 - **Extra llama-server arguments** - default empty. Any additional
@@ -92,7 +92,7 @@ and [Review](tab-review.md)'s Recaption.
   it can lock in a bad output with no chance to sample around it.
 - **Top-p** - default `0.9`, range `0.0`–`1.0`. Nucleus sampling cutoff,
   used together with Temperature.
-- **Max tokens** - default `1024`. Upper bound on the length of a single
+- **Max tokens** - default `2048`. Upper bound on the length of a single
   generated caption. A caption that stops mid-sentence was cut off by
   this limit - raise it if that happens.
 - **Request timeout (seconds)** - default `300`. How long a single

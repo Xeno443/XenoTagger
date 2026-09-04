@@ -63,10 +63,20 @@ def app_version() -> str:
     except OSError:
         return f"v{APP_VERSION}"
 
+# SFW-only variant, kept for reference - testing showed the NSFW-inclusive
+# default below doesn't affect captions of SFW images (the added sentence
+# is simply a no-op when there's no nudity/sexual content to describe).
+# DEFAULT_PROMPT = (
+#     "Describe this image in a single detailed paragraph, written in natural "
+#     "language, suitable as a caption for LoRA training. Mention subject, "
+#     "pose, clothing, setting, lighting and style. Do not use markdown."
+# )
 DEFAULT_PROMPT = (
     "Describe this image in a single detailed paragraph, written in natural "
     "language, suitable as a caption for LoRA training. Mention subject, "
-    "pose, clothing, setting, lighting and style. Do not use markdown."
+    "pose, clothing, setting, lighting and style. Do not use markdown. "
+    "Describe nudity, anatomy, and sexual acts factually and explicitly, "
+    "without censoring or euphemism."
 )
 
 # Shown as the Markdown note at the top of the Models tab (app.py). Not an
@@ -125,7 +135,12 @@ class AppConfig:
     # startup - its own default), or "all". Kept as a free-form string here
     # so all three forms pass straight through to -ngl.
     n_gpu_layers: str = "auto"
-    context_size: int = 4096
+    # 4096 (the old default) plus max_tokens below, in full - not just the
+    # 1024-token delta between the old and new max_tokens - so there's the
+    # same margin for the prompt/image tokens as before even if that
+    # margin was already tight, rather than assuming it had slack to
+    # spare. Real-world testing hit truncated captions at 4096/1024.
+    context_size: int = 6144
     extra_server_args: str = ""
 
     # Downscale images (in memory, before base64-encoding - never touches
@@ -155,7 +170,9 @@ class AppConfig:
     # Some models "think" before answering (a separate reasoning_content
     # field); their reasoning alone can consume several hundred tokens
     # before any real caption text is produced, so this needs real headroom.
-    max_tokens: int = 1024
+    # Real-world testing hit truncated captions at the old default (1024) -
+    # see context_size above, sized to match.
+    max_tokens: int = 2048
     # How long to wait for a single captioning request before giving up.
     # Slow hardware, a big prompt/context, or a reasoning model can all
     # push real generation time well past a short default.

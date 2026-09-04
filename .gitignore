@@ -4,6 +4,7 @@ system/python/
 .venv/
 setup-env-classic.bat
 handoff.md
+CLAUDE.md
 llama/
 webui/models/*
 !webui/models/.gitkeep

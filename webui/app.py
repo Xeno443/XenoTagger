@@ -2603,12 +2603,19 @@ def _hydra_install_status_ui():
     hydra_status_update = gr.update(value=_hydra_status_text())
 
     st = hydra_classifier.status()
-    ready = st.deps_installed and st.model_downloaded
+    # not running is load-bearing here, not just for the Install button
+    # below - deps_installed() (find_spec("torch")) can flip True while
+    # install_deps()'s pip subprocess is still mid-write (e.g. torch's
+    # own __init__.py exists before its multi-GB CUDA DLLs are fully
+    # written), so without this, Load/Enable/Autoload can all go
+    # clickable mid-install and race a load against an incomplete
+    # torch install.
+    ready = st.deps_installed and st.model_downloaded and not running
     return (
         infotext_update,
         hydra_status_update,
         gr.update(interactive=not st.deps_installed and not running),
-        gr.update(interactive=st.deps_installed and st.model_downloaded and not st.loaded),
+        gr.update(interactive=ready and not st.loaded),
         gr.update(interactive=st.loaded),
         gr.update(interactive=ready),
         gr.update(interactive=ready),
