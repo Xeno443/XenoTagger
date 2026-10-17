@@ -1,4 +1,4 @@
-"""Custom CSS for app.py's Gradio UI.
+"""Custom CSS for the Gradio UI (passed to demo.launch in app.py).
 
 Every rule here exists because Gradio has no built-in way to do the thing -
 each one was only added after checking the relevant component's constructor
@@ -90,7 +90,7 @@ SERVER_MODE_RADIO_CSS = "#server-mode-radio .wrap { flex-direction: column; }"
 # Button never had - kept throwing off alignment with the row above,
 # through several rounds of trying to compensate for it live. Solved
 # without any CSS instead: Caption and Interrupt now sit in two SEPARATE
-# Columns (see single_run_col/single_interrupt_col in app.py), and it's
+# Columns (see single_run_col/single_interrupt_col in ui/tab_single.py), and it's
 # each Column's own `visible` that toggles - confirmed live that a Row of
 # two plain gr.Column()s (no CSS at all) aligns correctly on its own, so
 # swapping which two of three Columns are shown reuses that proven shape

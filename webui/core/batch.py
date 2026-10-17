@@ -83,7 +83,7 @@ class ReviewItem:
 def review_item_status(image_path: Path) -> str:
     """Classifies a single image by which of .txt/.txt.nlp/.txt.tags/
     .txt.issue exist next to it - shared by scan_review_status() below and
-    app.py's _review_maybe_save (so the table's status stays consistent
+    ui/tab_review.py's _review_maybe_save (so the table's status stays consistent
     with whatever a save just did, not just re-derived from a fresh
     directory scan):
 
@@ -148,7 +148,7 @@ def run_batch(
     knows which image is currently in flight; caption_image() processes
     one image at a time and has no reason to know its own path. Called
     from whatever thread run_batch() itself runs on (the GUI runs it in a
-    background worker thread, see app.py's run_batch_ui), so it must be a
+    background worker thread, see ui/tab_batch.py's run_batch_ui), so it must be a
     plain, Gradio-free callback, never something that touches gr.*
     directly.
 

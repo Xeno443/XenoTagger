@@ -1,6 +1,6 @@
 """Background model-download worker - fetches a curated quant/mmproj GGUF
-from its HF URL into webui/models/<folder>/, driven by app.py's Download-
-queue section (this module itself stays Gradio-free, like the rest of
+from its HF URL into webui/models/<folder>/, driven by
+ui/downloads_queue.py (this module itself stays Gradio-free, like the rest of
 core/ - it just does the actual transfer).
 
 Streams to a "<name>.gguf.part" sibling file, renaming to the real name

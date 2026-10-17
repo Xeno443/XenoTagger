@@ -17,8 +17,8 @@ where it doesn't reliably notice an HTTP client disconnecting and keeps
 generating regardless, so closing our end of the connection alone can't
 be trusted to actually stop server-side work; killing the OS process is
 unconditional and doesn't depend on llama-server cooperating. See
-app.py's Operation-tracking section (_operation_interrupt_click,
-_operation_force_abort) for where this gets invoked as an abort
+ui/operation.py (operation_interrupt_click,
+operation_force_abort) for where this gets invoked as an abort
 mechanism, not just at shutdown.
 
 Only ever manages a process we ourselves started (resolve_server returns

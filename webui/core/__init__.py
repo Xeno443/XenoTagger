@@ -2,5 +2,5 @@
 both entry points: the GUI (app.py, one level up) and the headless CLI
 (cli.py, same level). Anything here needs to make sense run from either
 one; anything that only makes sense for the interactive GUI belongs in
-app.py instead, not here.
+app.py or ui/ instead, not here.
 """

@@ -37,7 +37,7 @@ independent and safe to make from a different thread than the one that
 built the client, which is how the app already uses it: a batch run's
 worker thread (core/batch.py) makes its sequential run of caption() calls
 on the same LlamaClient instance the GUI thread obtained via
-app.py's get_client(), while the GUI thread itself is off polling a
+ui/llama_session.py's get_client(), while the GUI thread itself is off polling a
 progress queue, not calling caption() at the same time.
 """
 

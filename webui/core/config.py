@@ -81,7 +81,7 @@ DEFAULT_PROMPT = (
 
 # Shown as the Markdown note at the top of the Models tab (app.py). Not an
 # AppConfig field - it's not per-user/persisted state, just UI copy kept
-# here so it can be edited without hunting through app.py's Gradio layout
+# here so it can be edited without hunting through the Gradio layout
 # code. {ignored_substrings} is filled in at render time from
 # core.models.IGNORED_SUBSTRINGS, so that part always reflects the real,
 # current ignore-list rather than going stale if it's ever changed.
