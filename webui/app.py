@@ -117,6 +117,9 @@ import atexit
 import logging
 import os
 import platform
+import socket
+import sys
+import time
 
 # Must be set before `import gradio` - some of its telemetry checks read
 # this at import time, not just when building a Blocks instance. The ui
@@ -489,7 +492,40 @@ def build_app() -> gr.Blocks:
 UI_PORT = 7901
 
 
+def _ui_port_in_use(wait: float = 3.0) -> bool:
+    """Whether something is already listening on UI_PORT, checked before
+    anything else - so a second instance stops with a plain message
+    instead of Gradio's traceback, and before setup_debug_logging()
+    truncates the running instance's log file.
+
+    A connect test, not a bind test: a plain bind can fail on a port that
+    only has leftover TIME_WAIT connections from a just-closed instance
+    (Linux), which is exactly Restart app's case. Retries for `wait`
+    seconds, because Restart app's os.execv starts the new process while
+    the old one may still be letting go of the port."""
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            # A listener answers within a millisecond; a refused connect
+            # on Windows otherwise takes ~2s of retries to fail.
+            with socket.create_connection(("127.0.0.1", UI_PORT), timeout=0.2):
+                pass
+        except OSError:
+            return False
+        if time.monotonic() >= deadline:
+            return True
+        time.sleep(0.5)
+
+
 def main() -> None:
+    if _ui_port_in_use():
+        print(
+            f"\nPort {UI_PORT} is already in use - XenoTagger is probably already running "
+            f"(open http://127.0.0.1:{UI_PORT} in your browser), or another program is using that port. "
+            "Close it and start again.\n",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     setup_debug_logging()
     for backend in BACKENDS:
         atexit.register(backend.on_exit)
