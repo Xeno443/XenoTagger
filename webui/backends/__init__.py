@@ -9,7 +9,7 @@ Import rules - keep the graph acyclic and the CLI Gradio-free:
     through core.lifecycle and this registry instead.
   - Only <backend>/settings_ui.py may import Gradio or ui/ (the shared
     modules - state, notify, operation, context, dialogs, reachability,
-    downloads_queue - never a tab_*). Nothing else imports settings_ui;
+    downloads_queue, model_status - never a tab_*). Nothing else imports settings_ui;
     the GUI loads it by Backend.settings_ui_module.
   - core/ never imports backends/ - except core.captioner/core.batch,
     which still call llama and Hydra directly until the v0.9 step-3

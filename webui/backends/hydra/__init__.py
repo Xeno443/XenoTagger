@@ -10,10 +10,14 @@ restarts an owned llama-server when loaded later (core.lifecycle).
 
 from __future__ import annotations
 
-from core.backend import Backend
+from core.backend import Backend, ModelRow
 from core.config import AppConfig
+from core.downloads import DownloadItem
 
-from . import classifier
+from . import classifier, install
+
+# Models tab row key - Hydra has exactly one model.
+_MODEL_KEY = "hydra-3.5"
 
 
 class HydraBackend(Backend):
@@ -22,6 +26,12 @@ class HydraBackend(Backend):
     role = "tagger"
     vram = "fixed"
     settings_ui_module = "backends.hydra.settings_ui"
+    has_models = True
+    selectable_models = False  # one model, used as soon as it's downloaded
+    models_help = (
+        "one model (~1GB), used as soon as it's downloaded. Load it in "
+        "Settings -> Hydra, which also installs its dependencies."
+    )
 
     def is_loaded(self, cfg: AppConfig) -> bool:
         return classifier.status().loaded
@@ -66,6 +76,27 @@ class HydraBackend(Backend):
         # process's own CUDA context, which os.execv doesn't clean up -
         # unload explicitly so VRAM isn't leaked into the replaced process.
         classifier.unload()
+
+    def list_models(self, cfg: AppConfig) -> list[ModelRow]:
+        downloaded = install.model_downloaded()
+        return [ModelRow(
+            key=_MODEL_KEY, name="RedRocket-Hydra 3.5", source="Curated",
+            local="1/1" if downloaded else "0/1", active=downloaded,
+            note="" if downloaded else "not downloaded yet",
+        )]
+
+    def model_downloads(self, cfg: AppConfig, key: str, values: list) -> list[DownloadItem]:
+        if key != _MODEL_KEY or install.model_downloaded():
+            return []
+        return [DownloadItem(
+            url=install.MODEL_URL, dest_path=install.MODEL_PATH,
+            label=install.MODEL_FILENAME, size_bytes=install.MODEL_SIZE_BYTES,
+        )]
+
+    def model_status(self, cfg: AppConfig) -> str:
+        if install.model_downloaded():
+            return f"Model: {install.MODEL_FILENAME}, downloaded."
+        return f"Model: {install.MODEL_FILENAME}, not downloaded yet."
 
 
 BACKEND = HydraBackend()

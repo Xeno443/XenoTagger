@@ -14,7 +14,7 @@ from core.config import AppConfig
 current_cfg: AppConfig = config_mod.load()
 
 # Guards the read-modify-write of current_cfg + config_mod.save() in
-# save_settings_ui() and models_set_active_ui() - the only two places that
+# save_settings_ui() and models_action_ui() - the only two places that
 # mutate current_cfg wholesale. Without it, two overlapping saves (e.g.
 # two browser tabs) could each read a stale current_cfg and the second
 # write would silently clobber fields the first one just changed. Plain

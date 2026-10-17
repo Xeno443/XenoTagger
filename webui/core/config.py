@@ -86,20 +86,14 @@ DEFAULT_PROMPT = (
 # Shown as the Markdown note at the top of the Models tab (ui/tab_models.py). Not an
 # AppConfig field - it's not per-user/persisted state, just UI copy kept
 # here so it can be edited without hunting through the Gradio layout
-# code. {ignored_substrings} is filled in at render time from
-# backends.llama.models.IGNORED_SUBSTRINGS, so that part always reflects the real,
-# current ignore-list rather than going stale if it's ever changed.
+# code. Each backend's own notes (Backend.models_help) follow it as a list.
 MODELS_TAB_INTRO = (
-    "Every `.gguf` under a `webui/models/<folder>/` is picked up, "
-    "grouped by folder: files with \"mmproj\" in the name are "
-    "projectors, everything else is a selectable quant. Files "
-    "matching `{ignored_substrings}` are ignored "
-    "(e.g. speculative-decoding draft models). Dropdown choices "
-    "marked \"(download, ...)\" come from the curated list and "
-    "aren't on disk yet - picking one changes the button below to "
-    "\"Download\", which queues it in the background; \"Abort all "
-    "downloads\" stops whatever's in flight and clears the rest of "
-    "the queue."
+    "Every backend's models in one list - the Backend column says whose a "
+    "row is, and Show filters by it. Click a row to see its details; "
+    "if anything it needs isn't on disk yet, the button below turns into "
+    "\"Download\", which queues it in the background (in any server mode). "
+    "\"Abort all downloads\" stops whatever's in flight and clears the "
+    "rest of the queue. A ★ marks the model each backend uses right now."
 )
 
 # Shown as the Markdown note at the top of Settings -> Llama (backends/llama/settings_ui.py).

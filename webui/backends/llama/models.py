@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -98,6 +99,12 @@ def _read_gguf_metadata(path: Path) -> tuple[bool, Optional[str], Optional[str]]
         return True, None, f"gguf header parse warning: {exc}"
 
 
+# Held around every load-modify-save of CACHE_PATH - a scan (Models tab
+# refresh) and a download's cache_file_metadata() can run at the same time
+# on different threads, and the later save would drop the other's entries.
+_cache_lock = threading.Lock()
+
+
 def _load_cache() -> dict:
     try:
         return json.loads(CACHE_PATH.read_text(encoding="utf-8"))
@@ -137,7 +144,24 @@ def _cached_metadata(path: Path, cache: dict) -> tuple[bool, Optional[str], Opti
     return valid, arch, err
 
 
+def cache_file_metadata(path: Path) -> None:
+    """Parses one GGUF's header into the cache now (if new or changed), so
+    the next scan_all() doesn't have to. Run right after a model download
+    finishes (DownloadItem.after_download), on the download thread - the
+    multi-second parse of a new multi-GB file then happens before the
+    "Downloaded" popup instead of in the Models tab's refresh after it."""
+    with _cache_lock:
+        cache = _load_cache()
+        _cached_metadata(path, cache)
+        _save_cache(cache)
+
+
 def _scan_all() -> tuple[list[ModelVariant], list[MmprojVariant]]:
+    with _cache_lock:
+        return _scan_all_locked()
+
+
+def _scan_all_locked() -> tuple[list[ModelVariant], list[MmprojVariant]]:
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     cache = _load_cache()
     seen_keys: set[str] = set()

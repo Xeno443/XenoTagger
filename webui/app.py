@@ -7,8 +7,8 @@ belongs in core/, or in a backend outside its settings_ui.py.
 This file only builds the frame: the Blocks, the top-level Tabs, the
 status bar, the two timers, the launch chain (each backend's autoload, in
 core.lifecycle.autoload_order), and the wiring that crosses tabs (Batch ->
-Review, Models -> Settings, the reachability refresh that gates
-Single/Batch/Models). Each tab's own components and handlers live in
+Review, Models <-> a backend's Settings sub-tab, the reachability refresh
+that gates Single/Batch). Each tab's own components and handlers live in
 ui/tab_*.py, the Settings sub-tabs in each backend's settings_ui.py
 (backends/<id>/) and in ui/settings/, and the UI-side state several tabs
 share in ui/state.py, ui/operation.py, ui/reachability.py and
@@ -39,8 +39,8 @@ Lock would deadlock there):
   - `current_cfg`/`config_lock` (ui/state.py; plain Lock - neither writer
     calls back into itself or the other while holding it): guards the
     read-modify-write of current_cfg + config_mod.save() in
-    save_settings_ui() and models_set_active_ui(), the only two places
-    that mutate current_cfg wholesale. Without it, two overlapping saves
+    save_settings_ui() and the Models tab's models_action_ui() ("Set as
+    active model"), the only two places that mutate current_cfg wholesale. Without it, two overlapping saves
     could each read a stale current_cfg and the second write would
     silently clobber fields the first one just changed.
 
@@ -103,12 +103,11 @@ server. This matters
 because os.execv replaces the entire process with zero chance for any
 cleanup to run afterward - waiting first means an interrupted operation
 gets an observable, handled failure instead of just vanishing without a
-trace. The Models tab's own "Manage llama server" button used to have an
-in-place equivalent (restart_server_ui, force-abort + stop + refresh
-right there) but is now pure navigation to Settings -> Llama - actually
-stopping/starting only ever happens from that sub-tab's Start/End
-buttons, which are already correctly gated (disabled mid-job, see
-_settings_gating_ui) so there's no force-abort race left for a plain
+trace. The Models tab's "Open <backend> settings" button is pure
+navigation to that backend's Settings sub-tab - actually stopping/
+starting llama-server only ever happens from the Llama sub-tab's
+Start/End buttons, which are already correctly gated (disabled mid-job,
+see _settings_gating_ui) so there's no force-abort race for a plain
 redirect to need to guard against.
 """
 
@@ -127,7 +126,7 @@ os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
 import gradio as gr
 
 from backends import BACKENDS
-from backends.llama.session import cached_controllable, cached_reachable, refresh_reachability_cache
+from backends.llama.session import cached_reachable, refresh_reachability_cache
 from core import config as config_mod
 from core import tag_vocab
 from core.lifecycle import autoload_order
@@ -150,11 +149,9 @@ def _refresh_reachability_ui(current_tab_label: str):
     """Wired to reachability_timer.tick(). Refreshes the cache (picked up
     by the next status_timer tick for Single/Batch/Recaption's own Run/
     Recaption BUTTON gating, see the cache's own comment above) and
-    separately updates three TABS themselves: Models (disabled unless
-    controllable - see cached_controllable) and Single-image/Batch
-    processing (disabled unless reachable at all - captioning there is
-    pointless, not just "not ours to redirect", the moment nothing can
-    answer). If the user is on one of these when it becomes disabled,
+    separately updates two TABS themselves: Single-image/Batch processing
+    (disabled unless reachable at all - captioning there is pointless the
+    moment nothing can answer). If the user is on one of these when it becomes disabled,
     pushes them off to Settings rather than leaving them stranded on a tab
     they can no longer switch back into. Never touches main_tabs'
     selection otherwise, so it can't yank anyone off Review mid-task -
@@ -177,14 +174,11 @@ def _refresh_reachability_ui(current_tab_label: str):
     it untouched on ticks that don't redirect."""
     cfg = state.current_cfg
     status = refresh_reachability_cache(cfg)
-    controllable = cached_controllable(cfg)
-    track_reachability_transitions(cfg, status, controllable)
-    push_to_settings = (not controllable and current_tab_label == "Models") or (
-        not status.reachable and current_tab_label in ("Single image", "Batch processing")
-    )
+    track_reachability_transitions(cfg, status)
+    push_to_settings = not status.reachable and current_tab_label in ("Single image", "Batch processing")
     tabs_update = gr.update(selected="settings") if push_to_settings else gr.update()
     label_update = "Settings" if push_to_settings else gr.skip()
-    return (*tab_gating_updates(cfg, status, controllable), tabs_update, label_update)
+    return (*tab_gating_updates(cfg, status), tabs_update, label_update)
 
 
 def _on_main_tab_select(evt: gr.SelectData) -> str:
@@ -193,13 +187,11 @@ def _on_main_tab_select(evt: gr.SelectData) -> str:
     return evt.value
 
 
-def _goto_llama_settings_ui():
-    """The Models tab's "Manage llama server" button's click target -
-    pure navigation to Settings -> Llama, no server action of its own
-    (see this module's own docstring for why that's safe: the Start/End
-    buttons there are already gated off while a job's running, so this
-    can't be used to bypass anything the way an in-place restart-from-
-    Models-tab could).
+def _goto_backend_settings_ui(selected):
+    """The Models tab's "Open <backend> settings" button's click target -
+    pure navigation to the selected row's backend's Settings sub-tab
+    (selected is the Models tab's [backend_id, key] state), no action of
+    its own.
 
     Explicitly asserts every destination (main_tabs, settings_tabs,
     current_settings_subtab_state, current_tab_label_state) rather than a
@@ -210,20 +202,24 @@ def _goto_llama_settings_ui():
     reflect this redirect immediately since neither main_tabs.select() nor
     settings_tabs.select() reliably fire on a server-pushed switch like
     this one (see their own comments)."""
-    return gr.update(selected="settings"), gr.update(selected="llama-settings"), "llama-settings", "Settings"
+    tab_id = f"{selected[0] if selected else BACKENDS[0].id}-settings"
+    return gr.update(selected="settings"), gr.update(selected=tab_id), tab_id, "Settings"
 
 
-def _goto_hydra_settings_ui():
-    """The Models tab's "Manage Hydra" button's click target - same pure
-    navigation as _goto_llama_settings_ui above, to Settings -> Hydra
-    instead."""
-    return gr.update(selected="settings"), gr.update(selected="hydra-settings"), "hydra-settings", "Settings"
+def _goto_models_ui_for(backend_id: str):
+    """Click target for a backend Settings page's "Show in Models": the
+    Models tab, filtered to that backend. build_app chains the Models
+    refresh after it - a server-pushed tab switch doesn't fire the tab's
+    own .select() refresh."""
+    def _goto_models_ui():
+        return gr.update(selected="models"), backend_id, "Models"
+    return _goto_models_ui
 
 
 def _send_batch_to_review_ui(directory: str):
     """The Batch tab's "Send to Review" button - pure navigation + handoff
     of the directory field to the Review tab (same "explicitly assert
-    every destination" reasoning as _goto_llama_settings_ui above -
+    every destination" reasoning as _goto_backend_settings_ui above -
     main_tabs.select() doesn't reliably fire on a server-pushed switch
     like this one). Wired in build_app's cross-tab section, once both
     tabs exist. Chained with .then(review_scan_ui, ...) there, same
@@ -237,7 +233,7 @@ def _send_batch_to_review_ui(directory: str):
 
 def _startup_reachability_ui():
     """Wired to demo.load() - decides which tab a freshly-loaded page
-    lands on, and the Models/Single-image/Batch-processing tabs' initial
+    lands on, and the Single-image/Batch-processing tabs' initial
     interactive state (see _refresh_reachability_ui, which this shares its
     per-tab logic with). A real (not cached) check, since the optimistic
     default cache value would otherwise land everyone on Single-image once
@@ -249,10 +245,9 @@ def _startup_reachability_ui():
     it)."""
     cfg = state.current_cfg
     status = refresh_reachability_cache(cfg)
-    controllable = cached_controllable(cfg)
-    track_reachability_transitions(cfg, status, controllable)
+    track_reachability_transitions(cfg, status)
     tab_target, tab_label = ("single", "Single image") if status.reachable else ("settings", "Settings")
-    return (gr.update(selected=tab_target), *tab_gating_updates(cfg, status, controllable), tab_label)
+    return (gr.update(selected=tab_target), *tab_gating_updates(cfg, status), tab_label)
 
 
 def _fallback_tab_safety_ui(current_tab_label: str):
@@ -266,11 +261,7 @@ def _fallback_tab_safety_ui(current_tab_label: str):
     Also updates current_tab_label_state to "Settings" when it redirects,
     same reasoning as _refresh_reachability_ui - a server-pushed tab
     switch doesn't fire main_tabs.select() on its own."""
-    controllable = cached_controllable(state.current_cfg)
-    reachable = cached_reachable()
-    on_disabled_models = current_tab_label == "Models" and not controllable
-    on_disabled_single_batch = current_tab_label in ("Single image", "Batch processing") and not reachable
-    if on_disabled_models or on_disabled_single_batch:
+    if current_tab_label in ("Single image", "Batch processing") and not cached_reachable():
         return gr.update(selected="settings"), gr.update(selected="debug-settings"), "Settings"
     return gr.update(), gr.update(), gr.skip()
 
@@ -392,15 +383,14 @@ def build_app() -> gr.Blocks:
         status_bar = gr.Markdown(get_status_text(), elem_id="status-bar")
         # Order must match _update_ui_status' concatenation.
         _run_interrupt_btns = [*single.run_controls, *batch.run_controls, *review.run_controls]
-        # Every output of the reachability refresh - Models/Single/Batch tab
+        # Every output of the reachability refresh - Single/Batch tab
         # gating, the Llama sub-tab's Start/Stop, and the push-to-Settings
         # redirect. Shared by reachability_timer, the autostart chain, and
         # every button a tab registered via ctx.after_server_change.
         # Order is the contract ui.context.REACHABILITY documents.
         llama_ui = settings.backends["llama"]
         _reachability_outputs = [
-            models.tab, single.tab, batch.tab, llama_ui.start_btn, llama_ui.end_btn, main_tabs,
-            current_tab_label_state,
+            single.tab, batch.tab, llama_ui.start_btn, llama_ui.end_btn, main_tabs, current_tab_label_state,
         ]
 
         # ---- Cross-tab wiring - each needs components from more than one tab.
@@ -411,8 +401,14 @@ def build_app() -> gr.Blocks:
         _goto_settings_outputs = [
             main_tabs, settings.settings_tabs, settings.current_subtab_state, current_tab_label_state,
         ]
-        models.manage_llama_btn.click(_goto_llama_settings_ui, [], _goto_settings_outputs)
-        models.manage_hydra_btn.click(_goto_hydra_settings_ui, [], _goto_settings_outputs)
+        models.settings_btn.click(_goto_backend_settings_ui, [models.selected_state], _goto_settings_outputs)
+        for backend_id, handle in settings.backends.items():
+            models_btn = getattr(handle, "models_btn", None)
+            if models_btn is None:
+                continue
+            models_btn.click(
+                _goto_models_ui_for(backend_id), [], [main_tabs, models.filter, current_tab_label_state]
+            ).then(tab_models.models_refresh_ui, models.refresh_inputs, models.scan_outputs)
         for event in ctx.server_change_events:
             event.then(_refresh_reachability_ui, [current_tab_label_state], _reachability_outputs)
 
@@ -429,8 +425,8 @@ def build_app() -> gr.Blocks:
 
         # Tracks which top-level tab is currently selected (declared up by
         # main_tabs' own definition, see the comment there) purely so
-        # _refresh_reachability_ui can tell whether the user is on the
-        # Models tab at the moment it needs to be disabled (and if so,
+        # _refresh_reachability_ui can tell whether the user is on
+        # Single/Batch at the moment it needs to be disabled (and if so,
         # push them off it) without disturbing anyone on any other tab -
         # see that function's docstring.
         main_tabs.select(_on_main_tab_select, [], [current_tab_label_state])
@@ -451,7 +447,7 @@ def build_app() -> gr.Blocks:
         # result is picked up by the very next status_timer tick afterward
         # (_update_ui_status reads the cache, doesn't recompute it)
         # for Single/Batch/Recaption's own Run/Recaption BUTTON gating; the
-        # Models/Single-image/Batch-processing TABS' own interactive state
+        # Single-image/Batch-processing TABS' own interactive state
         # is set directly below instead, since gating those also needs to
         # know (and occasionally override) which tab is currently selected
         # - see _refresh_reachability_ui's docstring.
@@ -479,10 +475,7 @@ def build_app() -> gr.Blocks:
         # around whatever's left, not the other way around).
         launch_chain = demo.load(
             _startup_reachability_ui, [],
-            [
-                main_tabs, models.tab, single.tab, batch.tab, llama_ui.start_btn, llama_ui.end_btn,
-                current_tab_label_state,
-            ],
+            [main_tabs, single.tab, batch.tab, llama_ui.start_btn, llama_ui.end_btn, current_tab_label_state],
         ).then(_update_ui_status, [], _run_interrupt_btns)
         for backend in autoload_order(BACKENDS):
             if backend.id not in ctx.autoloads:

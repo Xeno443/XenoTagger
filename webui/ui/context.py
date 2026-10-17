@@ -15,8 +15,8 @@ A tab registers what it needs and app.py applies it once every tab exists:
     autoload step. app.py chains these after the startup check in
     core.lifecycle.autoload_order (fixed-VRAM backends first). outputs may
     be REACHABILITY, meaning app.py's reachability outputs - fn must then
-    return its updates in that order: (Models tab, Single tab, Batch tab,
-    Llama Start button, Llama Stop button, main Tabs, current tab label).
+    return its updates in that order: (Single tab, Batch tab, Llama Start
+    button, Llama Stop button, main Tabs, current tab label).
 """
 
 from __future__ import annotations

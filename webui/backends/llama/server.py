@@ -80,16 +80,6 @@ class ServerStatus:
     "installed but idle" is just as unusable right now as "not installed
     at all" - both are reachable=False.
 
-    controllable: can the Models tab's model/mmproj selection have any
-    actual effect at the *mode* level - True for managed mode once
-    llama.cpp is installed (whether or not anything's running yet), False
-    for external mode (never ours to tell what to load) and for managed
-    mode with nothing installed (nothing to ever control). app.py further
-    narrows this by session ownership when reachable is True (see its
-    _cached_controllable): a healthy managed-mode server this app didn't
-    start itself might be running any model at all, which this module has
-    no way to know.
-
     installed: managed mode only - is llama-server.exe present on disk.
     Not meaningful for external mode (always False there). Exists so a
     caller can tell "not installed" apart from "installed but idle"
@@ -97,7 +87,6 @@ class ServerStatus:
     need different status text/button behavior (see app.py)."""
 
     reachable: bool
-    controllable: bool
     installed: bool
     reason: str = ""
 
@@ -228,25 +217,26 @@ def check_status(cfg: AppConfig) -> ServerStatus:
     (unlike resolve_server, which this deliberately doesn't call). Meant
     for UI gating: polled periodically and at app startup to decide
     whether Single/Batch/Recaption should be enabled, and whether the
-    Models tab's model/mmproj selection means anything."""
+    Models tab's "Set as active model" means anything (session.
+    set_active_blocked)."""
     if cfg.server_mode == "external":
         base_url = cfg.external_url.rstrip("/")
         if is_healthy(base_url):
-            return ServerStatus(reachable=True, controllable=False, installed=False)
+            return ServerStatus(reachable=True, installed=False)
         return ServerStatus(
-            reachable=False, controllable=False, installed=False,
+            reachable=False, installed=False,
             reason=f"No server responding at {base_url}.",
         )
 
     base_url = f"http://{MANAGED_HOST}:{cfg.server_port}"
     if is_healthy(base_url):
-        return ServerStatus(reachable=True, controllable=True, installed=True)
+        return ServerStatus(reachable=True, installed=True)
     if LLAMA_SERVER_EXE.exists():
         return ServerStatus(
-            reachable=False, controllable=True, installed=True,
+            reachable=False, installed=True,
             reason="llama-server isn't running yet.",
         )
     return ServerStatus(
-        reachable=False, controllable=False, installed=False,
+        reachable=False, installed=False,
         reason="llama.cpp isn't installed yet.",
     )

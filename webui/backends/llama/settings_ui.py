@@ -20,7 +20,8 @@ from core.downloads import format_size
 from ui import state
 from ui.context import REACHABILITY, BuildContext
 from ui.notify import notify
-from ui.reachability import gating_from_cache
+from ui.model_status import model_status_row
+from ui.reachability import tab_gating_updates
 
 from . import BACKEND
 from .install import (
@@ -53,14 +54,14 @@ def _autostart_managed_llama_ui():
     main_tabs.select() on its own (see app.py's _refresh_reachability_ui
     docstring for the bug this class of fix addresses)."""
     cfg = state.current_cfg
-    noop = (gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.skip())
+    noop = (gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.skip())
     if not BACKEND.wants_autoload(cfg):
         return noop
     notify("Starting managed llama-server automatically (autostart is enabled)...")
     ok, _ = try_start_managed_llama(cfg)
     if not ok:
         return noop
-    return (*gating_from_cache(cfg, cached_status()), gr.update(selected="single"), "Single image")
+    return (*tab_gating_updates(cfg, cached_status()), gr.update(selected="single"), "Single image")
 
 
 def _start_managed_llama_ui():
@@ -311,7 +312,7 @@ def collect_settings(
 ) -> dict:
     """AppConfig updates from build()'s save_inputs, in that order.
     model_name/mmproj_name are deliberately NOT settable from this form -
-    they live entirely in the Models tab (models_set_active_ui), so Save
+    they live entirely in the Models tab ("Set as active model"), so Save
     carries forward whatever's already configured."""
     return dict(
         server_mode=server_mode,
@@ -375,6 +376,7 @@ def build(ctx: BuildContext):
         # Group/section, not folded into the managed-mode
         # config box below (moved out of there live).
         installed_backend_text = gr.Markdown(_llama_installed_text())
+        show_in_models_btn = model_status_row(ctx, BACKEND)
         with gr.Group():
             server_mode = gr.Radio(
                 choices=[
@@ -514,6 +516,7 @@ def build(ctx: BuildContext):
         gated=True,
         start_btn=start_llama_btn,
         end_btn=end_llama_btn,
+        models_btn=show_in_models_btn,
         # collect_settings()'s parameter order.
         save_inputs=[
             server_mode, server_port, external_url, n_gpu_layers, context_size, extra_server_args,

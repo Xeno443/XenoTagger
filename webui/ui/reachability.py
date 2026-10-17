@@ -1,12 +1,14 @@
 """Server-reachability gating shared by the frame (app.py's startup and
 reachability-refresh handlers) and the llama backend's autostart
-(backends/llama/settings_ui.py): the Models/Single/Batch tabs'
-interactive state, the Llama sub-tab's Start/Stop buttons, and the
-popups for reachability transitions.
+(backends/llama/settings_ui.py): the Single/Batch tabs' interactive
+state, the Llama sub-tab's Start/Stop buttons, and the popup for a
+reachability transition.
 
 Today this is all about the llama backend, the only captioner - it
 becomes "is the active captioner ready" with the v0.9 step-3 caption
-pipeline.
+pipeline. The Models tab isn't gated: downloads work in every mode, and
+only llama's own "Set as active model" depends on the server
+(backends.llama.session.set_active_blocked).
 """
 
 from __future__ import annotations
@@ -14,39 +16,26 @@ from __future__ import annotations
 import gradio as gr
 
 from backends.llama.server import ServerStatus
-from backends.llama.session import (
-    cached_controllable, is_server_managed_by_us, managed_base_url, note_controllable_transition,
-    update_reachability_tracking,
-)
+from backends.llama.session import is_server_managed_by_us, managed_base_url, update_reachability_tracking
 from core.config import AppConfig
-from ui.downloads_queue import download_abort_all
 from ui.notify import notify
 
 
-def track_reachability_transitions(cfg: AppConfig, status: ServerStatus, controllable: bool) -> None:
-    """Shows the one-shot popups backends.llama.session's two transition
-    trackers return - "model management is disabled" (which also aborts
-    every queued download - switching away from a controllable state
-    likely means they're no longer wanted) and "server stopped
-    responding". Must run before the status bar's next status_label() read
-    (it updates the crash flag that label reads)."""
-    message = note_controllable_transition(controllable, cfg, status)
-    if message:
-        notify(message)
-        download_abort_all()
+def track_reachability_transitions(cfg: AppConfig, status: ServerStatus) -> None:
+    """Shows the one-shot "server stopped responding" popup backends.llama.
+    session's transition tracker returns. Must run before the status bar's
+    next status_label() read (it updates the crash flag that label reads)."""
     message = update_reachability_tracking(status, cfg)
     if message:
         notify(message, level="warning")
 
 
-def tab_gating_updates(cfg: AppConfig, status: ServerStatus, controllable: bool) -> tuple:
-    """(models_tab, single_tab, batch_tab, start_btn, end_btn) updates.
-    Models is disabled unless controllable; Single/Batch unless something
-    is reachable at all."""
-    models_tab_update = gr.update(interactive=controllable)
+def tab_gating_updates(cfg: AppConfig, status: ServerStatus) -> tuple:
+    """(single_tab, batch_tab, start_btn, end_btn) updates. Single/Batch
+    are disabled unless something is reachable at all."""
     single_batch_update = gr.update(interactive=status.reachable)
     start_btn_update, end_btn_update = llama_lifecycle_button_updates(cfg, status)
-    return models_tab_update, single_batch_update, single_batch_update, start_btn_update, end_btn_update
+    return single_batch_update, single_batch_update, start_btn_update, end_btn_update
 
 
 def llama_lifecycle_button_updates(cfg: AppConfig, status: ServerStatus):
@@ -71,8 +60,3 @@ def llama_lifecycle_button_updates(cfg: AppConfig, status: ServerStatus):
     owned = cfg.server_mode == "managed" and status.reachable and is_server_managed_by_us(managed_base_url(cfg))
     end_update = gr.update(interactive=owned)
     return start_update, end_update
-
-
-def gating_from_cache(cfg: AppConfig, status: ServerStatus) -> tuple:
-    """tab_gating_updates() with controllable read from the cache."""
-    return tab_gating_updates(cfg, status, cached_controllable(cfg))

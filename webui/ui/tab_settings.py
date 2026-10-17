@@ -5,7 +5,9 @@ Sub-tabs come first from the backend registry (backends.BACKENDS - each
 backend's settings_ui module, loaded by Backend.settings_ui_module), then
 the non-backend ones in ui/settings/. Every sub-tab module provides:
   - build(ctx) -> handle with tab, tab_label, tab_id, gated (disabled
-    while a caption job runs) and save_inputs (its fields Save reads)
+    while a caption job runs) and save_inputs (its fields Save reads);
+    a backend's may add models_btn (ui.model_status' "Show in Models",
+    wired by app.py)
   - collect_settings(*values) -> dict of AppConfig updates, taking
     save_inputs' values in the same order
 and optionally:
@@ -218,9 +220,9 @@ def build(ctx: BuildContext):
         # save_settings_ui slices these back apart per sub-tab, in this order.
         settings_inputs = [component for _, handle in _subtabs for component in handle.save_inputs]
         # Saving can change server_mode (or anything else
-        # check_status/cached_controllable/cached_reachable
-        # read), and the Models/Single-image/Batch-processing
-        # tabs' interactive state would otherwise be stale for
+        # check_status/cached_reachable read), and the
+        # Single-image/Batch-processing tabs' interactive state
+        # would otherwise be stale for
         # up to 8s until reachability_timer's next tick -
         # refresh it immediately instead. current_tab_label_
         # state is "Settings" here (this click can only happen

@@ -1,5 +1,5 @@
-"""Background download queue shared by every section of the Models tab
-(one queue, one worker thread, one progress row)."""
+"""Background download queue behind the Models tab - every backend's
+downloads share it (one queue, one worker thread, one progress row)."""
 
 from __future__ import annotations
 
@@ -140,9 +140,10 @@ def _download_status_html() -> Optional[str]:
             pct = min(100, int(done * 100 / total))
             elapsed = max(time.monotonic() - (_download_started_at or time.monotonic()), 0.001)
             speed = done / elapsed
+            name = f"{item.source}: {item.label}" if item.source else item.label
             html += (
                 f"<progress value=\"{done}\" max=\"{total}\" style=\"width:100%;\"></progress>"
-                f"<div>{item.label}: {pct}% "
+                f"<div>{name}: {pct}% "
                 f"({format_size(done)} / {format_size(item.size_bytes)}) - {format_size(speed)}/s</div>"
             )
         more = len(_download_queue)
@@ -154,8 +155,8 @@ def _download_status_html() -> Optional[str]:
 def download_status_ui():
     """(row_visibility_update, html_update) - wired to the same 2s
     status_timer as everything else, plus called directly after any
-    action that changes the queue (from either the VLM or Hydra section -
-    both feed the one shared _download_queue) so the row responds
+    action that changes the queue (every backend's rows feed the one
+    shared _download_queue) so the row responds
     immediately instead of waiting for the next tick. Also fires a
     one-shot notify() popup per completed/failed download popped from
     _download_announces."""

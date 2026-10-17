@@ -19,12 +19,13 @@ from core.lifecycle import load_with_coexistence
 from ui import state
 from ui.context import BuildContext
 from ui.dialogs import browse_tag_vocab_file_ui
+from ui.model_status import model_status_row
 from ui.notify import notify
 from ui.operation import operation_blocked_by
 
 from . import BACKEND
 from . import classifier as hydra_classifier
-from .install import MODEL_PATH as HYDRA_MODEL_PATH, install_deps as hydra_install_deps
+from .install import install_deps as hydra_install_deps
 
 log = logging.getLogger(__name__)
 
@@ -41,15 +42,10 @@ log = logging.getLogger(__name__)
 #     whether a UI callback is listening, so nothing is lost by not
 #     wiring one here - only completion/failure surfaces to the UI, via
 #     hydra_lifecycle_infotext + a notify() popup.
-#   - Downloading hydra-3.5.safetensors is just another file - it reuses
-#     the EXISTING curated-model download queue (download_enqueue et al.,
-#     ui.downloads_queue) rather than inventing a second download mechanism. The
-#     button lives on the Models tab's "Hydra model" section (moved
-#     there from this sub-tab); its progress shows in the single shared
-#     download_status_row below both Models-tab sections, since there is
-#     only ever one item actually downloading at a time regardless of
-#     which section queued it - see download_status_row's own comment
-#     at its definition for why a second, section-local row was removed.
+#   - Downloading hydra-3.5.safetensors is just another file - it's
+#     Hydra's row in the combined Models tab (HydraBackend.model_downloads),
+#     through the same shared download queue (ui.downloads_queue) as
+#     every other backend's models.
 # Loading/unloading the model itself is not a background job at all - it
 # blocks for a few seconds at most (~1GB), so it's a plain generator
 # click handler, the same shape as _start_managed_llama_ui/
@@ -106,10 +102,11 @@ def collect_settings(
 
 
 def _hydra_status_text() -> str:
+    """Dependencies + loaded state - whether the model is downloaded is the
+    model status line below it (ui.model_status)."""
     st = hydra_classifier.status()
     parts = [
         f"Dependencies: {'installed' if st.deps_installed else 'not installed'}.",
-        f"Model: {'downloaded' if st.model_downloaded else 'not downloaded'} ({HYDRA_MODEL_PATH}).",
         f"Loaded on {st.device}." if st.loaded else "Not loaded.",
     ]
     return " ".join(parts)
@@ -281,6 +278,7 @@ def build(ctx: BuildContext):
             "for next launch)."
         )
         hydra_status_md = gr.Markdown(_hydra_status_text())
+        show_in_models_btn = model_status_row(ctx, BACKEND)
 
         # Initial interactive= values only - kept fresh
         # afterward by _hydra_install_status_ui (2s timer +
@@ -421,6 +419,7 @@ def build(ctx: BuildContext):
         tab_label="Hydra",
         tab_id=f"{BACKEND.id}-settings",
         gated=True,
+        models_btn=show_in_models_btn,
         # collect_settings()'s parameter order.
         save_inputs=[
             hydra_enabled, hydra_device, hydra_confidence, hydra_threshold, hydra_implications,

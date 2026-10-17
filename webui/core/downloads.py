@@ -1,7 +1,8 @@
-"""Background model-download worker - fetches a curated quant/mmproj GGUF
-from its HF URL into webui/models/<folder>/, driven by
-ui/downloads_queue.py (this module itself stays Gradio-free, like the rest of
-core/ - it just does the actual transfer).
+"""Streaming file download - fetches one model file (a curated GGUF, Hydra's
+weights, ...) into webui/models/<folder>/. Driven by the GUI's queue
+(ui/downloads_queue.py) and by the backends' CLI installers; this module
+itself stays Gradio-free, like the rest of core/ - it just does the
+actual transfer.
 
 Streams to a "<name>.gguf.part" sibling file, renaming to the real name
 only once the transfer completes fully - so a scan_all() pass during an
@@ -50,6 +51,14 @@ class DownloadItem:
     dest_path: Path
     label: str  # shown in the queue status text, e.g. "gemma-4-12b-it-Q4_K_M"
     size_bytes: int
+    # Which backend it's for, shown before the label in the GUI queue's
+    # status text (set by the Models tab, not the backend).
+    source: str = ""
+    # Runs on the finished file (dest_path) right after the rename, still
+    # inside download_one - e.g. converting weights to a smaller format.
+    # An exception from it propagates like a failed download, but the
+    # downloaded file stays in place.
+    after_download: Optional[Callable[[Path], None]] = None
 
 
 def download_one(
@@ -91,6 +100,9 @@ def download_one(
                             on_progress(written)
         part_path.replace(item.dest_path)
         log.info("Download complete: %s", item.dest_path)
+        if item.after_download is not None:
+            log.info("Running post-download step for %s", item.label)
+            item.after_download(item.dest_path)
         return True
     finally:
         # No-op if the rename above already moved it away (the success

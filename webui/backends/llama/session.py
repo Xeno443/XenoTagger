@@ -1,11 +1,12 @@
 """Which llama-server this app process manages (_session/_session_lock),
 how to get a client for it, and the cached server-reachability state that
-gates Single/Batch/Recaption and the Models tab.
+gates Single/Batch/Recaption and the Models tab's "Set as active model".
 
 Gradio-free, like every non-settings_ui module in a backend: functions
 that need the current config take it as `cfg` (the GUI passes
-ui.state.current_cfg), and the two transition trackers return the popup
-text instead of showing it - the frame (app.py) does the notify()."""
+ui.state.current_cfg), and the reachability transition tracker returns
+the popup text instead of showing it - ui/reachability.py does the
+notify()."""
 
 from __future__ import annotations
 
@@ -94,8 +95,8 @@ def stop_managed() -> None:
 # for status-text/button purposes elsewhere. "external" mode has no local
 # fallback we control at all, so it always needs a real live health check.
 #
-# The mode-level categorization (including the base "controllable" -
-# see server.ServerStatus) lives in server.py's check_status(),
+# The mode-level categorization (see server.ServerStatus) lives in
+# server.py's check_status(),
 # which never starts or stops anything, unlike resolve_server(). It's a
 # real network call though (is_healthy), so it's cached here and
 # refreshed on its own slower timer (see reachability_timer in app.py's
@@ -103,15 +104,13 @@ def stop_managed() -> None:
 # no reason to hit the network that often just to keep a button's
 # interactive state current.
 #
-# Whether the Models tab is actually usable is a stricter, session-aware
-# question check_status() can't answer on its own (it has no idea which
-# server, if any, THIS session started) - see cached_controllable()
-# below for that narrowing, and app.py's _refresh_reachability_ui for how it
-# drives the Models tab itself (disabling it, and evicting the user to
-# Settings if they're on it when that happens).
+# Whether the Models tab's "Set as active model" would have any effect is a
+# stricter, session-aware question check_status() can't answer on its own
+# (it has no idea which server, if any, THIS session started) - see
+# set_active_blocked() below.
 
 _reachability_lock = threading.RLock()
-_reachability_cache = ServerStatus(reachable=True, controllable=True, installed=True)  # optimistic default until the first real check
+_reachability_cache = ServerStatus(reachable=True, installed=True)  # optimistic default until the first real check
 
 
 def refresh_reachability_cache(cfg: AppConfig) -> ServerStatus:
@@ -155,66 +154,33 @@ def managed_base_url(cfg: AppConfig) -> str:
     return f"http://{MANAGED_HOST}:{cfg.server_port}"
 
 
-def cached_controllable(cfg: AppConfig) -> bool:
-    """Whether the Models tab should be usable right now - stricter than
-    ServerStatus.controllable's mode-level check (see its docstring):
-    external mode is never controllable, same as before, but a running
-    managed-mode server also has to be one THIS session started. A
-    running server we merely reused (leftover from a previous run, or
-    started by hand) might be running any model at all, and there's no
-    reliable way to tell - see the module docstring's note on the removed
-    PID-tracking approach - so it's treated the same as external mode:
-    not ours to manage. A not-yet-running managed-mode server (that's
-    otherwise installed) stays controllable, since starting it fresh
-    would use whatever we pick."""
+def set_active_blocked(cfg: AppConfig) -> Optional[str]:
+    """Why the Models tab's "Set as active model" can't have any effect
+    right now (None if it can) - the only part of the Models tab that
+    depends on the server; downloads always work. External mode never
+    loads what we pick. Neither does a running managed-mode server this
+    session didn't start (leftover from a previous run, or started by
+    hand): it might be running any model at all, and there's no reliable
+    way to tell, so it's treated like external mode. Not running yet, or
+    llama.cpp not installed yet, is fine - the next start uses the pick."""
+    if cfg.server_mode == "external":
+        return (
+            "Set as active only applies to a llama-server this app starts - in external mode, "
+            "the server you run decides which model it loads."
+        )
     with _reachability_lock:
         status = _reachability_cache
-    if not status.controllable:
-        return False
-    if cfg.server_mode == "managed" and status.reachable:
-        return is_server_managed_by_us(managed_base_url(cfg))
-    return True
+    if status.reachable and not is_server_managed_by_us(managed_base_url(cfg)):
+        return (
+            "A llama-server this app didn't start is running on the managed port - it may have "
+            "any model loaded, so Set as active has no effect until it's stopped."
+        )
+    return None
 
 
-_last_known_controllable = True  # matches the optimistic cache default above
 _last_known_reachable: Optional[bool] = None  # None = no real check has completed yet
 _down_is_crash = False  # persists for a whole down-streak, not just its first tick - see update_reachability_tracking
 _expected_stop = False  # set by stop_managed() itself, consumed by update_reachability_tracking - see both docstrings
-
-
-def note_controllable_transition(controllable: bool, cfg: AppConfig, status: ServerStatus) -> Optional[str]:
-    """Returns a popup message exactly once, the moment the Models tab
-    becomes unusable (not on every reachability_timer tick for as long as
-    it stays that way), whether that's discovered at startup or later -
-    None otherwise. The caller (ui/reachability.py) shows it as an info
-    toast and also aborts any in-flight/queued downloads at that same
-    moment (a deliberate
-    reversal of the earlier "let them finish" behavior - decided this
-    session that switching away from a controllable state likely means
-    those downloads are no longer wanted at all) - done here, not gated
-    on which tab the user happens to be viewing, since the download queue
-    itself doesn't care whether Models is the active tab right now.
-
-    The message is picked from cfg/status rather than one fixed string -
-    confirmed live that the "isn't one this app started" wording is
-    flatly wrong for managed-mode-but-nothing-installed: there's no
-    active llama-server to have started or not started in that case, the
-    reachability warning already covers "nothing's set up yet" on its
-    own, so this only needs to add the ownership-specific explanation
-    when there's actually something running to have an opinion about."""
-    global _last_known_controllable
-    message = None
-    if not controllable and _last_known_controllable:
-        if cfg.server_mode == "managed" and not status.installed:
-            message = "Model management is disabled: llama.cpp isn't installed yet, so there's nothing to manage."
-        else:
-            message = (
-                "Model management is disabled: the active llama-server isn't one this app "
-                "started, so what it currently has loaded isn't something the Models tab can "
-                "show you or change."
-            )
-    _last_known_controllable = controllable
-    return message
 
 
 def update_reachability_tracking(status: ServerStatus, cfg: AppConfig) -> Optional[str]:

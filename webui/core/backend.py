@@ -10,11 +10,43 @@ Captioning itself (caption()/tag()) isn't part of this interface yet -
 core.captioner still calls the llama client and Hydra classifier
 directly. That moves behind this interface with the caption-pipeline
 rewrite (v0.9 step 3).
+
+The model methods (list_models() and friends) feed the GUI's combined
+Models tab (ui/tab_models.py), which shows every backend's rows in one
+table. They're plain data in and out, no Gradio: a backend describes its
+models and the choices for one of them (ModelRow, ModelOption), the tab
+renders them.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+from typing import Optional
+
 from .config import AppConfig
+from .downloads import DownloadItem
+
+
+@dataclass
+class ModelRow:
+    """One row of the Models tab table."""
+    # Backend-internal id, handed back to model_options()/model_downloads()/
+    # set_active() - never shown.
+    key: str
+    name: str
+    source: str  # "Curated" (in a list we ship) or "Manual" (found on disk)
+    local: str  # what's on disk, e.g. "2/5" (of 5 curated files) or "1"
+    active: bool = False  # the one this backend uses right now (star column)
+    note: str = ""  # appended to "Viewing <name>" when the row is selected
+
+
+@dataclass
+class ModelOption:
+    """One dropdown under the table for the selected row (llama: Quant,
+    mmproj). An empty choices list shows a disabled "N/A"."""
+    label: str
+    choices: list[tuple[str, str]] = field(default_factory=list)  # (shown label, value)
+    value: Optional[str] = None  # preselected; falls back to the first choice
 
 
 class Backend:
@@ -76,3 +108,46 @@ class Backend:
     def on_exit(self) -> None:
         """Registered with atexit by the GUI's main() only (never at import
         time - scratch scripts import these modules too)."""
+
+    # ---- Models tab. `values` below is the selected row's current dropdown
+    # values, one per ModelOption in model_options()' order, None for an
+    # "N/A" one; trailing extras are ignored.
+
+    # Whether this backend has rows in the Models tab at all (and a "Show
+    # in Models" link on its Settings page).
+    has_models: bool = False
+    # Whether a downloaded row can be made the active one (llama: pick one
+    # of several GGUFs). False means there's nothing to choose - Hydra's
+    # single model is used as soon as it's on disk.
+    selectable_models: bool = False
+    # Markdown shown in the Models tab's intro, explaining this backend's rows.
+    models_help: str = ""
+
+    def list_models(self, cfg: AppConfig) -> list[ModelRow]:
+        """Curated and on-disk models merged into one row each - matching
+        the two up is backend-specific. Rescans the disk; called on every
+        Models tab refresh, so later calls may reuse this result."""
+        return []
+
+    def model_options(self, cfg: AppConfig, key: str) -> list[ModelOption]:
+        return []
+
+    def model_downloads(self, cfg: AppConfig, key: str, values: list) -> list[DownloadItem]:
+        """What still has to be downloaded for this selection - empty if
+        it's all on disk (or nothing downloadable is selected)."""
+        return []
+
+    def set_active_problem(self, cfg: AppConfig, key: str, values: list) -> Optional[str]:
+        """Why this (fully downloaded) selection can't be made active right
+        now, or None if it can. Only asked when selectable_models."""
+        return None
+
+    def set_active(self, cfg: AppConfig, key: str, values: list) -> tuple[Optional[dict], str]:
+        """(AppConfig updates, message) - updates is None if refused. The
+        caller applies and saves the updates; a backend never saves config."""
+        return None, "Nothing to set as active."
+
+    def model_status(self, cfg: AppConfig) -> str:
+        """One line for this backend's Settings page, next to its "Show in
+        Models" button."""
+        return ""

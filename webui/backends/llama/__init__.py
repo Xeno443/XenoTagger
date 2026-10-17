@@ -8,16 +8,20 @@ the app it's one adaptive-VRAM captioner.
   - session.py     which server this app process owns + the cached
                    reachability state the GUI gates on
   - models.py      local GGUF discovery + curated model list
+  - catalog.py     the Models tab rows (folder = row, quant/mmproj dropdowns)
   - install.py     llama-server.exe installer (ggml-org releases)
   - settings_ui.py Settings -> Llama (GUI only)
 """
 
 from __future__ import annotations
 
-from core.backend import Backend
-from core.config import AppConfig
+from typing import Optional
 
-from . import session
+from core.backend import Backend, ModelOption, ModelRow
+from core.config import AppConfig
+from core.downloads import DownloadItem
+
+from . import catalog, session
 from .server import LLAMA_SERVER_EXE, get_loaded_model_name, is_healthy
 
 
@@ -27,6 +31,9 @@ class LlamaBackend(Backend):
     role = "captioner"
     vram = "adaptive"
     settings_ui_module = "backends.llama.settings_ui"
+    has_models = True
+    selectable_models = True
+    models_help = catalog.MODELS_HELP
 
     def is_loaded(self, cfg: AppConfig) -> bool:
         # Ownership only, not a health check - same test "Stop llama
@@ -64,6 +71,24 @@ class LlamaBackend(Backend):
 
     def on_exit(self) -> None:
         session.stop_managed()
+
+    def list_models(self, cfg: AppConfig) -> list[ModelRow]:
+        return catalog.list_models(cfg)
+
+    def model_options(self, cfg: AppConfig, key: str) -> list[ModelOption]:
+        return catalog.model_options(cfg, key)
+
+    def model_downloads(self, cfg: AppConfig, key: str, values: list) -> list[DownloadItem]:
+        return catalog.model_downloads(cfg, key, values)
+
+    def set_active_problem(self, cfg: AppConfig, key: str, values: list) -> Optional[str]:
+        return catalog.set_active_problem(cfg, key, values)
+
+    def set_active(self, cfg: AppConfig, key: str, values: list) -> tuple[Optional[dict], str]:
+        return catalog.set_active(cfg, key, values)
+
+    def model_status(self, cfg: AppConfig) -> str:
+        return catalog.model_status(cfg)
 
 
 BACKEND = LlamaBackend()
