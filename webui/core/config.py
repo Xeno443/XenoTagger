@@ -44,7 +44,7 @@ ROOT_DIR = WEBUI_DIR.parent
 SETTINGS_PATH = WEBUI_DIR / "config" / "settings.json"
 DEFAULT_TAG_VOCAB_PATH = str(WEBUI_DIR / "tags" / "e621.csv")
 
-APP_VERSION = "0.8-beta"
+APP_VERSION = "0.9-dev"
 
 
 def app_version() -> str:
