@@ -12,7 +12,7 @@ from typing import Optional
 
 import gradio as gr
 
-from ui.llama_session import stop_managed
+from backends.llama.session import stop_managed
 
 log = logging.getLogger("app")  # fixed name, see app.py
 
@@ -33,7 +33,7 @@ log = logging.getLogger("app")  # fixed name, see app.py
 # in core/server.py for the real kill.)
 #
 # This also acts as the mutual-exclusion gate for the race discussed
-# above ui.llama_session's _session_lock: only one kind of operation ("single" or "batch")
+# above backends.llama.session's _session_lock: only one kind of operation ("single" or "batch")
 # may be active at a time, since both ultimately share the one
 # llama-server connection.
 

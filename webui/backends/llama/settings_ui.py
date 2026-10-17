@@ -1,5 +1,9 @@
 """Settings -> Llama: llama.cpp install, managed/external server config,
-Start/Stop, and the prompt/sampling fields."""
+Start/Stop, the prompt/sampling fields, and llama-server's launch-time
+autostart. The only file in backends/llama/ that imports Gradio or ui/ -
+loaded by ui.tab_settings via LlamaBackend.settings_ui_module, which
+expects build(ctx), collect_settings(), and optionally after_save() and
+abort_background() (see ui.tab_settings)."""
 
 from __future__ import annotations
 
@@ -12,44 +16,51 @@ import gradio as gr
 
 from core import config as config_mod
 from core.config import AppConfig
-from core.llama_install import (
+from core.downloads import format_size
+from ui import state
+from ui.context import REACHABILITY, BuildContext
+from ui.notify import notify
+from ui.reachability import gating_from_cache
+
+from . import BACKEND
+from .install import (
     BACKENDS as LLAMA_BACKENDS, DEFAULT_BACKEND as LLAMA_DEFAULT_BACKEND,
     install as llama_install_run, installed_info as llama_installed_info, plan_install as llama_plan_install,
 )
-from core.models import format_size
-from core.server import ServerStatus, get_loaded_model_name, is_healthy
-from ui import state
-from ui.context import BuildContext
-from ui.llama_session import (
-    is_server_managed_by_us, managed_base_url, refresh_reachability_cache, stop_managed, try_start_managed_llama,
+from .server import get_loaded_model_name, is_healthy
+from .session import (
+    cached_status, is_server_managed_by_us, managed_base_url, refresh_reachability_cache, stop_managed,
+    try_start_managed_llama,
 )
-from ui.notify import notify
 
-log = logging.getLogger("app")  # fixed name, see app.py
+log = logging.getLogger(__name__)
 
 
-def llama_lifecycle_button_updates(cfg: AppConfig, status: ServerStatus):
-    """(start_btn_update, end_btn_update) for the Llama settings tab's
-    two lifecycle buttons - shared by app.py's _refresh_reachability_ui and
-    _startup_reachability_ui so the two can't disagree. Start is only
-    ever useful in managed mode with something installed but not already
-    running (installed-and-not-running, not installed-and-running or
-    external, where it'd have nothing to do); End only when this session
-    actually owns whatever's currently running - see
-    is_server_managed_by_us's docstring on why that's the one thing that
-    gates it, not just "something's running".
-
-    Start also tracks Save-settings' primary/orange styling, but only
-    while it's actually clickable - variant, not just interactive, so
-    "ready to click" reads as visually distinct from "nothing to do right
-    now" rather than relying on interactive=False's subtler dimming alone
-    to carry that. End stays plain (like Restart app) regardless of
-    state - it's the less common action, not the one to draw the eye to."""
-    can_start = cfg.server_mode == "managed" and status.installed and not status.reachable
-    start_update = gr.update(interactive=can_start, variant="primary" if can_start else "secondary")
-    owned = cfg.server_mode == "managed" and status.reachable and is_server_managed_by_us(managed_base_url(cfg))
-    end_update = gr.update(interactive=owned)
-    return start_update, end_update
+def _autostart_managed_llama_ui():
+    """Registered as this backend's launch-time autoload step (see
+    build()) - core.lifecycle.autoload_order runs it after the fixed-VRAM
+    backends' (Hydra's), and app.py chains it after the startup check, so
+    the initial UI has already rendered with tabs correctly
+    enabled/disabled - autostart is a background convenience layered on
+    top of that correct initial state, never a substitute for it. Only
+    actually does anything for managed mode, installed, not already
+    running, and the checkbox on (BACKEND.wants_autoload) - the one case a
+    user would otherwise have to click Start for themselves. Silent no-op
+    in every other case - no popup for "didn't autostart", only for
+    actually doing something. Returns app.py's reachability outputs (see
+    ui.context.REACHABILITY), and sets current_tab_label_state to "Single
+    image" when it redirects there - a server-pushed switch doesn't fire
+    main_tabs.select() on its own (see app.py's _refresh_reachability_ui
+    docstring for the bug this class of fix addresses)."""
+    cfg = state.current_cfg
+    noop = (gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.skip())
+    if not BACKEND.wants_autoload(cfg):
+        return noop
+    notify("Starting managed llama-server automatically (autostart is enabled)...")
+    ok, _ = try_start_managed_llama(cfg)
+    if not ok:
+        return noop
+    return (*gating_from_cache(cfg, cached_status()), gr.update(selected="single"), "Single image")
 
 
 def _start_managed_llama_ui():
@@ -62,7 +73,7 @@ def _start_managed_llama_ui():
     run_single_ui's "Starting server (loading model)..." yield, for the
     exact same reason)."""
     yield "Starting llama-server (this can take a while if a model needs to load)..."
-    _, message = try_start_managed_llama()
+    _, message = try_start_managed_llama(state.current_cfg)
     yield message
 
 
@@ -70,8 +81,8 @@ def _end_managed_llama_ui():
     """Only ever meaningfully clickable when is_server_managed_by_us() is
     true (see its interactive= wiring below) - but stop_managed() is
     itself already safe to call regardless, since it only ever touches
-    ui.llama_session's _session["managed"], which is only ever non-None when this session
-    is the one that actually spawned the process (see core/server.py's
+    session.py's _session["managed"], which is only ever non-None when this session
+    is the one that actually spawned the process (see server.py's
     docstring). The ownership check here is just to report accurately
     what happened for a stale/racing click, not to gate the action. A
     generator for the same reason _start_managed_llama_ui is - stopping
@@ -80,7 +91,7 @@ def _end_managed_llama_ui():
     yield "Stopping llama-server..."
     owned = is_server_managed_by_us(managed_base_url(state.current_cfg))
     stop_managed()
-    refresh_reachability_cache()
+    refresh_reachability_cache(state.current_cfg)
     yield "llama-server stopped." if owned else "Nothing to stop - this session doesn't own the running server."
 
 
@@ -88,7 +99,7 @@ def _verify_external_ui(external_url: str) -> str:
     """Tests whatever URL is currently in the External server URL field -
     not necessarily state.current_cfg.external_url, since the user may be
     checking a value they haven't saved yet. A real check beyond a bare
-    /health 200: also asks /props (get_loaded_model_name, core/server.py -
+    /health 200: also asks /props (get_loaded_model_name, server.py -
     the same call the status bar's "Model: X" already uses) so the result
     says what model is actually loaded there, not just that *something*
     answered."""
@@ -181,11 +192,13 @@ def _llama_install_start_ui(backend_id: str) -> str:
     return f"Installing {LLAMA_BACKENDS[backend_id].label} - resolving latest release..."
 
 
-def llama_install_abort_all() -> None:
-    """Bare flag-set, no UI return value - mirrors download_abort_all()
-    above, called both by _llama_install_abort_ui below and by
-    restart_app_ui (which doesn't need or want a UI-facing message, the
-    process is about to be replaced)."""
+def abort_background() -> None:
+    """Aborts a running llama.cpp install. Bare flag-set, no UI return
+    value - mirrors ui.downloads_queue's download_abort_all(), called both
+    by _llama_install_abort_ui below and, as this sub-tab's
+    abort_background hook, by ui.tab_settings' restart_app_ui (which
+    doesn't need or want a UI-facing message, the process is about to be
+    replaced)."""
     global _install_abort_requested
     with _install_lock:
         _install_abort_requested = True
@@ -195,7 +208,7 @@ def _llama_install_abort_ui() -> str:
     with _install_lock:
         if _install_thread is None or not _install_thread.is_alive():
             return "Nothing to abort."
-    llama_install_abort_all()
+    abort_background()
     return "Aborting install..."
 
 
@@ -292,9 +305,70 @@ def _llama_install_button_label() -> str:
     return "Reinstall llama.cpp" if llama_installed_info() is not None else "Install llama.cpp"
 
 
+def collect_settings(
+    server_mode, server_port, external_url, n_gpu_layers, context_size, extra_server_args,
+    autostart_managed_llama, prompt_template, temperature, top_p, max_tokens, request_timeout,
+) -> dict:
+    """AppConfig updates from build()'s save_inputs, in that order.
+    model_name/mmproj_name are deliberately NOT settable from this form -
+    they live entirely in the Models tab (models_set_active_ui), so Save
+    carries forward whatever's already configured."""
+    return dict(
+        server_mode=server_mode,
+        server_port=int(server_port),
+        external_url=external_url,
+        n_gpu_layers=n_gpu_layers.strip() or "auto",
+        context_size=int(context_size),
+        extra_server_args=extra_server_args,
+        autostart_managed_llama=bool(autostart_managed_llama),
+        prompt_template=prompt_template,
+        temperature=float(temperature),
+        top_p=float(top_p),
+        max_tokens=int(max_tokens),
+        request_timeout=int(request_timeout),
+    )
+
+
+def after_save(old_cfg: AppConfig, new_cfg: AppConfig) -> Optional[str]:
+    """Reacts to a saved change in the server-process-affecting fields and
+    returns what to append to "Settings saved." (None if nothing to add).
+    Prompt/sampling fields are just written through, live immediately, no
+    process interaction. Server-process fields (mode, port, GPU layers,
+    context size, extra args) each need a specific reaction: switching to
+    external stops any managed server we own; switching to managed never
+    auto-starts (the user must do that explicitly, even with autostart on
+    - autostart is for the *next app launch*, not this save); changing the
+    process args while staying managed stops the current one (a no-op if
+    we don't own it - see stop_managed) and, only if autostart is enabled,
+    immediately starts a fresh one with the new settings."""
+    switched_to_external = old_cfg.server_mode != "external" and new_cfg.server_mode == "external"
+    switched_to_managed = old_cfg.server_mode == "external" and new_cfg.server_mode == "managed"
+    process_args_changed = (
+        old_cfg.server_port, old_cfg.n_gpu_layers, old_cfg.context_size, old_cfg.extra_server_args
+    ) != (
+        new_cfg.server_port, new_cfg.n_gpu_layers, new_cfg.context_size, new_cfg.extra_server_args
+    )
+
+    if switched_to_external:
+        stop_managed()
+        return "Switched to external mode."
+    if switched_to_managed:
+        return (
+            "Switched to managed mode - click \"Start llama server\" "
+            "in this tab when you're ready (autostart applies on the next app launch, not now)."
+        )
+    if new_cfg.server_mode == "managed" and process_args_changed:
+        stop_managed()
+        if new_cfg.autostart_managed_llama:
+            _, start_message = try_start_managed_llama(new_cfg)
+            return start_message
+        return "Click \"Start llama server\" to apply the new server settings."
+    return None
+
+
 def build(ctx: BuildContext):
     cfg = state.current_cfg
-    with gr.Tab("Llama", id="llama-settings") as llama_settings_tab:
+    with gr.Tab("Llama", id=f"{BACKEND.id}-settings") as llama_settings_tab:
         gr.Markdown(config_mod.LLAMA_TAB_INTRO)
         # Same position as hydra_status_md on the Hydra tab -
         # a status line right under the intro, above any
@@ -431,15 +505,18 @@ def build(ctx: BuildContext):
 
     ctx.on_tick(_llama_install_status_ui, [], _llama_install_status_outputs)
     ctx.on_load(_llama_install_status_ui, [], _llama_install_status_outputs)
+    ctx.on_autoload(BACKEND.id, _autostart_managed_llama_ui, REACHABILITY)
 
     return SimpleNamespace(
         tab=llama_settings_tab,
+        tab_label="Llama",
+        tab_id=f"{BACKEND.id}-settings",
+        gated=True,
         start_btn=start_llama_btn,
         end_btn=end_llama_btn,
-        # Save settings fields, in save_settings_ui's own order.
-        server_mode=server_mode, server_port=server_port, external_url=external_url,
-        n_gpu_layers=n_gpu_layers, context_size=context_size, extra_server_args=extra_server_args,
-        autostart_managed_llama=autostart_managed_llama,
-        prompt_template=prompt_template, temperature=temperature, top_p=top_p, max_tokens=max_tokens,
-        request_timeout=request_timeout,
+        # collect_settings()'s parameter order.
+        save_inputs=[
+            server_mode, server_port, external_url, n_gpu_layers, context_size, extra_server_args,
+            autostart_managed_llama, prompt_template, temperature, top_p, max_tokens, request_timeout,
+        ],
     )

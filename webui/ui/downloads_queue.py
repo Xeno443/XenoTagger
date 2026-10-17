@@ -10,8 +10,7 @@ from typing import Optional
 
 import gradio as gr
 
-from core.downloads import DownloadItem, download_one
-from core.models import format_size
+from core.downloads import DownloadItem, download_one, format_size
 from ui.notify import notify
 
 log = logging.getLogger("app")  # fixed name, see app.py

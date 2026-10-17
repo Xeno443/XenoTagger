@@ -38,14 +38,14 @@ from typing import Callable, Optional
 
 import requests
 
-from .downloads import DownloadItem, download_one
+from core.config import ROOT_DIR
+from core.downloads import DownloadItem, download_one
 
 log = logging.getLogger(__name__)
 
 GITHUB_API = "https://api.github.com/repos/ggml-org/llama.cpp"
 REQUEST_TIMEOUT = 15
 
-ROOT_DIR = Path(__file__).resolve().parent.parent.parent
 INSTALL_DIR = ROOT_DIR / "llama"
 MARKER_FILENAME = ".llama_backend.json"
 

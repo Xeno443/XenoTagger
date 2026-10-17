@@ -11,23 +11,22 @@ from typing import Optional
 
 import gradio as gr
 
-from core import config as config_mod
-from core import hydra_classifier
-from core.config import AppConfig
-from core.downloads import DownloadItem
-from core.hydra_install import (
+from backends.hydra import classifier as hydra_classifier
+from backends.hydra.install import (
     MODEL_PATH as HYDRA_MODEL_PATH, MODEL_SIZE_BYTES as HYDRA_MODEL_SIZE_BYTES, MODEL_URL as HYDRA_MODEL_URL,
 )
-from core.models import (
-    IGNORED_SUBSTRINGS, MODELS_DIR, ModelGroup, format_size, group_models,
-    load_curated_models, merge_curated, scan_all,
+from backends.llama.models import (
+    IGNORED_SUBSTRINGS, ModelGroup, group_models, load_curated_models, merge_curated, scan_all,
 )
+from backends.llama.session import cached_controllable
+from core import config as config_mod
+from core.config import MODELS_DIR, AppConfig
+from core.downloads import DownloadItem, format_size
 from ui import state
 from ui.context import BuildContext
 from ui.downloads_queue import (
     download_abort_all, download_consume_needs_refresh, download_enqueue, download_status_ui,
 )
-from ui.llama_session import cached_controllable
 
 log = logging.getLogger("app")  # fixed name, see app.py
 
@@ -108,7 +107,7 @@ def download_abort_all_ui(selected_folder: Optional[str] = None):
 
 # ---------------------------------------------------------------- Models tab
 #
-# One row per model DIRECTORY (core.models.group_models), not one row per
+# One row per model DIRECTORY (backends.llama.models.group_models), not one row per
 # quant file - a folder's several quants and mmproj precisions become the
 # two dropdowns' choices for whichever row is currently selected, not
 # separate top-level rows each. Clicking a table row only loads that
@@ -154,7 +153,7 @@ def _action_mode_for_selection(
     the two can never silently disagree about what a given selection
     means.
 
-    controllable (see ui.llama_session's cached_controllable) gates the whole
+    controllable (see backends.llama.session's cached_controllable) gates the whole
     Models tab, download included: if the active connection isn't one
     this app manages, there's no server the user could ever point at
     something downloaded here either - see cached_controllable's own
@@ -196,7 +195,7 @@ def models_selection_change_ui(groups: list[ModelGroup], quant_name: str, mmproj
     screen, which correctly resolves to "disabled" here rather than
     crashing or showing something wrong."""
     group = _group_for_quant_value(groups, quant_name)
-    mode = _action_mode_for_selection(group, quant_name, mmproj_name, cached_controllable())
+    mode = _action_mode_for_selection(group, quant_name, mmproj_name, cached_controllable(state.current_cfg))
     return _action_button_update(mode)
 
 
@@ -308,7 +307,7 @@ def _models_dropdown_updates(
         mmproj_value = preferred_mmproj if preferred_mmproj in mmproj_values else mmproj_values[0]
         mmproj_update = gr.update(choices=mmproj_pairs, value=mmproj_value, interactive=True)
 
-    mode = _action_mode_for_selection(group, quant_value, mmproj_value, cached_controllable())
+    mode = _action_mode_for_selection(group, quant_value, mmproj_value, cached_controllable(state.current_cfg))
     return quant_update, mmproj_update, _action_button_update(mode)
 
 
@@ -373,7 +372,7 @@ def models_set_active_ui(groups: list[ModelGroup], quant_name: str, mmproj_name:
     defensive fallback for a stale/racing click, not the normal path for
     a not-yet-downloaded pick (that's models_download_ui's job now)."""
     noop = (gr.update(), gr.update(), gr.update())
-    if not cached_controllable():
+    if not cached_controllable(state.current_cfg):
         return _models_table_rows(groups), *noop, (
             "Model selection has no effect right now - connected to a server this app doesn't control "
             "(external mode, or an unrecognized server already using the managed port)."
@@ -475,7 +474,7 @@ def models_action_ui(groups: list[ModelGroup], quant_name: str, mmproj_name: str
     _action_mode_for_selection) and dispatches to it, then refreshes the
     download-status row too in case this action changed the queue."""
     group = _group_for_quant_value(groups, quant_name)
-    mode = _action_mode_for_selection(group, quant_name, mmproj_name, cached_controllable())
+    mode = _action_mode_for_selection(group, quant_name, mmproj_name, cached_controllable(state.current_cfg))
     if mode == "download":
         table_u, quant_u, mmproj_u, action_u, status = models_download_ui(groups, quant_name, mmproj_name)
     else:

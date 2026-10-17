@@ -5,7 +5,7 @@ system/python/
 setup-env-classic.bat
 handoff.md
 CLAUDE.md
-llama/
+/llama/
 webui/models/*
 !webui/models/.gitkeep
 webui/config/settings.json

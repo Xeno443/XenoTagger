@@ -1,6 +1,11 @@
-"""Which llama-server this session manages (_session/_session_lock), how
-to get a client for it, and the cached server-reachability state that
-gates Single/Batch/Recaption and the Models tab."""
+"""Which llama-server this app process manages (_session/_session_lock),
+how to get a client for it, and the cached server-reachability state that
+gates Single/Batch/Recaption and the Models tab.
+
+Gradio-free, like every non-settings_ui module in a backend: functions
+that need the current config take it as `cfg` (the GUI passes
+ui.state.current_cfg), and the two transition trackers return the popup
+text instead of showing it - the frame (app.py) does the notify()."""
 
 from __future__ import annotations
 
@@ -8,15 +13,13 @@ import logging
 import threading
 from typing import Optional
 
-from core.client import LlamaClient
 from core.config import AppConfig
-from core.models import resolve_selection
-from core.server import MANAGED_HOST, ServerError, ServerStatus, check_status, resolve_server
-from ui import state
-from ui.downloads_queue import download_abort_all
-from ui.notify import notify
 
-log = logging.getLogger("app")  # fixed name, see app.py
+from .client import LlamaClient
+from .models import resolve_selection
+from .server import MANAGED_HOST, ServerError, ServerStatus, check_status, resolve_server
+
+log = logging.getLogger(__name__)
 
 _session = {"managed": None, "client": None, "base_url": None}
 # Guards every read/decide/write of _session - without it, two requests
@@ -82,17 +85,17 @@ def stop_managed() -> None:
 #
 # "managed" mode has no implicit lazy-start anymore - starting the server
 # is always an explicit action (the "Start llama server" button, or
-# autostart at launch - see ui.settings.llama and app.py's autostart),
+# autostart at launch - see backends/llama/settings_ui.py),
 # never a side effect of clicking Caption. So "reachable" here means
 # exactly one thing for both modes: is something actually answering a
 # health check right now. "Installed but not started yet" is just as
 # unusable as "not installed at all" from this section's point of view -
-# see core.server.ServerStatus.installed for how the two get told apart
+# see server.ServerStatus.installed for how the two get told apart
 # for status-text/button purposes elsewhere. "external" mode has no local
 # fallback we control at all, so it always needs a real live health check.
 #
 # The mode-level categorization (including the base "controllable" -
-# see core.server.ServerStatus) lives in core/server.py's check_status(),
+# see server.ServerStatus) lives in server.py's check_status(),
 # which never starts or stops anything, unlike resolve_server(). It's a
 # real network call though (is_healthy), so it's cached here and
 # refreshed on its own slower timer (see reachability_timer in app.py's
@@ -111,9 +114,9 @@ _reachability_lock = threading.RLock()
 _reachability_cache = ServerStatus(reachable=True, controllable=True, installed=True)  # optimistic default until the first real check
 
 
-def refresh_reachability_cache() -> ServerStatus:
+def refresh_reachability_cache(cfg: AppConfig) -> ServerStatus:
     global _reachability_cache
-    result = check_status(state.current_cfg)
+    result = check_status(cfg)
     with _reachability_lock:
         _reachability_cache = result
     return result
@@ -142,7 +145,7 @@ def is_server_managed_by_us(base_url: str) -> bool:
     stopping) whatever's currently answering at base_url - what the status
     bar calls "running" rather than a healthy-but-unowned server. Session-
     local only; doesn't know about anything from a previous app run (see
-    core/server.py's docstring on why that's on purpose)."""
+    server.py's docstring on why that's on purpose)."""
     managed = _session.get("managed")
     connected = _session.get("client") is not None and _session.get("base_url") == base_url
     return connected and managed is not None
@@ -152,7 +155,7 @@ def managed_base_url(cfg: AppConfig) -> str:
     return f"http://{MANAGED_HOST}:{cfg.server_port}"
 
 
-def cached_controllable() -> bool:
+def cached_controllable(cfg: AppConfig) -> bool:
     """Whether the Models tab should be usable right now - stricter than
     ServerStatus.controllable's mode-level check (see its docstring):
     external mode is never controllable, same as before, but a running
@@ -168,7 +171,6 @@ def cached_controllable() -> bool:
         status = _reachability_cache
     if not status.controllable:
         return False
-    cfg = state.current_cfg
     if cfg.server_mode == "managed" and status.reachable:
         return is_server_managed_by_us(managed_base_url(cfg))
     return True
@@ -180,11 +182,13 @@ _down_is_crash = False  # persists for a whole down-streak, not just its first t
 _expected_stop = False  # set by stop_managed() itself, consumed by update_reachability_tracking - see both docstrings
 
 
-def note_controllable_transition(controllable: bool, cfg: AppConfig, status: ServerStatus) -> None:
-    """Fires exactly one gr.Info the moment the Models tab becomes
-    unusable (not on every reachability_timer tick for as long as it stays
-    that way), whether that's discovered at startup or later. Also aborts
-    any in-flight/queued downloads at that same moment (a deliberate
+def note_controllable_transition(controllable: bool, cfg: AppConfig, status: ServerStatus) -> Optional[str]:
+    """Returns a popup message exactly once, the moment the Models tab
+    becomes unusable (not on every reachability_timer tick for as long as
+    it stays that way), whether that's discovered at startup or later -
+    None otherwise. The caller (ui/reachability.py) shows it as an info
+    toast and also aborts any in-flight/queued downloads at that same
+    moment (a deliberate
     reversal of the earlier "let them finish" behavior - decided this
     session that switching away from a controllable state likely means
     those downloads are no longer wanted at all) - done here, not gated
@@ -199,22 +203,24 @@ def note_controllable_transition(controllable: bool, cfg: AppConfig, status: Ser
     own, so this only needs to add the ownership-specific explanation
     when there's actually something running to have an opinion about."""
     global _last_known_controllable
+    message = None
     if not controllable and _last_known_controllable:
         if cfg.server_mode == "managed" and not status.installed:
-            notify("Model management is disabled: llama.cpp isn't installed yet, so there's nothing to manage.")
+            message = "Model management is disabled: llama.cpp isn't installed yet, so there's nothing to manage."
         else:
-            notify(
+            message = (
                 "Model management is disabled: the active llama-server isn't one this app "
                 "started, so what it currently has loaded isn't something the Models tab can "
                 "show you or change."
             )
-        download_abort_all()
     _last_known_controllable = controllable
+    return message
 
 
-def update_reachability_tracking(status: ServerStatus, cfg: AppConfig) -> None:
-    """Updates _last_known_reachable/_down_is_crash and fires exactly one
-    popup for a genuinely NEW, UNEXPECTED transition into unreachable -
+def update_reachability_tracking(status: ServerStatus, cfg: AppConfig) -> Optional[str]:
+    """Updates _last_known_reachable/_down_is_crash and returns exactly one
+    warning-popup message (the caller shows it) for a genuinely NEW,
+    UNEXPECTED transition into unreachable -
     never a repeat every poll while it stays that way, and never at all
     for a transition stop_managed() itself caused (see _expected_stop -
     stopping a server we manage is never a crash by definition, whether
@@ -249,7 +255,7 @@ def update_reachability_tracking(status: ServerStatus, cfg: AppConfig) -> None:
     if status.reachable:
         _down_is_crash = False
         _expected_stop = False
-        return
+        return None
     managed_installed = cfg.server_mode == "managed" and status.installed
     if was_reachable:
         expected = _expected_stop
@@ -257,13 +263,13 @@ def update_reachability_tracking(status: ServerStatus, cfg: AppConfig) -> None:
         _down_is_crash = not expected
         if _down_is_crash:
             if managed_installed:
-                notify("The managed llama-server stopped responding - it may have crashed. Restart it from Settings.", level="warning")
-            else:
-                notify(f"No captioning server is reachable - {status.reason} Set it up on the Settings tab.", level="warning")
+                return "The managed llama-server stopped responding - it may have crashed. Restart it from Settings."
+            return f"No captioning server is reachable - {status.reason} Set it up on the Settings tab."
     elif was_reachable is None and not managed_installed:
-        notify(f"No captioning server is reachable - {status.reason} Set it up on the Settings tab.", level="warning")
+        return f"No captioning server is reachable - {status.reason} Set it up on the Settings tab."
     # was_reachable is False (steady-state down), or None+managed_installed
     # (fresh idle) - no popup either way.
+    return None
 
 
 def status_label(cfg: AppConfig, reachable: bool, installed: bool) -> str:
@@ -317,7 +323,7 @@ def get_client(cfg: AppConfig) -> LlamaClient:
         return _session["client"]
 
 
-def try_start_managed_llama() -> tuple[bool, str]:
+def try_start_managed_llama(cfg: AppConfig) -> tuple[bool, str]:
     """Attempts to start (or confirm-reuse) the managed llama-server for
     the current config, blocking until ready or failed. Shared by the
     "Start llama server" button, autostart-at-launch, and a settings-save
@@ -329,15 +335,14 @@ def try_start_managed_llama() -> tuple[bool, str]:
     missing/invalid model selection is reported the same way here as it
     would be from any other entry point."""
     try:
-        get_client(state.current_cfg)
+        get_client(cfg)
     except ServerError as exc:
         return False, f"Couldn't start llama-server: {exc}"
-    refresh_reachability_cache()
+    refresh_reachability_cache(cfg)
     return True, "llama-server is running."
 
 
-def display_base_url() -> str:
-    cfg = state.current_cfg
+def display_base_url(cfg: AppConfig) -> str:
     if cfg.server_mode == "external":
         return cfg.external_url.rstrip("/")
     return managed_base_url(cfg)

@@ -36,13 +36,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .config import AppConfig
+from core.config import MODELS_DIR, WEBUI_DIR, AppConfig
 
 log = logging.getLogger(__name__)
 
-MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
-CACHE_PATH = Path(__file__).resolve().parent.parent / "config" / "models_cache.json"
-MODELS_SOURCE_PATH = Path(__file__).resolve().parent.parent / "config" / "models_source.json"
+CACHE_PATH = WEBUI_DIR / "config" / "models_cache.json"
+MODELS_SOURCE_PATH = WEBUI_DIR / "config" / "models_source.json"
 
 GGUF_MAGIC = b"GGUF"
 
@@ -319,15 +318,6 @@ def merge_curated(groups: list[ModelGroup], curated: list[CuratedModel]) -> list
             result.append(new_group)
             by_folder[c.folder_name] = new_group
     return sorted(result, key=lambda g: g.name.lower())
-
-
-def format_size(num_bytes: int) -> str:
-    size = float(num_bytes)
-    for unit in ("B", "KB", "MB", "GB"):
-        if size < 1024.0:
-            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
-        size /= 1024.0
-    return f"{size:.1f} TB"
 
 
 def resolve_selection(cfg: AppConfig) -> tuple[Optional[Path], Optional[Path], Optional[str]]:

@@ -1,5 +1,8 @@
-"""Settings -> Hydra: dependency install, Load/Unload, and the tagger
-settings."""
+"""Settings -> Hydra: dependency install, Load/Unload, the tagger
+settings, and Hydra's launch-time autoload. The only file in
+backends/hydra/ that imports Gradio or ui/ - loaded by ui.tab_settings via
+HydraBackend.settings_ui_module (see ui.tab_settings for what it must
+provide)."""
 
 from __future__ import annotations
 
@@ -11,27 +14,28 @@ from typing import Optional
 
 import gradio as gr
 
-from core import hydra_classifier
-from core.hydra_install import MODEL_PATH as HYDRA_MODEL_PATH, install_deps as hydra_install_deps
+from backends import BACKENDS
+from core.lifecycle import load_with_coexistence
 from ui import state
 from ui.context import BuildContext
 from ui.dialogs import browse_tag_vocab_file_ui
-from ui.llama_session import (
-    is_server_managed_by_us, managed_base_url, refresh_reachability_cache, stop_managed, try_start_managed_llama,
-)
 from ui.notify import notify
 from ui.operation import operation_blocked_by
 
-log = logging.getLogger("app")  # fixed name, see app.py
+from . import BACKEND
+from . import classifier as hydra_classifier
+from .install import MODEL_PATH as HYDRA_MODEL_PATH, install_deps as hydra_install_deps
+
+log = logging.getLogger(__name__)
 
 # --------------------------------------------------------------- Hydra install/lifecycle
 #
 # Two separate concerns, kept apart the same way llama's own install
-# section (ui.settings.llama) is kept apart from ui.downloads_queue:
+# section (backends/llama/settings_ui.py) is kept apart from ui.downloads_queue:
 #   - Installing Hydra's Python deps (torch + friends) is a pip subprocess
 #     - its own lock/thread/state below. Its per-line output is NOT
 #     streamed into the UI (a dedicated Textbox for this was tried and
-#     removed - too noisy for a settings page); core.hydra_install's own
+#     removed - too noisy for a settings page); install.py's own
 #     log.debug("pip: %s", line) call already captures every line to the
 #     debug log unconditionally (see its own docstring), regardless of
 #     whether a UI callback is listening, so nothing is lost by not
@@ -49,7 +53,7 @@ log = logging.getLogger("app")  # fixed name, see app.py
 # Loading/unloading the model itself is not a background job at all - it
 # blocks for a few seconds at most (~1GB), so it's a plain generator
 # click handler, the same shape as _start_managed_llama_ui/
-# _end_managed_llama_ui in ui.settings.llama (no dedicated timer needed - unlike
+# _end_managed_llama_ui in backends/llama/settings_ui.py (no dedicated timer needed - unlike
 # llama-server's reachability, "is Hydra loaded" can only change via our
 # own explicit actions here, never externally).
 
@@ -57,7 +61,7 @@ _hydra_install_lock = threading.RLock()
 _hydra_install_thread: Optional[threading.Thread] = None
 _hydra_install_running = False
 # One-shot (message, level) popped by the next _hydra_install_status_ui
-# tick, same single-shot idiom as llama's own _install_announce (ui.settings.llama) -
+# tick, same single-shot idiom as llama's own _install_announce (backends/llama/settings_ui.py) -
 # so a stale completion message doesn't keep stomping on whatever
 # Load/Unload wrote to hydra_lifecycle_infotext in the meantime, and so
 # a one-shot notify() popup fires on completion/failure.
@@ -80,6 +84,25 @@ def _hydra_metric_to_sliders(metric: str) -> tuple[float, float]:
 
 def hydra_sliders_to_metric(confidence: float, threshold: float) -> str:
     return f"f{confidence:g}@{threshold:g}"
+
+
+def collect_settings(
+    hydra_enabled, hydra_device, hydra_confidence, hydra_threshold, hydra_implications,
+    hydra_exclude_categories, hydra_exclude_tags, hydra_max_tags, hydra_autoload_model, hydra_tag_vocab_path,
+) -> dict:
+    """AppConfig updates from build()'s save_inputs, in that order. The
+    two metric sliders map to the one hydra_metric string."""
+    return dict(
+        hydra_enabled=bool(hydra_enabled),
+        hydra_device=hydra_device,
+        hydra_metric=hydra_sliders_to_metric(float(hydra_confidence), float(hydra_threshold)),
+        hydra_implications=hydra_implications,
+        hydra_exclude_categories=hydra_exclude_categories,
+        hydra_exclude_tags=hydra_exclude_tags,
+        hydra_max_tags=int(hydra_max_tags),
+        hydra_autoload_model=bool(hydra_autoload_model),
+        hydra_tag_vocab_path=hydra_tag_vocab_path,
+    )
 
 
 def _hydra_status_text() -> str:
@@ -160,29 +183,19 @@ def _hydra_install_status_ui():
     )
 
 
-def load_hydra_with_llama_coexistence():
-    """The shared "load Hydra, safely coexisting with an already-running
-    managed llama-server" logic - used by BOTH the manual "Load Hydra
-    model" button and the startup autoload path, so correctness doesn't
-    depend on which of the two triggered it, or on the autoload chain's
-    own Hydra-before-llama ordering (see AppConfig.hydra_autoload_model's
-    docstring) staying right forever. That ordering just avoids the
+def _load_hydra_ui():
+    """The shared "load Hydra" UI flow - used by BOTH the manual "Load
+    Hydra model" button and the launch-time autoload, so correctness
+    doesn't depend on which of the two triggered it, or on the autoload
+    chain's own fixed-before-adaptive ordering (core.lifecycle.
+    autoload_order) staying right forever. That ordering just avoids the
     pointless stop-immediately-after-start dance during a normal dual-
-    autostart launch; this function is what actually makes it safe
-    regardless.
-
-    llama-server's own n_gpu_layers="auto" is the one piece here that
-    adapts gracefully to reduced free VRAM (partial CPU offload);
-    hydra_classifier.load() is all-or-nothing onto one device. So if a
-    MANAGED llama-server this session owns is already running, and
-    hydra_device is "cuda" (no VRAM contention at all if it's "cpu" -
-    skip the dance entirely), it's stopped first so Hydra gets first pick
-    of free VRAM, then llama-server is restarted from state.current_cfg so
-    "auto" resizes itself around whatever Hydra actually claimed.
-    Ownership-gated the same way "Stop llama server" already is - never
-    touches a server this session didn't start (an orphaned process from
-    a previous run, or someone else's server on that port, is left
-    alone, same as everywhere else in the app).
+    autostart launch; core.lifecycle.load_with_coexistence is what
+    actually makes it safe regardless: if hydra_device is "cuda", every
+    running adaptive backend this app owns (llama-server) is stopped
+    first so Hydra gets first pick of free VRAM, then restarted so its
+    "auto" resizes itself around whatever Hydra actually claimed. Never
+    touches a server this session didn't start.
 
     Refuses outright (no stop/restart at all) if a caption operation is
     currently active - killing the server out from under an in-flight
@@ -208,38 +221,42 @@ def load_hydra_with_llama_coexistence():
         notify(message, level="warning")
         return
 
-    cfg = state.current_cfg
-    needs_restart = cfg.hydra_device == "cuda" and is_server_managed_by_us(managed_base_url(cfg))
-
-    if needs_restart:
-        yield "Stopping llama-server to free VRAM for Hydra...", gr.update()
-        stop_managed()
-        refresh_reachability_cache()
-
-    yield "Loading Hydra model...", gr.update()
-    try:
-        hydra_classifier.load(cfg)
-        message = f"Hydra model loaded on {hydra_classifier.status().device}."
-        level = "info"
-    except hydra_classifier.HydraError as exc:
-        message = f"Couldn't load Hydra model: {exc}"
-        level = "warning"
-
-    if needs_restart:
-        yield f"{message} Restarting llama-server...", gr.update(value=_hydra_status_text())
-        started, start_message = try_start_managed_llama()
-        message = f"{message} {start_message}" if started else f"{message} Restart failed: {start_message}"
-        if not started:
-            level = "warning"
-
-    yield message, gr.update(value=_hydra_status_text())
-    notify(message, level=level)
+    for step in load_with_coexistence(BACKEND, BACKENDS, state.current_cfg):
+        # Status line refreshes once Hydra's own load has happened
+        # (restarting/done), not while llama-server is being stopped.
+        status_update = gr.update(value=_hydra_status_text()) if step.phase in ("restarting", "done") else gr.update()
+        yield step.message, status_update
+        if step.phase == "done":
+            notify(step.message, level=step.level)
 
 
 def _load_hydra_model_ui():
     """The manual "Load Hydra model" button's click target - see
-    load_hydra_with_llama_coexistence()'s own docstring."""
-    yield from load_hydra_with_llama_coexistence()
+    _load_hydra_ui()'s own docstring."""
+    yield from _load_hydra_ui()
+
+
+def _autoload_hydra_model_ui():
+    """This backend's launch-time autoload step (registered in build()),
+    run before llama-server's autostart by core.lifecycle.autoload_order -
+    so that when both are enabled, Hydra gets first pick of a clean,
+    fully-free VRAM budget and llama-server's own n_gpu_layers="auto"
+    (which gracefully adapts to reduced free VRAM, unlike Hydra's own
+    all-or-nothing load) sizes itself around whatever's left. Silent no-op
+    unless BACKEND.wants_autoload (hydra_enabled, hydra_autoload_model,
+    deps+model both present, nothing already loaded) - same "no popup for
+    didn't-autostart" convention as llama's autostart.
+
+    The actual load - including the stop/restart dance, moot here in the
+    normal case since nothing's started yet this early in a fresh launch,
+    but still a real safety net for an edge case like a page reload while
+    an owned llama-server is running - is _load_hydra_ui(), the same
+    shared flow the manual Load button uses."""
+    if not BACKEND.wants_autoload(state.current_cfg):
+        yield gr.update(), gr.update()
+        return
+    notify("Loading Hydra model automatically (autoload is enabled)...")
+    yield from _load_hydra_ui()
 
 
 def _unload_hydra_model_ui():
@@ -253,7 +270,7 @@ def _unload_hydra_model_ui():
 
 def build(ctx: BuildContext):
     cfg = state.current_cfg
-    with gr.Tab("Hydra", id="hydra-settings") as hydra_settings_tab:
+    with gr.Tab("Hydra", id=f"{BACKEND.id}-settings") as hydra_settings_tab:
         gr.Markdown(
             "Hydra 3.5 (RedRocket) is an optional second-stage e621 tag "
             "classifier - if loaded, its tags are appended after the VLM's "
@@ -380,9 +397,9 @@ def build(ctx: BuildContext):
             _hydra_install_status_ui, [], _hydra_install_status_outputs
         )
         # Same immediate-refresh reasoning as Start/Stop
-        # llama's own chained calls (ui.settings.llama) - a manual Load
+        # llama's own chained calls (backends/llama/settings_ui.py) - a manual Load
         # click can now stop+restart the managed server
-        # (see load_hydra_with_llama_coexistence), and
+        # (see _load_hydra_ui), and
         # waiting up to 8s for reachability_timer's next
         # tick to reflect that would be the same
         # staleness already fixed for Start/Stop/Save.
@@ -397,15 +414,17 @@ def build(ctx: BuildContext):
 
     ctx.on_tick(_hydra_install_status_ui, [], _hydra_install_status_outputs)
     ctx.on_load(_hydra_install_status_ui, [], _hydra_install_status_outputs)
+    ctx.on_autoload(BACKEND.id, _autoload_hydra_model_ui, [hydra_lifecycle_infotext, hydra_status_md])
 
     return SimpleNamespace(
         tab=hydra_settings_tab,
-        lifecycle_infotext=hydra_lifecycle_infotext,
-        status_md=hydra_status_md,
-        # Save settings fields, in save_settings_ui's own order.
-        hydra_enabled=hydra_enabled, hydra_device=hydra_device, hydra_confidence=hydra_confidence,
-        hydra_threshold=hydra_threshold, hydra_implications=hydra_implications,
-        hydra_exclude_categories=hydra_exclude_categories, hydra_exclude_tags=hydra_exclude_tags,
-        hydra_max_tags=hydra_max_tags, hydra_autoload_model=hydra_autoload_model,
-        hydra_tag_vocab_path=hydra_tag_vocab_path,
+        tab_label="Hydra",
+        tab_id=f"{BACKEND.id}-settings",
+        gated=True,
+        # collect_settings()'s parameter order.
+        save_inputs=[
+            hydra_enabled, hydra_device, hydra_confidence, hydra_threshold, hydra_implications,
+            hydra_exclude_categories, hydra_exclude_tags, hydra_max_tags, hydra_autoload_model,
+            hydra_tag_vocab_path,
+        ],
     )

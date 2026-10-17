@@ -35,6 +35,15 @@ CHUNK_SIZE = 1024 * 1024
 REQUEST_TIMEOUT = 30  # seconds of silence (connect or between chunks), not a total-transfer cap
 
 
+def format_size(num_bytes: int) -> str:
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024.0:
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024.0
+    return f"{size:.1f} TB"
+
+
 @dataclass
 class DownloadItem:
     url: str
@@ -53,12 +62,13 @@ def download_one(
     scan can't mistake an interrupted download for a real, usable file.
 
     Returns True if the file was actually completed and renamed into
-    place, False if should_abort() cut it short - lets the caller (app.py's
-    worker) know whether to trigger a Models-tab refresh, without it
-    having to duplicate the abort-vs-done distinction made here.
+    place, False if should_abort() cut it short - lets the caller
+    (ui/downloads_queue.py's worker) know whether to trigger a Models-tab
+    refresh, without it having to duplicate the abort-vs-done distinction
+    made here.
 
     on_progress, if given, is called after every chunk write with the
-    cumulative byte count written so far - the UI side (app.py) turns
+    cumulative byte count written so far - the UI side turns
     that into a percentage/speed display; this module has no opinion on
     how it's shown, only that it's a running total, not a delta."""
     item.dest_path.parent.mkdir(parents=True, exist_ok=True)

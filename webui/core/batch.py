@@ -15,8 +15,8 @@ out of sync with reality if images get added, removed, or a caption file
 gets hand-edited between runs.
 
 should_stop, if given, is polled between images (never mid-request - a
-graceful "finish the current one, then stop" signal) - see app.py's
-Operation-tracking section for what actually drives it from the UI side;
+graceful "finish the current one, then stop" signal) - see ui/operation.py
+for what actually drives it from the UI side;
 this module has no opinion on where the flag comes from, only that it's
 a zero-argument callable returning a bool.
 """
@@ -28,8 +28,9 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Optional
 
+from backends.llama.client import ClientError, LlamaClient
+
 from .captioner import caption_image
-from .client import ClientError, LlamaClient
 from .config import AppConfig
 
 log = logging.getLogger(__name__)

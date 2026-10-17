@@ -14,11 +14,11 @@ import gradio as gr
 from PIL import Image as PILImage
 
 from core.batch import find_images, run_batch
-from core.server import ServerError, is_healthy
+from backends.llama.server import ServerError, is_healthy
 from ui import state
 from ui.context import BuildContext
 from ui.dialogs import browse_directory_ui
-from ui.llama_session import display_base_url, get_client
+from backends.llama.session import display_base_url, get_client
 from ui.notify import notify
 from ui.operation import (
     COL_HIDDEN, COL_SHOWN, INTERRUPT_RESET, RUN_BUSY, RUN_IDLE, operation_blocked_by, operation_end,
@@ -56,7 +56,7 @@ def run_batch_ui(directory_str, overwrite, trigger_word_override):
     operation_start("batch", "Batch captioning")
     try:
         cfg = state.current_cfg
-        base_url = display_base_url()
+        base_url = display_base_url(cfg)
         already_up = is_healthy(base_url)
         running_state = (RUN_IDLE, COL_HIDDEN, COL_SHOWN, INTERRUPT_RESET)
         if cfg.server_mode == "external":

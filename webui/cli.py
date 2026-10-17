@@ -20,16 +20,16 @@ import sys
 from pathlib import Path
 
 from core import config as config_mod
-from core import hydra_classifier
-from core.client import LlamaClient
-from core.hydra_install import (
+from backends.hydra import classifier as hydra_classifier
+from backends.llama.client import LlamaClient
+from backends.hydra.install import (
     MODEL_SIZE_BYTES as HYDRA_MODEL_SIZE_BYTES,
     download_model as hydra_download_model,
     install_deps as hydra_install_deps,
 )
-from core.llama_install import BACKENDS, DEFAULT_BACKEND, install, plan_install
-from core.models import resolve_selection, scan_model_variants
-from core.server import ServerError, resolve_server
+from backends.llama.install import BACKENDS, DEFAULT_BACKEND, install, plan_install
+from backends.llama.models import resolve_selection, scan_model_variants
+from backends.llama.server import ServerError, resolve_server
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -68,13 +68,14 @@ def setup_logging(log_file: str | None, debuglog: str | None, verbose: bool) -> 
 
     root = logging.getLogger()
     # Deliberately NOT touching the root logger's level - only our own
-    # namespaces ("core", "cli") get elevated below. Every third-party
+    # namespaces ("core", "backends", "cli") get elevated below. Every third-party
     # library's logger (urllib3, httpcore, asyncio, ...) inherits from root
     # when it has no level of its own, so leaving root alone keeps them all
     # at their own quiet default instead of flooding output with unrelated
     # chatter the moment DEBUG is wanted for our own code.
     our_level = logging.DEBUG if (verbose or debuglog) else logging.INFO
     logging.getLogger("core").setLevel(our_level)
+    logging.getLogger("backends").setLevel(our_level)
     logging.getLogger("cli").setLevel(our_level)
 
     console = logging.StreamHandler(sys.stdout)
@@ -102,7 +103,7 @@ def setup_logging(log_file: str | None, debuglog: str | None, verbose: bool) -> 
 def _install_llama(log: logging.Logger, backend_id: str) -> int:
     """Synchronous install (no worker thread needed for a one-shot CLI
     invocation) - logs progress at INFO on phase changes and roughly
-    every 10% of the download, then returns 0/1. Shares core.llama_install
+    every 10% of the download, then returns 0/1. Shares backends.llama.install
     with the GUI's Settings -> Llama installer, so both stay in sync."""
     try:
         plan = plan_install(backend_id)
@@ -144,7 +145,7 @@ def _install_llama(log: logging.Logger, backend_id: str) -> int:
 def _install_hydra(log: logging.Logger) -> int:
     """Synchronous (no worker thread needed for a one-shot CLI invocation) -
     pip-installs Hydra's deps then downloads its model weight, sharing
-    core.hydra_install with the GUI's Settings -> Hydra installer/
+    backends.hydra.install with the GUI's Settings -> Hydra installer/
     downloader so both stay in sync."""
     log.info("Installing Hydra dependencies (torch + friends - this downloads several GB) ...")
     if not hydra_install_deps(on_output=lambda line: log.info("pip: %s", line)):

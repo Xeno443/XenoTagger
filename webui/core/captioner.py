@@ -2,8 +2,12 @@
 own docstring below for why this indirection exists (it's the thing that
 makes the Single-image tab, the Batch tab, and the CLI all behave
 identically instead of three separately-maintained call sites). The
-Hydra 3.5 second-stage tag classifier (core.hydra_classifier) hooks in
+Hydra 3.5 second-stage tag classifier (backends.hydra.classifier) hooks in
 here for exactly that reason - see caption_image() below.
+
+Still calls the llama client and Hydra directly - the one place core/
+imports backends/. The v0.9 step-3 caption pipeline moves this behind
+core.backend's Backend interface.
 
 apply_trigger_word()'s trigger_word argument distinguishes None from ""
 deliberately, and callers rely on that: None means "no override was
@@ -21,8 +25,9 @@ import logging
 from pathlib import Path
 from typing import Callable, Optional, Union
 
-from . import hydra_classifier
-from .client import CaptionResult, LlamaClient
+from backends.hydra import classifier as hydra_classifier
+from backends.llama.client import CaptionResult, LlamaClient
+
 from .config import AppConfig
 
 log = logging.getLogger(__name__)
@@ -73,7 +78,7 @@ def caption_image(
     on_stage, if given, is called with a short label ("captioning" /
     "tagging (Hydra)") right before each of this function's two possible
     model calls - this is the hook the GUI uses to show which stage a
-    caption is currently in (see app.py's _operation_set_stage). Purely
+    caption is currently in (the Single/Batch/Review tabs' on_stage_cb). Purely
     optional and side-effect-only - core/ itself has no UI, this is just
     a plain callback so it stays framework-agnostic; the CLI simply
     doesn't pass one."""

@@ -13,11 +13,11 @@ import gradio as gr
 
 from core import config as config_mod
 from core.captioner import caption_image
-from core.client import ClientError
-from core.server import ServerError, is_healthy
+from backends.llama.client import ClientError
+from backends.llama.server import ServerError, is_healthy
 from ui import state
 from ui.context import BuildContext
-from ui.llama_session import display_base_url, get_client
+from backends.llama.session import display_base_url, get_client
 from ui.operation import (
     COL_HIDDEN, COL_SHOWN, INTERRUPT_RESET, RUN_BUSY, RUN_IDLE, operation_blocked_by, operation_end,
     operation_interrupt_click, operation_start,
@@ -41,7 +41,7 @@ def run_single_ui(image_path, trigger_word_override: str):
     try:
         log.info("Single-image caption requested: %s", image_path)
         cfg = state.current_cfg
-        base_url = display_base_url()
+        base_url = display_base_url(cfg)
         already_up = is_healthy(base_url)
         running_state = (RUN_IDLE, COL_HIDDEN, COL_SHOWN, INTERRUPT_RESET)
         if cfg.server_mode == "external":

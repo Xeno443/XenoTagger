@@ -1,5 +1,5 @@
 """Vendored inference code for RedRocket's Hydra 3.5 e621 tag classifier
-(https://huggingface.co/RedRocket/Hydra), used by core.hydra_classifier
+(https://huggingface.co/RedRocket/Hydra), used by backends.hydra.classifier
 as the in-process second-stage tagger. Copied verbatim from upstream's
 own `hydra/hydra/` package (their internal implementation, not their
 gui.pyw/inference.py/service.py entry points, which this app doesn't

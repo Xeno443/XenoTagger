@@ -50,11 +50,10 @@ from typing import Optional
 
 import requests
 
-from .config import AppConfig
+from core.config import ROOT_DIR, WEBUI_DIR, AppConfig
 
-ROOT_DIR = Path(__file__).resolve().parent.parent.parent
 LLAMA_SERVER_EXE = ROOT_DIR / "llama" / "llama-server.exe"
-LOG_PATH = ROOT_DIR / "webui" / "logs" / "llama-server.log"
+LOG_PATH = WEBUI_DIR / "logs" / "llama-server.log"
 
 # Managed mode always binds/talks to localhost - it's a subprocess this
 # app itself spawns and is the only intended client of, so there's no

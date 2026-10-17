@@ -3,7 +3,7 @@ second-stage hook (see captioner.py's own docstring for why that single
 hook point exists). Pure Python + torch, imported and run in the same
 interpreter as the GUI/CLI (this repo's "no venv, everything in
 system\\python" house rule applies to Hydra's deps too - see
-core.hydra_install), so unlike llama-server there's no separate
+backends.hydra.install), so unlike llama-server there's no separate
 process/port/health-check to manage here - just a lazily-populated
 module-level singleton.
 
@@ -27,7 +27,7 @@ needs an explicit Unload + Load to actually change.
 
 torch and the vendored rr_hydra package are imported lazily inside
 functions, not at module top level, so importing this module never
-requires torch to be installed - mirrors core.models' own `import gguf`
+requires torch to be installed - mirrors backends.llama.models' own `import gguf`
 pattern for the same reason (this module needs to be importable, and
 status() needs to work, before the optional deps are ever installed).
 """
@@ -40,8 +40,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Union
 
-from .config import AppConfig
-from .hydra_install import MODEL_PATH, deps_installed, model_downloaded
+from core.config import AppConfig
+
+from .install import MODEL_PATH, deps_installed, model_downloaded
 
 log = logging.getLogger(__name__)
 
@@ -65,7 +66,7 @@ class HydraResult:
 
 
 _lock = threading.Lock()
-_model = None  # a vendor.rr_hydra.model.Hydra instance, once loaded
+_model = None  # a .vendor.rr_hydra.model.Hydra instance, once loaded
 _device: Optional[str] = None
 
 
@@ -104,13 +105,11 @@ def load(cfg: AppConfig) -> None:
         try:
             import torch
 
-            # Absolute, not relative (`from ..vendor...`) - core/ is
-            # imported as a top-level package (app.py/cli.py run with
-            # webui/ as sys.path[0] and do `from core import ...`
-            # directly, never through a "webui" package umbrella), so
-            # core has no parent package for a ".." to climb to. vendor/
-            # is importable the same top-level way core itself is.
-            from vendor.rr_hydra.model import load_model
+            # Relative within this backend package (backends.hydra), which
+            # is fine since backends/ is a real top-level package - only a
+            # ".." climbing above backends/ would fail (app.py/cli.py run
+            # with webui/ as sys.path[0], no "webui" package umbrella).
+            from .vendor.rr_hydra.model import load_model
         except ImportError as exc:
             raise HydraError(f"Could not import Hydra's dependencies: {exc}") from exc
 
@@ -173,7 +172,7 @@ def classify(image: Union[str, Path, bytes], cfg: AppConfig) -> HydraResult:
     try:
         import torch
 
-        from vendor.rr_hydra import image as hydra_image
+        from .vendor.rr_hydra import image as hydra_image
 
         source = str(image) if isinstance(image, Path) else image
         tensor = model.load_image(source)

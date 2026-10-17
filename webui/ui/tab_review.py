@@ -16,12 +16,12 @@ from core.batch import (
     ISSUE_SUFFIX, NLP_SUFFIX, TAGS_SUFFIX, ReviewItem, review_item_status, scan_review_status,
 )
 from core.captioner import caption_image
-from core.client import ClientError
-from core.server import ServerError, is_healthy
+from backends.llama.client import ClientError
+from backends.llama.server import ServerError, is_healthy
 from ui import state
 from ui.context import BuildContext
 from ui.dialogs import browse_directory_ui
-from ui.llama_session import display_base_url, get_client
+from backends.llama.session import display_base_url, get_client
 from ui.operation import (
     COL_HIDDEN, COL_SHOWN, INTERRUPT_RESET, current_operation, operation_blocked_by, operation_end,
     operation_interrupt_click, operation_lock, operation_start,
@@ -340,7 +340,7 @@ def review_recaption_ui(items: list[ReviewItem], index: int, current_caption: st
     try:
         log.info("Review recaption requested: %s", item.path)
         cfg = state.current_cfg
-        base_url = display_base_url()
+        base_url = display_base_url(cfg)
         already_up = is_healthy(base_url)
         running_state = (COL_HIDDEN, COL_SHOWN, INTERRUPT_RESET, *_REVIEW_NAV_BUSY)
         msg = "Processing..." if already_up else "Starting server (loading model)..."

@@ -1,18 +1,21 @@
 """Gradio UI entry point and frame: Single-image captioning, Batch
 processing, Review, Models, Settings, and an opt-in Debuglog tab. The CLI
-(cli.py) is a separate, independent entry point that shares core/ with
-this file but not this file or ui/ - nothing UI-specific belongs in core/.
+(cli.py) is a separate, independent entry point that shares core/ and
+backends/ with this file but not this file or ui/ - nothing UI-specific
+belongs in core/, or in a backend outside its settings_ui.py.
 
 This file only builds the frame: the Blocks, the top-level Tabs, the
-status bar, the two timers, the launch chain (Hydra autoload, llama
-autostart), and the wiring that crosses tabs (Batch -> Review, Models ->
-Settings, the reachability refresh that gates Single/Batch/Models). Each
-tab's own components and handlers live in ui/tab_*.py, the Settings
-sub-tabs in ui/settings/, and the UI-side state several tabs share in
-ui/state.py, ui/operation.py, ui/llama_session.py and
-ui/downloads_queue.py - see ui/__init__.py for the import rules that keep
-those acyclic. Tabs hand frame-level wiring back through a BuildContext
-(ui/context.py) instead of reaching for components they don't own.
+status bar, the two timers, the launch chain (each backend's autoload, in
+core.lifecycle.autoload_order), and the wiring that crosses tabs (Batch ->
+Review, Models -> Settings, the reachability refresh that gates
+Single/Batch/Models). Each tab's own components and handlers live in
+ui/tab_*.py, the Settings sub-tabs in each backend's settings_ui.py
+(backends/<id>/) and in ui/settings/, and the UI-side state several tabs
+share in ui/state.py, ui/operation.py, ui/reachability.py and
+ui/downloads_queue.py - see ui/__init__.py and backends/__init__.py for
+the import rules that keep those acyclic. Tabs hand frame-level wiring
+back through a BuildContext (ui/context.py) instead of reaching for
+components they don't own.
 
 Three coordination mechanisms guard shared, process-wide state that
 several tabs (and Settings' restart actions) can touch concurrently - the
@@ -21,7 +24,7 @@ function that calls another lock-holding function of its own while
 already holding the lock (get_client() calls stop_managed(); a plain
 Lock would deadlock there):
 
-  - `_session`/`_session_lock` (ui/llama_session.py): which llama-server
+  - `_session`/`_session_lock` (backends/llama/session.py): which llama-server
     (if any) we're currently managing. Guards against two requests racing
     in before any server is up yet (e.g. a batch run and a single-image
     caption both arriving at once) each deciding independently that no
@@ -54,7 +57,7 @@ independent gr.Button()s there too) is that the Interrupt button was
 never the one that started the long call, so it's never "busy" and is
 always immediately clickable - its own click handler is fast and
 non-blocking (flip a flag; on the second click, kill the managed
-llama-server process - see core/server.py's ManagedServer.stop for why a
+llama-server process - see backends/llama/server.py's ManagedServer.stop for why a
 hard kill is the only reliable way to actually interrupt an in-flight
 request). First click requests a graceful stop (batch: finish the
 current image, then stop before the next one; single-image has no next
@@ -123,22 +126,16 @@ os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
 
 import gradio as gr
 
+from backends import BACKENDS
+from backends.llama.session import cached_controllable, cached_reachable, refresh_reachability_cache
 from core import config as config_mod
-from core import hydra_classifier
 from core import tag_vocab
-from core.config import AppConfig
-from core.server import LLAMA_SERVER_EXE, get_loaded_model_name, is_healthy
+from core.lifecycle import autoload_order
 from ui import state, tab_batch, tab_debuglog, tab_models, tab_review, tab_settings, tab_single
-from ui.context import BuildContext
+from ui.context import REACHABILITY, BuildContext
 from ui.css import ALL_CSS
-from ui.llama_session import (
-    cached_controllable, cached_reachable, cached_status, display_base_url, note_controllable_transition,
-    refresh_reachability_cache, status_label, stop_managed, try_start_managed_llama, update_reachability_tracking,
-)
-from ui.notify import notify
 from ui.operation import current_operation, operation_lock, operation_status_text
-from ui.settings.hydra import load_hydra_with_llama_coexistence
-from ui.settings.llama import llama_lifecycle_button_updates
+from ui.reachability import tab_gating_updates, track_reachability_transitions
 from ui.tab_debuglog import setup_debug_logging
 from ui.tab_review import review_scan_ui
 
@@ -179,22 +176,15 @@ def _refresh_reachability_ui(current_tab_label: str):
     concluding they were still stuck on a disabled tab. gr.skip() leaves
     it untouched on ticks that don't redirect."""
     cfg = state.current_cfg
-    status = refresh_reachability_cache()
-    controllable = cached_controllable()
-    note_controllable_transition(controllable, cfg, status)
-    update_reachability_tracking(status, cfg)
-    models_tab_update = gr.update(interactive=controllable)
-    single_batch_update = gr.update(interactive=status.reachable)
-    start_btn_update, end_btn_update = llama_lifecycle_button_updates(cfg, status)
+    status = refresh_reachability_cache(cfg)
+    controllable = cached_controllable(cfg)
+    track_reachability_transitions(cfg, status, controllable)
     push_to_settings = (not controllable and current_tab_label == "Models") or (
         not status.reachable and current_tab_label in ("Single image", "Batch processing")
     )
     tabs_update = gr.update(selected="settings") if push_to_settings else gr.update()
     label_update = "Settings" if push_to_settings else gr.skip()
-    return (
-        models_tab_update, single_batch_update, single_batch_update,
-        start_btn_update, end_btn_update, tabs_update, label_update,
-    )
+    return (*tab_gating_updates(cfg, status, controllable), tabs_update, label_update)
 
 
 def _on_main_tab_select(evt: gr.SelectData) -> str:
@@ -258,18 +248,11 @@ def _startup_reachability_ui():
     docstring for why this matters and what silently goes wrong without
     it)."""
     cfg = state.current_cfg
-    status = refresh_reachability_cache()
-    controllable = cached_controllable()
-    note_controllable_transition(controllable, cfg, status)
-    update_reachability_tracking(status, cfg)
-    models_tab_update = gr.update(interactive=controllable)
-    single_batch_update = gr.update(interactive=status.reachable)
-    start_btn_update, end_btn_update = llama_lifecycle_button_updates(cfg, status)
+    status = refresh_reachability_cache(cfg)
+    controllable = cached_controllable(cfg)
+    track_reachability_transitions(cfg, status, controllable)
     tab_target, tab_label = ("single", "Single image") if status.reachable else ("settings", "Settings")
-    return (
-        gr.update(selected=tab_target), models_tab_update, single_batch_update, single_batch_update,
-        start_btn_update, end_btn_update, tab_label,
-    )
+    return (gr.update(selected=tab_target), *tab_gating_updates(cfg, status, controllable), tab_label)
 
 
 def _fallback_tab_safety_ui(current_tab_label: str):
@@ -283,86 +266,13 @@ def _fallback_tab_safety_ui(current_tab_label: str):
     Also updates current_tab_label_state to "Settings" when it redirects,
     same reasoning as _refresh_reachability_ui - a server-pushed tab
     switch doesn't fire main_tabs.select() on its own."""
-    controllable = cached_controllable()
+    controllable = cached_controllable(state.current_cfg)
     reachable = cached_reachable()
     on_disabled_models = current_tab_label == "Models" and not controllable
     on_disabled_single_batch = current_tab_label in ("Single image", "Batch processing") and not reachable
     if on_disabled_models or on_disabled_single_batch:
         return gr.update(selected="settings"), gr.update(selected="debug-settings"), "Settings"
     return gr.update(), gr.update(), gr.skip()
-
-
-def _autostart_managed_llama_ui():
-    """Chained onto demo.load AFTER the initial UI has already rendered
-    with tabs correctly enabled/disabled (see the demo.load chain below) -
-    autostart is a background convenience layered on top of that correct
-    initial state, never a substitute for it. Only actually does anything
-    for managed mode, installed, not already running, and the checkbox
-    on - exactly "state 2" (see the state table this was designed
-    against), the one case a user would otherwise have to click Start for
-    themselves. Silent no-op in every other case (external mode, nothing
-    installed, already running, or autostart off) - no popup for "didn't
-    autostart", only for actually doing something. Reads the cache
-    _startup_reachability_ui (immediately before this in the same chain)
-    already refreshed - no extra network call just to decide whether to
-    bother. Also sets current_tab_label_state to "Single image" when it
-    redirects there - same reasoning as the other tab-pushing functions
-    above (a server-pushed switch doesn't fire main_tabs.select() on its
-    own; see _refresh_reachability_ui's docstring for the bug this class
-    of fix addresses)."""
-    cfg = state.current_cfg
-    noop = (gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.skip())
-    if cfg.server_mode != "managed" or not cfg.autostart_managed_llama:
-        return noop
-    status = cached_status()
-    if not status.installed or status.reachable:
-        return noop
-    notify("Starting managed llama-server automatically (autostart is enabled)...")
-    ok, _ = try_start_managed_llama()
-    if not ok:
-        return noop
-    status = cached_status()
-    controllable = cached_controllable()
-    models_tab_update = gr.update(interactive=controllable)
-    single_batch_update = gr.update(interactive=status.reachable)
-    start_btn_update, end_btn_update = llama_lifecycle_button_updates(cfg, status)
-    return (
-        models_tab_update, single_batch_update, single_batch_update,
-        start_btn_update, end_btn_update, gr.update(selected="single"), "Single image",
-    )
-
-
-def _autoload_hydra_model_ui():
-    """Chained onto the demo.load chain BEFORE _autostart_managed_llama_ui
-    (deliberately reordered - see AppConfig.hydra_autoload_model's own
-    docstring) - so that when both autostart-llama and autoload-Hydra are
-    enabled, Hydra gets first pick of a clean, fully-free VRAM budget and
-    llama-server's own n_gpu_layers="auto" (which gracefully adapts to
-    reduced free VRAM, unlike Hydra's own all-or-nothing load) sizes
-    itself around whatever's left. Silent no-op unless hydra_enabled,
-    hydra_autoload_model, deps+model are both present, and nothing is
-    already loaded - same "no popup for didn't-autostart" convention as
-    _autostart_managed_llama_ui itself.
-
-    The actual load - including the stop-managed-llama/restart dance,
-    now moot here in the normal case since nothing's started yet this
-    early in a fresh launch, but still a real safety net for an edge
-    case like an orphaned managed process surviving an app crash - is
-    delegated to load_hydra_with_llama_coexistence() (see its own
-    docstring), the same shared logic the manual Load button uses, so
-    correctness doesn't depend on this function's own ordering assumption
-    staying true forever."""
-    cfg = state.current_cfg
-    noop = (gr.update(), gr.update())
-    if not (cfg.hydra_enabled and cfg.hydra_autoload_model):
-        yield noop
-        return
-    st = hydra_classifier.status()
-    if not (st.deps_installed and st.model_downloaded) or st.loaded:
-        yield noop
-        return
-    notify("Loading Hydra model automatically (autoload is enabled)...")
-    yield from load_hydra_with_llama_coexistence()
 
 
 def _update_ui_status():
@@ -433,40 +343,19 @@ def _update_ui_status():
 
 # ------------------------------------------------------------------ Status bar
 
-def _hydra_footer_label(cfg: AppConfig) -> str:
-    """Compact one-word(ish) Hydra state for the status bar - see
-    _hydra_status_text() for the fuller sentence-form version shown on
-    the Hydra sub-tab itself; this is deliberately terser, matching the
-    llama-server segment's own "running"/"idle"/etc. brevity."""
-    if not cfg.hydra_enabled:
-        return "disabled"
-    st = hydra_classifier.status()
-    if st.loaded:
-        return f"loaded ({st.device})"
-    if not st.deps_installed or not st.model_downloaded:
-        return "not set up"
-    return "enabled, not loaded"
-
-
 def get_status_text() -> str:
+    """Version/Python/Gradio, then each backend's own segments in registry
+    order (Backend.status_bar_segments), then the active operation."""
     cfg = state.current_cfg
-    base_url = display_base_url()
-    healthy = is_healthy(base_url)
-    installed = LLAMA_SERVER_EXE.exists()  # cheap, local - no extra network call
-    # Always the server's own answer, never our config - our selection is
-    # just what we'd ask it to load next, not necessarily what's actually
-    # loaded right now (e.g. external mode, or a server someone else picked).
-    model = get_loaded_model_name(base_url) if healthy else None
-    model = model or "n/a"
-    return (
-        f"Version: {config_mod.app_version()} &nbsp;·&nbsp; "
-        f"Python: {platform.python_version()} &nbsp;·&nbsp; "
-        f"Gradio: {gr.__version__} &nbsp;·&nbsp; "
-        f"llama: {status_label(cfg, healthy, installed)} &nbsp;·&nbsp; "
-        f"Model: {model} &nbsp;·&nbsp; "
-        f"Hydra: {_hydra_footer_label(cfg)} &nbsp;·&nbsp; "
-        f"Status: {operation_status_text()}"
-    )
+    segments = [
+        ("Version", config_mod.app_version()),
+        ("Python", platform.python_version()),
+        ("Gradio", gr.__version__),
+    ]
+    for backend in BACKENDS:
+        segments.extend(backend.status_bar_segments(cfg))
+    segments.append(("Status", operation_status_text()))
+    return " &nbsp;·&nbsp; ".join(f"{label}: {value}" for label, value in segments)
 
 
 def build_app() -> gr.Blocks:
@@ -507,8 +396,10 @@ def build_app() -> gr.Blocks:
         # gating, the Llama sub-tab's Start/Stop, and the push-to-Settings
         # redirect. Shared by reachability_timer, the autostart chain, and
         # every button a tab registered via ctx.after_server_change.
+        # Order is the contract ui.context.REACHABILITY documents.
+        llama_ui = settings.backends["llama"]
         _reachability_outputs = [
-            models.tab, single.tab, batch.tab, settings.llama.start_btn, settings.llama.end_btn, main_tabs,
+            models.tab, single.tab, batch.tab, llama_ui.start_btn, llama_ui.end_btn, main_tabs,
             current_tab_label_state,
         ]
 
@@ -578,25 +469,26 @@ def build_app() -> gr.Blocks:
         # ui's real (and slower - a live network call) check to the punch.
         # That race was real: Single/Batch could show enabled on a fresh
         # page load against an unreachable server, correcting only once
-        # status_timer's first 2s tick came around, if at all. Autostart
-        # (if enabled) chains after that, deliberately - the initial UI
-        # renders in its correct not-yet-running state first, then
-        # autostart is a background upgrade on top of it, never a
-        # substitute for landing correctly in the first place.
-        demo.load(
+        # status_timer's first 2s tick came around, if at all. Each
+        # backend's autoload (if enabled) chains after that, deliberately -
+        # the initial UI renders in its correct not-yet-running state
+        # first, then autoload is a background upgrade on top of it, never
+        # a substitute for landing correctly in the first place. Backends
+        # run in core.lifecycle.autoload_order: fixed-VRAM ones (Hydra)
+        # before adaptive ones (llama-server's n_gpu_layers="auto" adapts
+        # around whatever's left, not the other way around).
+        launch_chain = demo.load(
             _startup_reachability_ui, [],
             [
-                main_tabs, models.tab, single.tab, batch.tab, settings.llama.start_btn, settings.llama.end_btn,
+                main_tabs, models.tab, single.tab, batch.tab, llama_ui.start_btn, llama_ui.end_btn,
                 current_tab_label_state,
             ],
-        ).then(_update_ui_status, [], _run_interrupt_btns).then(
-            # Deliberately BEFORE llama's own autostart below - see
-            # _autoload_hydra_model_ui's own docstring for why the
-            # ordering matters (Hydra gets first pick of free VRAM;
-            # llama-server's n_gpu_layers="auto" adapts around whatever's
-            # left, not the other way around).
-            _autoload_hydra_model_ui, [], [settings.hydra.lifecycle_infotext, settings.hydra.status_md],
-        ).then(_autostart_managed_llama_ui, [], _reachability_outputs)
+        ).then(_update_ui_status, [], _run_interrupt_btns)
+        for backend in autoload_order(BACKENDS):
+            if backend.id not in ctx.autoloads:
+                continue
+            fn, outputs = ctx.autoloads[backend.id]
+            launch_chain = launch_chain.then(fn, [], _reachability_outputs if outputs == REACHABILITY else outputs)
 
     return demo
 
@@ -606,7 +498,8 @@ UI_PORT = 7901
 
 def main() -> None:
     setup_debug_logging()
-    atexit.register(stop_managed)
+    for backend in BACKENDS:
+        atexit.register(backend.on_exit)
     demo = build_app()
     demo.queue()
     demo.launch(

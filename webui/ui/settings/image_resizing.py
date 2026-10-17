@@ -10,6 +10,15 @@ from ui import state
 from ui.context import BuildContext
 
 
+def collect_settings(resize_enabled, resize_target_mp, snap_enabled, snap_multiple) -> dict:
+    return dict(
+        resize_enabled=bool(resize_enabled),
+        resize_target_mp=float(resize_target_mp),
+        snap_enabled=bool(snap_enabled),
+        snap_multiple=int(snap_multiple),
+    )
+
+
 def build(ctx: BuildContext):
     cfg = state.current_cfg
     with gr.Tab("Image resizing", id="image-resizing-settings") as image_resizing_settings_tab:
@@ -32,6 +41,8 @@ def build(ctx: BuildContext):
 
     return SimpleNamespace(
         tab=image_resizing_settings_tab,
-        resize_enabled=resize_enabled, resize_target_mp=resize_target_mp,
-        snap_enabled=snap_enabled, snap_multiple=snap_multiple,
+        tab_label="Image resizing",
+        tab_id="image-resizing-settings",
+        gated=True,
+        save_inputs=[resize_enabled, resize_target_mp, snap_enabled, snap_multiple],
     )

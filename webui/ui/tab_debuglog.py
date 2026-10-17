@@ -8,15 +8,15 @@ from collections import deque
 
 import gradio as gr
 
+from backends.llama.server import LOG_PATH
+from backends.llama.session import has_managed_process
 from core import config as config_mod
-from core.server import LOG_PATH
 from ui import state
 from ui.context import BuildContext
-from ui.llama_session import has_managed_process
 
 log = logging.getLogger("app")  # fixed name, see app.py
 
-# Debug tab: captures log output from our own Python code (core.* modules
+# Debug tab: captures log output from our own Python code (core.*/backends.* modules
 # all log via the standard `logging` module, but nothing was ever attached
 # to see it before this) into a bounded in-memory buffer, AND a plain text
 # file - the buffer is what the Debug tab's textbox polls, the file is for
@@ -52,7 +52,7 @@ def setup_debug_logging() -> None:
     buffer_handler.setFormatter(log_formatter)
     logging.getLogger().addHandler(buffer_handler)
 
-    # Truncated fresh on every app start, matching core.server's own
+    # Truncated fresh on every app start, matching backends.llama.server's own
     # LOG_PATH (llama-server.log) convention - this is meant as a live
     # window into the CURRENT run, not an accumulating history across
     # restarts (which, this session, happen often during iteration).
@@ -66,7 +66,10 @@ def setup_debug_logging() -> None:
     # logger inherits from when it has no level of its own) means Gradio's
     # httpx/httpcore/asyncio internals - and anything else - stay at their
     # own quiet default instead of flooding this with unrelated chatter.
+    # "backends" covers every backend module's __name__ logger
+    # (backends.llama.server etc.).
     logging.getLogger("core").setLevel(logging.DEBUG)
+    logging.getLogger("backends").setLevel(logging.DEBUG)
     logging.getLogger("app").setLevel(logging.DEBUG)
 
 

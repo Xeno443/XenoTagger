@@ -3,7 +3,7 @@ needs - torch, pyvips, einops, safetensors, numpy - into whichever Python
 environment is currently running this app (sys.executable - the portable
 system\\python by default, or a user's own venv, see setup-venv.bat), and
 downloads the hydra-3.5.safetensors model weight. Mirrors
-core.llama_install's spirit (heavy/optional, installed on demand via an
+backends.llama.install's spirit (heavy/optional, installed on demand via an
 in-app button or a CLI flag, never baked into webui/requirements.txt) but
 is much simpler: no GitHub-release-asset resolution needed, just a pip
 install and one fixed-URL file download.
@@ -13,10 +13,10 @@ marker file written after a successful install - always reflects reality
 even if the user manually pip-uninstalls something afterward, unlike a
 marker that could drift out of sync with what's actually on disk.
 
-The model weight lands under core.models' own MODELS_DIR, in a
+The model weight lands under core.config's shared MODELS_DIR, in a
 "RedRocket-Hydra" folder - reusing webui/models/'s existing gitignore
-treatment rather than adding a new top-level directory. models.py's
-scanner only globs *.gguf per folder, so a folder holding only a
+treatment rather than adding a new top-level directory. The llama
+backend's GGUF scanner (backends/llama/models.py) only globs *.gguf per folder, so a folder holding only a
 .safetensors is invisible to it - no interference with the Models tab.
 """
 
@@ -26,15 +26,12 @@ import importlib.util
 import logging
 import subprocess
 import sys
-from pathlib import Path
 from typing import Callable, Optional
 
-from .downloads import DownloadItem, download_one
-from .models import MODELS_DIR
+from core.config import MODELS_DIR, ROOT_DIR
+from core.downloads import DownloadItem, download_one
 
 log = logging.getLogger(__name__)
-
-ROOT_DIR = Path(__file__).resolve().parent.parent.parent
 
 TORCH_INDEX_URL = "https://download.pytorch.org/whl/cu130"
 DEPS = ["torch>=2.6.0,<2.13.0", "pyvips[binary]", "einops", "safetensors", "numpy"]

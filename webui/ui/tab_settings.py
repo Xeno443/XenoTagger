@@ -1,49 +1,47 @@
 """Settings tab: the sub-tab container, operation gating of the sub-tabs,
-and the shared Save settings / Restart app row."""
+and the shared Save settings / Restart app row.
+
+Sub-tabs come first from the backend registry (backends.BACKENDS - each
+backend's settings_ui module, loaded by Backend.settings_ui_module), then
+the non-backend ones in ui/settings/. Every sub-tab module provides:
+  - build(ctx) -> handle with tab, tab_label, tab_id, gated (disabled
+    while a caption job runs) and save_inputs (its fields Save reads)
+  - collect_settings(*values) -> dict of AppConfig updates, taking
+    save_inputs' values in the same order
+and optionally:
+  - after_save(old_cfg, new_cfg) -> text to append to "Settings saved."
+    (or None) - reacting to a saved change, e.g. llama's server restart
+  - abort_background() - stop background work before Restart app, e.g.
+    llama's install worker
+"""
 
 from __future__ import annotations
 
+import importlib
 import logging
 import os
 import sys
-from types import SimpleNamespace
+from dataclasses import replace
+from types import ModuleType, SimpleNamespace
 
 import gradio as gr
 
+from backends import BACKENDS
 from core import config as config_mod
-from core import hydra_classifier
-from core.config import AppConfig
 from ui import state
 from ui.context import BuildContext
 from ui.downloads_queue import download_abort_all
-from ui.llama_session import stop_managed, try_start_managed_llama
 from ui.operation import operation_force_abort, settings_subtabs_disabled, wait_for_operation_to_end
 from ui.settings import captioning_defaults as settings_captioning_defaults
 from ui.settings import debug as settings_debug
-from ui.settings import hydra as settings_hydra
 from ui.settings import image_resizing as settings_image_resizing
-from ui.settings import llama as settings_llama
-from ui.settings.hydra import hydra_sliders_to_metric
-from ui.settings.llama import llama_install_abort_all
 
 log = logging.getLogger("app")  # fixed name, see app.py
 
-
-def _settings_gating_ui():
-    """Disables the operation-sensitive Settings sub-tabs' own
-    clickability (see settings_subtabs_disabled) while a Single/Batch/
-    Recaption job is actively running, so a job's settings can't change
-    out from under it mid-flight. The Debug sub-tab is deliberately
-    excluded - its one checkbox already needs a full app restart to take
-    effect regardless (see its own comment), so there's nothing it could
-    disrupt by staying editable. Deliberately does NOT touch the fields
-    inside those sub-tabs, only the tabs' own interactive= - see
-    _settings_subtab_entry_ui below for what actually protects someone
-    already sitting on one of these when a job starts (a redirect on
-    next entry, not disabling the fields themselves)."""
-    update = gr.update(interactive=not settings_subtabs_disabled())
-    return update, update, update, update
-
+# Filled by build(), in sub-tab order: (module, the handle its build()
+# returned). Module-level rather than closed over so the handlers below
+# stay plain, importable functions; build_app() runs once per process.
+_subtabs: list[tuple[ModuleType, SimpleNamespace]] = []
 
 # gr.SelectData.value for a Tab is ALWAYS its label, never its id -
 # confirmed via gradio/layouts/tabs.py's own EVENTS docstring ("value
@@ -54,17 +52,25 @@ def _settings_gating_ui():
 # you wish to control the selected tab from a predict function") - so
 # without this table, a value read off a real click could never be fed
 # back into gr.update(selected=...) and have it actually match anything.
-# Three of the five sub-tabs (Hydra, Image resizing, Captioning
-# defaults) never had an id at all until this fix, which independently
-# meant they could never have been a valid push target either way - see
-# their own gr.Tab(...) declarations.
-_SETTINGS_SUBTAB_ID_BY_LABEL = {
-    "Llama": "llama-settings",
-    "Hydra": "hydra-settings",
-    "Image resizing": "image-resizing-settings",
-    "Captioning defaults": "captioning-defaults-settings",
-    "Debug": "debug-settings",
-}
+# Filled by build() from each sub-tab handle's tab_label/tab_id - every
+# sub-tab needs an explicit id to be a valid push target at all.
+_SETTINGS_SUBTAB_ID_BY_LABEL: dict[str, str] = {}
+
+
+def _settings_gating_ui():
+    """Disables the operation-sensitive Settings sub-tabs' own
+    clickability (see settings_subtabs_disabled) while a Single/Batch/
+    Recaption job is actively running, so a job's settings can't change
+    out from under it mid-flight. The Debug sub-tab is deliberately
+    excluded (gated=False) - its one checkbox already needs a full app
+    restart to take effect regardless (see its own comment), so there's
+    nothing it could disrupt by staying editable. Deliberately does NOT
+    touch the fields inside those sub-tabs, only the tabs' own
+    interactive= - see _settings_subtab_entry_ui below for what actually
+    protects someone already sitting on one of these when a job starts (a
+    redirect on next entry, not disabling the fields themselves)."""
+    update = gr.update(interactive=not settings_subtabs_disabled())
+    return tuple(update for _, handle in _subtabs if handle.gated)
 
 
 def _on_settings_subtab_select(evt: gr.SelectData):
@@ -130,87 +136,47 @@ def restart_app_ui() -> None:
     Python self-restart trick, so newly-saved settings.json values (or a
     just-toggled Debug tab) take effect without anyone needing a terminal.
     Never returns: the process image is gone the moment execv succeeds, so
-    stop our own managed llama-server first (execv skips atexit entirely),
-    and abort any in-flight/queued downloads or llama.cpp install too -
-    all in-memory only and won't survive this regardless, better to say
-    so cleanly. Also unload Hydra if loaded - unlike llama-server (a
-    separate OS process stop_managed kills outright), Hydra's model
-    lives in THIS process's own CUDA context, which execv does not
-    clean up on its own (it replaces the process image but skips normal
-    interpreter/CUDA teardown) - explicit unload() first avoids leaking
-    VRAM into the replaced process.
+    first force-abort any running caption job and wait for it to notice,
+    abort in-flight/queued downloads and each sub-tab's own background
+    work (abort_background - e.g. a llama.cpp install), all in-memory only
+    and won't survive this regardless, then let every backend release
+    what execv wouldn't clean up (Backend.shutdown - llama-server's child
+    process, Hydra's CUDA context; execv skips atexit entirely).
     """
     log.info("User triggered app restart from Settings")
     operation_force_abort()
     wait_for_operation_to_end()
     download_abort_all()
-    llama_install_abort_all()
-    stop_managed()
-    hydra_classifier.unload()
+    for module, _ in _subtabs:
+        abort_background = getattr(module, "abort_background", None)
+        if abort_background is not None:
+            abort_background()
+    cfg = state.current_cfg
+    for backend in BACKENDS:
+        backend.shutdown(cfg)
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
-def save_settings_ui(
-    server_mode, server_port, external_url,
-    n_gpu_layers, context_size, extra_server_args, autostart_managed_llama,
-    resize_enabled, resize_target_mp, snap_enabled, snap_multiple,
-    prompt_template, temperature, top_p, max_tokens, request_timeout,
-    trigger_word, overwrite_existing, debug_tab_enabled,
-    hydra_enabled, hydra_device, hydra_confidence, hydra_threshold, hydra_implications,
-    hydra_exclude_categories, hydra_exclude_tags, hydra_max_tags, hydra_autoload_model,
-    hydra_tag_vocab_path,
-) -> str:
-    """Per-category behavior on save (see the design discussion this was
-    built from): image resizing/captioning defaults/prompt-template-bundle
-    fields are just written through, live immediately, no process
-    interaction - already true by construction, nothing special needed
-    for them below. Server-process-affecting fields (mode, port, GPU
-    layers, context size, extra args) each need a specific reaction:
-    switching to external stops any managed server we own; switching to
-    managed never auto-starts (the user must do that explicitly, even
-    with autostart on - autostart is for the *next app launch*, not this
-    save); changing the process args while staying managed stops the
-    current one (a no-op if we don't own it - see stop_managed) and,
-    only if autostart is enabled, immediately starts a fresh one with the
-    new settings."""
+def save_settings_ui(*values) -> str:
+    """Save settings' click target. values are every sub-tab's
+    save_inputs, concatenated in sub-tab order (see build()); each
+    sub-tab's collect_settings() gets its own slice and returns its
+    AppConfig updates, applied on top of the current config - so fields
+    no form covers (model_name/mmproj_name, set from the Models tab)
+    carry over unchanged. Then each sub-tab module's optional
+    after_save(old, new) reacts to what changed (llama: stop/restart the
+    managed server on a mode or process-arg change) and can append to the
+    returned message."""
+    updates: dict = {}
+    i = 0
+    for module, handle in _subtabs:
+        n = len(handle.save_inputs)
+        updates.update(module.collect_settings(*values[i:i + n]))
+        i += n
+
     old_cfg = state.current_cfg
-    # model_name/mmproj_name are deliberately NOT settable from this form -
-    # they live entirely in the Models tab now (models_set_active_ui), so
-    # carry forward whatever's already configured rather than defaulting
-    # to empty just because this form has no field for them.
     with state.config_lock:
-        state.current_cfg = AppConfig(
-            server_mode=server_mode,
-            server_port=int(server_port),
-            external_url=external_url,
-            model_name=state.current_cfg.model_name,
-            mmproj_name=state.current_cfg.mmproj_name,
-            n_gpu_layers=n_gpu_layers.strip() or "auto",
-            context_size=int(context_size),
-            extra_server_args=extra_server_args,
-            autostart_managed_llama=bool(autostart_managed_llama),
-            resize_enabled=bool(resize_enabled),
-            resize_target_mp=float(resize_target_mp),
-            snap_enabled=bool(snap_enabled),
-            snap_multiple=int(snap_multiple),
-            prompt_template=prompt_template,
-            temperature=float(temperature),
-            top_p=float(top_p),
-            max_tokens=int(max_tokens),
-            request_timeout=int(request_timeout),
-            trigger_word=trigger_word,
-            overwrite_existing=bool(overwrite_existing),
-            debug_tab_enabled=bool(debug_tab_enabled),
-            hydra_enabled=bool(hydra_enabled),
-            hydra_device=hydra_device,
-            hydra_metric=hydra_sliders_to_metric(float(hydra_confidence), float(hydra_threshold)),
-            hydra_implications=hydra_implications,
-            hydra_exclude_categories=hydra_exclude_categories,
-            hydra_exclude_tags=hydra_exclude_tags,
-            hydra_max_tags=int(hydra_max_tags),
-            hydra_autoload_model=bool(hydra_autoload_model),
-            hydra_tag_vocab_path=hydra_tag_vocab_path,
-        )
+        state.current_cfg = replace(state.current_cfg, **updates)
         new_cfg = state.current_cfg
         config_mod.save(new_cfg)
     log.info(
@@ -218,67 +184,39 @@ def save_settings_ui(
         new_cfg.server_mode, new_cfg.model_name or "(none)", new_cfg.n_gpu_layers,
     )
 
-    switched_to_external = old_cfg.server_mode != "external" and new_cfg.server_mode == "external"
-    switched_to_managed = old_cfg.server_mode == "external" and new_cfg.server_mode == "managed"
-    process_args_changed = (
-        old_cfg.server_port, old_cfg.n_gpu_layers, old_cfg.context_size, old_cfg.extra_server_args
-    ) != (
-        new_cfg.server_port, new_cfg.n_gpu_layers, new_cfg.context_size, new_cfg.extra_server_args
-    )
-
-    if switched_to_external:
-        stop_managed()
-        message = "Settings saved. Switched to external mode."
-    elif switched_to_managed:
-        message = (
-            "Settings saved. Switched to managed mode - click \"Start llama server\" "
-            "in this tab when you're ready (autostart applies on the next app launch, not now)."
-        )
-    elif new_cfg.server_mode == "managed" and process_args_changed:
-        stop_managed()
-        if new_cfg.autostart_managed_llama:
-            _, start_message = try_start_managed_llama()
-            message = f"Settings saved. {start_message}"
-        else:
-            message = "Settings saved. Click \"Start llama server\" to apply the new server settings."
-    else:
-        message = "Settings saved."
-
-    return message
+    notes = []
+    for module, _ in _subtabs:
+        after_save = getattr(module, "after_save", None)
+        if after_save is not None and (note := after_save(old_cfg, new_cfg)):
+            notes.append(note)
+    return " ".join(["Settings saved.", *notes])
 
 
 def build(ctx: BuildContext):
+    _subtabs.clear()
+    _SETTINGS_SUBTAB_ID_BY_LABEL.clear()
+    modules = [importlib.import_module(b.settings_ui_module) for b in BACKENDS] + [
+        settings_image_resizing, settings_captioning_defaults, settings_debug,
+    ]
+
     with gr.Tab("Settings", id="settings") as settings_tab:
         # Declared here, before settings_tabs opens, not as a
         # direct child of `with gr.Tabs()` itself - see current_
         # tab_label_state's own comment in app.py for why a gr.State
         # directly inside a Tabs block was confirmed live to
-        # corrupt the rendered tab strip.
-        current_settings_subtab_state = gr.State("llama-settings")
+        # corrupt the rendered tab strip. Defaults to the first sub-tab.
+        current_settings_subtab_state = gr.State(f"{BACKENDS[0].id}-settings")
         with gr.Tabs() as settings_tabs:
-            llama = settings_llama.build(ctx)
-            hydra = settings_hydra.build(ctx)
-            image_resizing = settings_image_resizing.build(ctx)
-            captioning_defaults = settings_captioning_defaults.build(ctx)
-            debug = settings_debug.build(ctx)
+            for module in modules:
+                _subtabs.append((module, module.build(ctx)))
 
         with gr.Row():
             save_settings_btn = gr.Button("Save settings", variant="primary")
             restart_app_btn = gr.Button("Restart app")
         settings_infotext = gr.Textbox(show_label=False, container=False, interactive=False)
 
-        # Must match save_settings_ui's parameter order exactly.
-        settings_inputs = [
-            llama.server_mode, llama.server_port, llama.external_url,
-            llama.n_gpu_layers, llama.context_size, llama.extra_server_args, llama.autostart_managed_llama,
-            image_resizing.resize_enabled, image_resizing.resize_target_mp,
-            image_resizing.snap_enabled, image_resizing.snap_multiple,
-            llama.prompt_template, llama.temperature, llama.top_p, llama.max_tokens, llama.request_timeout,
-            captioning_defaults.trigger_word, captioning_defaults.overwrite_existing, debug.debug_tab_enabled,
-            hydra.hydra_enabled, hydra.hydra_device, hydra.hydra_confidence, hydra.hydra_threshold,
-            hydra.hydra_implications, hydra.hydra_exclude_categories, hydra.hydra_exclude_tags,
-            hydra.hydra_max_tags, hydra.hydra_autoload_model, hydra.hydra_tag_vocab_path,
-        ]
+        # save_settings_ui slices these back apart per sub-tab, in this order.
+        settings_inputs = [component for _, handle in _subtabs for component in handle.save_inputs]
         # Saving can change server_mode (or anything else
         # check_status/cached_controllable/cached_reachable
         # read), and the Models/Single-image/Batch-processing
@@ -292,6 +230,8 @@ def build(ctx: BuildContext):
         ctx.after_server_change(save_settings_btn.click(save_settings_ui, settings_inputs, [settings_infotext]))
         restart_app_btn.click(restart_app_ui, [], [])
 
+    _SETTINGS_SUBTAB_ID_BY_LABEL.update({handle.tab_label: handle.tab_id for _, handle in _subtabs})
+
     # Tracks which Settings sub-tab was genuinely clicked into, as
     # opposed to whatever settings_tabs is currently displaying (see
     # _on_settings_subtab_select's own docstring for why those two
@@ -301,7 +241,7 @@ def build(ctx: BuildContext):
     # disabled - see _settings_subtab_entry_ui's own docstring.
     settings_tab.select(_settings_subtab_entry_ui, [current_settings_subtab_state], [settings_tabs])
 
-    _settings_gated_tabs = [llama.tab, hydra.tab, image_resizing.tab, captioning_defaults.tab]
+    _settings_gated_tabs = [handle.tab for _, handle in _subtabs if handle.gated]
     ctx.on_tick(_settings_gating_ui, [], _settings_gated_tabs)
     ctx.on_load(_settings_gating_ui, [], _settings_gated_tabs)
 
@@ -309,6 +249,6 @@ def build(ctx: BuildContext):
         tab=settings_tab,
         settings_tabs=settings_tabs,
         current_subtab_state=current_settings_subtab_state,
-        llama=llama,
-        hydra=hydra,
+        # Backend sub-tab handles by backend id.
+        backends={backend.id: handle for backend, (_, handle) in zip(BACKENDS, _subtabs)},
     )

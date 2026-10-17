@@ -43,6 +43,10 @@ WEBUI_DIR = Path(__file__).resolve().parent.parent
 ROOT_DIR = WEBUI_DIR.parent
 SETTINGS_PATH = WEBUI_DIR / "config" / "settings.json"
 DEFAULT_TAG_VOCAB_PATH = str(WEBUI_DIR / "tags" / "e621.csv")
+# Shared by every backend that keeps model files on disk (llama's GGUF
+# folders, Hydra's RedRocket-Hydra/ folder, ...) - gitignored. Lives here,
+# not in a backend, so no backend has to import another one for it.
+MODELS_DIR = WEBUI_DIR / "models"
 
 APP_VERSION = "0.9-dev"
 
@@ -79,11 +83,11 @@ DEFAULT_PROMPT = (
     "without censoring or euphemism."
 )
 
-# Shown as the Markdown note at the top of the Models tab (app.py). Not an
+# Shown as the Markdown note at the top of the Models tab (ui/tab_models.py). Not an
 # AppConfig field - it's not per-user/persisted state, just UI copy kept
 # here so it can be edited without hunting through the Gradio layout
 # code. {ignored_substrings} is filled in at render time from
-# core.models.IGNORED_SUBSTRINGS, so that part always reflects the real,
+# backends.llama.models.IGNORED_SUBSTRINGS, so that part always reflects the real,
 # current ignore-list rather than going stale if it's ever changed.
 MODELS_TAB_INTRO = (
     "Every `.gguf` under a `webui/models/<folder>/` is picked up, "
@@ -98,7 +102,7 @@ MODELS_TAB_INTRO = (
     "the queue."
 )
 
-# Shown as the Markdown note at the top of Settings -> Llama (app.py).
+# Shown as the Markdown note at the top of Settings -> Llama (backends/llama/settings_ui.py).
 # Same rationale/placement as MODELS_TAB_INTRO above - UI copy, not
 # per-user state, kept here so it's editable without hunting through the
 # Gradio layout code.
