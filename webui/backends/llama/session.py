@@ -16,9 +16,9 @@ from typing import Optional
 
 from core.config import AppConfig
 
-from .client import LlamaClient
+from .client import ClientError, LlamaClient
 from .models import resolve_selection
-from .server import MANAGED_HOST, ServerError, ServerStatus, check_status, resolve_server
+from .server import MANAGED_HOST, ServerError, ServerStatus, check_status, is_healthy, resolve_server
 
 log = logging.getLogger(__name__)
 
@@ -306,6 +306,16 @@ def try_start_managed_llama(cfg: AppConfig) -> tuple[bool, str]:
         return False, f"Couldn't start llama-server: {exc}"
     refresh_reachability_cache(cfg)
     return True, "llama-server is running."
+
+
+def running_client(cfg: AppConfig) -> LlamaClient:
+    """A client for whatever server cfg points at, if one answers - never
+    starts one, unlike get_client(). What the pipeline's caption() uses:
+    starting the server is start_pipeline's job, not a caption's."""
+    base_url = display_base_url(cfg)
+    if not is_healthy(base_url):
+        raise ClientError(f"llama-server isn't running at {base_url}.")
+    return LlamaClient(base_url, timeout=cfg.request_timeout)
 
 
 def display_base_url(cfg: AppConfig) -> str:

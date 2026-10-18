@@ -40,6 +40,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Union
 
+from core.backend import BackendError
 from core.config import AppConfig
 
 from .install import MODEL_PATH, deps_installed, model_downloaded
@@ -47,7 +48,7 @@ from .install import MODEL_PATH, deps_installed, model_downloaded
 log = logging.getLogger(__name__)
 
 
-class HydraError(RuntimeError):
+class HydraError(BackendError):
     pass
 
 
@@ -68,6 +69,8 @@ class HydraResult:
 _lock = threading.Lock()
 _model = None  # a .vendor.rr_hydra.model.Hydra instance, once loaded
 _device: Optional[str] = None
+# label -> category, filled on load; see label_categories().
+_categories: dict[str, str] = {}
 
 
 def status() -> HydraStatus:
@@ -138,6 +141,10 @@ def load(cfg: AppConfig) -> None:
 
         _model = model
         _device = device
+        _categories.clear()
+        _categories.update(
+            (lab.label, "rating" if lab.subcategory == "rating" else lab.category) for lab in model.labels
+        )
         log.info("Hydra model loaded on %s", device)
 
 
@@ -151,6 +158,7 @@ def unload() -> None:
         log.info("Unloading Hydra model")
         _model = None
         _device = None
+        _categories.clear()
         try:
             import torch
 
@@ -158,6 +166,13 @@ def unload() -> None:
                 torch.cuda.empty_cache()
         except ImportError:
             pass
+
+
+def label_categories() -> dict[str, str]:
+    """Every label's e621 category, with the rating labels (safe/
+    questionable/explicit, category "meta") reported as "rating" - see
+    core.backend.Tag. Empty while nothing is loaded."""
+    return _categories
 
 
 def classify(image: Union[str, Path, bytes], cfg: AppConfig) -> HydraResult:

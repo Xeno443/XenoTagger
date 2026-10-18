@@ -6,10 +6,12 @@ the registry of instances is backends.BACKENDS.
 Gradio-free and backend-agnostic: core/ never imports backends/, so code
 here (core.lifecycle) only ever works on Backend objects it's handed.
 
-Captioning itself (caption()/tag()) isn't part of this interface yet -
-core.captioner still calls the llama client and Hydra classifier
-directly. That moves behind this interface with the caption-pipeline
-rewrite (v0.9 step 3).
+tag()/caption() are the per-image calls the caption pipeline (v0.9 step
+3) makes on whatever backends it started: a tagger returns structured
+Tags, a captioner returns one CaptionOutput per variant. Expected
+failures raise BackendError (each backend's own error class derives from
+it), so the pipeline can handle every backend alike. core.captioner
+still calls llama and Hydra directly until the pipeline replaces it.
 
 The model methods (list_models() and friends) feed the GUI's combined
 Models tab (ui/tab_models.py), which shows every backend's rows in one
@@ -21,10 +23,42 @@ renders them.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from pathlib import Path
+from typing import Callable, Optional, Union
 
 from .config import AppConfig
 from .downloads import DownloadItem
+
+# What tag()/caption() accept: a file path, or the encoded file's bytes
+# (an upload on the Single tab).
+ImageInput = Union[str, Path, bytes]
+
+
+class BackendError(RuntimeError):
+    """An expected failure of one tag()/caption() call (not loaded, model
+    error, bad image) - the message is user-facing."""
+
+
+class Interrupted(BackendError):
+    """caption() stopped early because should_stop() returned True."""
+
+
+@dataclass
+class Tag:
+    name: str  # e621 form, underscores: "looking_at_viewer"
+    # e621 category ("general", "species", "meta", ...), except rating
+    # tags (safe/questionable/explicit), which are "rating" rather than
+    # "meta" so a captioner can drop them separately.
+    category: str
+    confidence: float
+
+
+@dataclass
+class CaptionOutput:
+    text: str
+    truncated: bool = False  # hit a length limit, text is cut off
+    seconds: float = 0.0
+    note: str = ""  # one line of details for logs/infotext, e.g. token counts
 
 
 @dataclass
@@ -59,6 +93,10 @@ class Backend:
     label: str = ""
     # "captioner" (writes the caption line) or "tagger" (writes the tag line).
     role: str = ""
+    # Captioners only: whether caption() uses the tagger's tags - "no",
+    # "optional" (llama: only a prompt containing {tags}) or "required"
+    # (Furrence2 can't caption without them).
+    takes_tags: str = "no"
     # "fixed": load() is all-or-nothing onto one device (Hydra).
     # "adaptive": sizes itself to whatever VRAM is free when it starts
     # (llama-server's n_gpu_layers="auto"). Drives core.lifecycle: fixed
@@ -95,6 +133,26 @@ class Backend:
         asks this before acting; core.lifecycle.autoload_order decides
         when that handler runs relative to the other backends'."""
         return False
+
+    def tag(self, cfg: AppConfig, image: ImageInput) -> list[Tag]:
+        """Taggers only. Best first, already filtered by this tagger's own
+        settings (threshold, exclusions). Raises BackendError."""
+        raise NotImplementedError
+
+    def caption(
+        self,
+        cfg: AppConfig,
+        image: ImageInput,
+        variant: str = "",
+        tags: Optional[list[Tag]] = None,
+        should_stop: Optional[Callable[[], bool]] = None,
+    ) -> CaptionOutput:
+        """Captioners only. variant is the pipeline variant's backend-
+        specific setting (llama: the prompt). tags are the tagger's, if
+        one ran. should_stop is polled while generating where the backend
+        can stop mid-caption (llama); a backend that's fast per image just
+        finishes it. Raises BackendError (Interrupted when stopped)."""
+        raise NotImplementedError
 
     def status_bar_segments(self, cfg: AppConfig) -> list[tuple[str, str]]:
         """(label, value) pairs for the global status bar, in order."""

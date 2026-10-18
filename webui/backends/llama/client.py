@@ -45,22 +45,25 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import logging
 import mimetypes
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Union
+from typing import Callable, Optional, Union
 
 import requests
 from PIL import Image
+
+from core.backend import BackendError, Interrupted
 
 log = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = 300
 
 
-class ClientError(RuntimeError):
+class ClientError(BackendError):
     pass
 
 
@@ -194,7 +197,14 @@ class LlamaClient:
         resize_target_mp: float = 1.0,
         snap_enabled: bool = True,
         snap_multiple: int = 64,
+        should_stop: Optional[Callable[[], bool]] = None,
     ) -> CaptionResult:
+        """Streams the answer, so should_stop() (polled per received
+        token) can end it early: closing the connection makes llama-server
+        cancel the generation within milliseconds (tested 2026-10-18; a
+        non-streaming request would run to the end regardless). It's
+        first polled once the first token arrives - not during prompt
+        processing. Raises Interrupted when stopped."""
         image_desc = image if isinstance(image, (str, Path)) else f"<{len(image)} bytes>"
         data_url, resize_note = _image_to_data_url(
             image,
@@ -222,7 +232,8 @@ class LlamaClient:
             "temperature": temperature,
             "top_p": top_p,
             "max_tokens": max_tokens,
-            "stream": False,
+            "stream": True,
+            "stream_options": {"include_usage": True},
         }
 
         start = time.monotonic()
@@ -231,48 +242,75 @@ class LlamaClient:
                 f"{self.base_url}/v1/chat/completions",
                 json=payload,
                 timeout=self.timeout,
+                stream=True,
             )
         except requests.RequestException as exc:
             log.error("caption(): request to %s failed after %.1fs: %s", self.base_url, time.monotonic() - start, exc)
             raise ClientError(f"Could not reach llama-server at {self.base_url}: {exc}") from exc
+
+        # Server-sent events: "data: {chunk}" lines, then "data: [DONE]".
+        # Text arrives as choices[0].delta.content pieces; finish_reason in
+        # the last content chunk; usage (include_usage) and llama.cpp's own
+        # timings in the final chunks.
+        parts: list[str] = []
+        finish_reason = "stop"
+        usage: dict = {}
+        timings: dict = {}
+        with resp:
+            if resp.status_code != 200:
+                log.error("caption(): HTTP %s from %s: %s", resp.status_code, self.base_url, resp.text[:500])
+                raise ClientError(
+                    f"llama-server returned HTTP {resp.status_code}: {resp.text[:500]}"
+                )
+            try:
+                for line in resp.iter_lines():
+                    if should_stop is not None and should_stop():
+                        # Leaving the with block closes the connection,
+                        # which is what makes the server cancel.
+                        log.info("caption(): stopped after %.1fs, %d chunks", time.monotonic() - start, len(parts))
+                        raise Interrupted("Caption interrupted.")
+                    if not line.startswith(b"data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == b"[DONE]":
+                        break
+                    chunk = json.loads(data)
+                    if "error" in chunk:
+                        raise ClientError(f"llama-server error: {chunk['error']}")
+                    for choice in chunk.get("choices") or []:
+                        if piece := (choice.get("delta") or {}).get("content"):
+                            parts.append(piece)
+                        if choice.get("finish_reason"):
+                            finish_reason = choice["finish_reason"]
+                    usage = chunk.get("usage") or usage
+                    timings = chunk.get("timings") or timings
+            except requests.RequestException as exc:
+                log.error("caption(): stream from %s broke after %.1fs: %s", self.base_url, time.monotonic() - start, exc)
+                raise ClientError(f"Connection to llama-server at {self.base_url} broke: {exc}") from exc
+            except ValueError as exc:
+                log.error("caption(): unexpected stream chunk from %s: %s", self.base_url, exc)
+                raise ClientError(f"Unexpected response from llama-server: {exc}") from exc
         elapsed = time.monotonic() - start
+        completion_tokens = usage.get("completion_tokens", 0)
 
-        if resp.status_code != 200:
-            log.error("caption(): HTTP %s from %s: %s", resp.status_code, self.base_url, resp.text[:500])
-            raise ClientError(
-                f"llama-server returned HTTP {resp.status_code}: {resp.text[:500]}"
+        if finish_reason == "length":
+            log.warning(
+                "caption(): truncated at %d tokens (max_tokens=%s) after %.1fs - "
+                "raise Max tokens in Settings if captions keep getting cut off",
+                completion_tokens, max_tokens, elapsed,
+            )
+        else:
+            log.debug(
+                "caption(): finished in %.1fs, %d completion tokens, %s tok/s",
+                elapsed, completion_tokens, timings.get("predicted_per_second"),
             )
 
-        try:
-            data = resp.json()
-            choice = data["choices"][0]
-            content = choice["message"]["content"].strip()
-            finish_reason = choice.get("finish_reason", "stop")
-            usage = data.get("usage", {})
-            timings = data.get("timings", {})
-            completion_tokens = usage.get("completion_tokens", 0)
-
-            if finish_reason == "length":
-                log.warning(
-                    "caption(): truncated at %d tokens (max_tokens=%s) after %.1fs - "
-                    "raise Max tokens in Settings if captions keep getting cut off",
-                    completion_tokens, max_tokens, elapsed,
-                )
-            else:
-                log.debug(
-                    "caption(): finished in %.1fs, %d completion tokens, %s tok/s",
-                    elapsed, completion_tokens, timings.get("predicted_per_second"),
-                )
-
-            return CaptionResult(
-                content=content,
-                finish_reason=finish_reason,
-                completion_tokens=completion_tokens,
-                prompt_tokens=usage.get("prompt_tokens", 0),
-                elapsed_s=elapsed,
-                tokens_per_second=timings.get("predicted_per_second"),
-                resize_note=resize_note,
-            )
-        except (KeyError, IndexError, ValueError) as exc:
-            log.error("caption(): unexpected response shape from %s: %s", self.base_url, resp.text[:500])
-            raise ClientError(f"Unexpected response from llama-server: {resp.text[:500]}") from exc
+        return CaptionResult(
+            content="".join(parts).strip(),
+            finish_reason=finish_reason,
+            completion_tokens=completion_tokens,
+            prompt_tokens=usage.get("prompt_tokens", 0),
+            elapsed_s=elapsed,
+            tokens_per_second=timings.get("predicted_per_second"),
+            resize_note=resize_note,
+        )

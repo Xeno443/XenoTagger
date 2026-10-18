@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Union
 
+from core.backend import BackendError
 from core.config import WEBUI_DIR
 
 from .install import LIB_DIR, MODEL_DIR, deps_installed, model_downloaded
@@ -34,7 +35,7 @@ READY_TIMEOUT = 300.0  # importing torch + loading the model; slow disks are slo
 REQUEST_TIMEOUT = 120.0  # one caption takes ~1s on a GPU, minutes on CPU at worst
 
 
-class Furrence2Error(RuntimeError):
+class Furrence2Error(BackendError):
     pass
 
 

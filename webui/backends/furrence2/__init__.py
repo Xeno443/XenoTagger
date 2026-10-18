@@ -12,15 +12,16 @@ install.py). All-or-nothing VRAM ("fixed", ~1.5GB), like Hydra.
   - settings_ui.py    Settings -> Furrence2 (GUI only)
 
 Loading is the pipeline's job (start_pipeline, v0.9 step 3) - there's no
-Load button or autoload, and nothing calls caption() yet.
+Load button or autoload, and nothing calls caption() until the pipeline
+exists.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Union
+from typing import Callable, Optional
 
-from core.backend import Backend, ModelRow
+from core.backend import Backend, CaptionOutput, ImageInput, ModelRow, Tag
 from core.config import AppConfig
 from core.downloads import DownloadItem
 
@@ -33,6 +34,7 @@ class Furrence2Backend(Backend):
     id = "furrence2"
     label = "Furrence2"
     role = "captioner"
+    takes_tags = "required"
     vram = "fixed"
     settings_ui_module = "backends.furrence2.settings_ui"
     has_models = True
@@ -72,14 +74,27 @@ class Furrence2Backend(Backend):
         worker_client.stop()
 
     def caption(
-        self, cfg: AppConfig, image: Union[str, Path, bytes], tags: list[tuple[str, str]], seed: str = "",
-    ) -> worker_client.Furrence2Result:
-        """tags: (e621 name with underscores, category) pairs, best first -
-        Furrence2 can't caption without them. Becomes the Backend
-        interface's caption() in step 3. Raises Furrence2Error."""
-        return worker_client.caption(
-            image, tags, seed=seed,
+        self,
+        cfg: AppConfig,
+        image: ImageInput,
+        variant: str = "",
+        tags: Optional[list[Tag]] = None,
+        should_stop: Optional[Callable[[], bool]] = None,
+    ) -> CaptionOutput:
+        """variant is unused (length comes from the settings), and so is
+        should_stop - one caption takes about a second. The prompt's tag
+        order is shuffled with the file name as seed, so captioning the
+        same file again builds the same prompt."""
+        if tags is None:
+            raise worker_client.Furrence2Error("Furrence2 needs a tagger's tags, and none ran.")
+        result = worker_client.caption(
+            image, [(t.name, t.category) for t in tags],
+            seed="" if isinstance(image, bytes) else Path(image).name,
             length_min=cfg.furrence2_length_min, length_max=cfg.furrence2_length_max,
+        )
+        return CaptionOutput(
+            text=result.caption, seconds=result.seconds,
+            note=f"{result.tags_used} tags, length {result.length}, {result.prompt_tokens} prompt tokens",
         )
 
     def list_models(self, cfg: AppConfig) -> list[ModelRow]:

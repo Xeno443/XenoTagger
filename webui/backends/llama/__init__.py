@@ -15,9 +15,9 @@ the app it's one adaptive-VRAM captioner.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Callable, Optional
 
-from core.backend import Backend, ModelOption, ModelRow
+from core.backend import Backend, CaptionOutput, ImageInput, ModelOption, ModelRow, Tag
 from core.config import AppConfig
 from core.downloads import DownloadItem
 
@@ -29,6 +29,7 @@ class LlamaBackend(Backend):
     id = "llama"
     label = "llama-server"
     role = "captioner"
+    takes_tags = "optional"
     vram = "adaptive"
     settings_ui_module = "backends.llama.settings_ui"
     has_models = True
@@ -55,6 +56,41 @@ class LlamaBackend(Backend):
             return False
         status = session.cached_status()
         return status.installed and not status.reachable
+
+    def caption(
+        self,
+        cfg: AppConfig,
+        image: ImageInput,
+        variant: str = "",
+        tags: Optional[list[Tag]] = None,
+        should_stop: Optional[Callable[[], bool]] = None,
+    ) -> CaptionOutput:
+        """variant is the prompt (empty = the configured prompt template).
+        A {tags} placeholder in it is replaced with the tags, comma-
+        separated in plain words ("looking at viewer"); a prompt without
+        one never sees them. Uses a server that's already running - never
+        starts one."""
+        prompt = variant or cfg.prompt_template
+        if "{tags}" in prompt:
+            prompt = prompt.replace("{tags}", ", ".join(t.name.replace("_", " ") for t in tags or []))
+        result = session.running_client(cfg).caption(
+            image,
+            prompt=prompt,
+            temperature=cfg.temperature,
+            top_p=cfg.top_p,
+            max_tokens=cfg.max_tokens,
+            resize_enabled=cfg.resize_enabled,
+            resize_target_mp=cfg.resize_target_mp,
+            snap_enabled=cfg.snap_enabled,
+            snap_multiple=cfg.snap_multiple,
+            should_stop=should_stop,
+        )
+        note = f"{result.completion_tokens} tokens"
+        if result.tokens_per_second:
+            note += f", {result.tokens_per_second:.1f} tok/s"
+        if result.resize_note:
+            note += f", resized {result.resize_note}"
+        return CaptionOutput(text=result.content, truncated=result.truncated, seconds=result.elapsed_s, note=note)
 
     def status_bar_segments(self, cfg: AppConfig) -> list[tuple[str, str]]:
         base_url = session.display_base_url(cfg)
