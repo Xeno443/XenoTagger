@@ -22,10 +22,11 @@ from __future__ import annotations
 
 from core.backend import Backend
 
+from .furrence2 import BACKEND as FURRENCE2
 from .hydra import BACKEND as HYDRA
 from .llama import BACKEND as LLAMA
 
-BACKENDS: list[Backend] = [LLAMA, HYDRA]
+BACKENDS: list[Backend] = [LLAMA, HYDRA, FURRENCE2]
 
 
 def get(backend_id: str) -> Backend:

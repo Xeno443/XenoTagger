@@ -223,6 +223,14 @@ class AppConfig:
     # - changing this takes effect on next restart, not on Save.
     hydra_tag_vocab_path: str = DEFAULT_TAG_VOCAB_PATH
 
+    # Furrence2's "length: N" prompt value (roughly words) is
+    # clamp(60 + 2 * prompt tags, min, max) - see backends/furrence2/
+    # worker.py. Chosen by testing (_reference/furrence2-test/FINDINGS.md):
+    # below 150 it under-describes images Hydra has few tags for, above
+    # ~200 it pads. min == max gives a fixed length.
+    furrence2_length_min: int = 150
+    furrence2_length_max: int = 200
+
 
 def load() -> AppConfig:
     defaults = asdict(AppConfig())

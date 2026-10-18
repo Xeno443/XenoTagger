@@ -20,6 +20,7 @@ import sys
 from pathlib import Path
 
 from core import config as config_mod
+from core.downloads import download_one
 from backends.hydra import classifier as hydra_classifier
 from backends.llama.client import LlamaClient
 from backends.hydra.install import (
@@ -27,6 +28,7 @@ from backends.hydra.install import (
     download_model as hydra_download_model,
     install_deps as hydra_install_deps,
 )
+from backends.furrence2 import install as furrence2_install
 from backends.llama.install import BACKENDS, DEFAULT_BACKEND, install, plan_install
 from backends.llama.models import resolve_selection, scan_model_variants
 from backends.llama.server import ServerError, resolve_server
@@ -44,6 +46,11 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="Install Hydra's Python dependencies (torch + friends) and download its "
              "model weight (~1GB), then exit. Does not enable or load it - see "
              "Settings -> Hydra (or hydra_enabled/hydra_autoload_model in settings.json) for that.",
+    )
+    parser.add_argument(
+        "--install-furrence2", action="store_true",
+        help="Install Furrence2's dependencies (torch, plus transformers 4.46 into "
+             "furrence2/lib) and download its model (3.3GB, converted to fp16), then exit.",
     )
     parser.add_argument("--dir", required=False, help="Directory of images to caption")
     parser.add_argument("--overwrite", action="store_true", default=None)
@@ -170,6 +177,37 @@ def _install_hydra(log: logging.Logger) -> int:
     return 0
 
 
+def _install_furrence2(log: logging.Logger) -> int:
+    """Same shape as _install_hydra, sharing backends.furrence2.install
+    with the GUI."""
+    log.info("Installing Furrence2 dependencies ...")
+    if not furrence2_install.install_deps(on_output=lambda line: log.info("pip: %s", line)):
+        log.error("Furrence2 dependency install failed.")
+        return 1
+
+    for item in furrence2_install.download_items():
+        log.info("Downloading %s ...", item.label)
+        last_logged_pct = -1
+
+        def on_progress(written: int) -> None:
+            nonlocal last_logged_pct
+            pct = int(written * 100 / max(item.size_bytes, 1))
+            if pct >= last_logged_pct + 10:
+                last_logged_pct = pct
+                log.info("Downloading: %d%%", pct)
+
+        try:
+            if not download_one(item, should_abort=lambda: False, on_progress=on_progress):
+                log.error("Furrence2 model download did not complete.")
+                return 1
+        except Exception as exc:
+            log.error("Furrence2 model download failed: %s", exc)
+            return 1
+
+    log.info("Furrence2 dependencies and model installed successfully.")
+    return 0
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     setup_logging(args.log_file, args.debuglog, args.verbose)
@@ -181,8 +219,11 @@ def main(argv=None) -> int:
     if args.install_hydra:
         return _install_hydra(log)
 
+    if args.install_furrence2:
+        return _install_furrence2(log)
+
     if not args.dir:
-        log.error("--dir is required (unless using --install-llama or --install-hydra)")
+        log.error("--dir is required (unless using --install-llama, --install-hydra or --install-furrence2)")
         return 2
 
     cfg = config_mod.load()
