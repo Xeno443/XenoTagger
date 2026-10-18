@@ -5,8 +5,7 @@ the app it's one adaptive-VRAM captioner.
 
   - server.py      llama-server process lifecycle, health/props checks
   - client.py      chat API calls, image preprocessing
-  - session.py     which server this app process owns + the cached
-                   reachability state the GUI gates on
+  - session.py     which server this app process owns, clients for it
   - models.py      local GGUF discovery + curated model list
   - catalog.py     the Models tab rows (folder = row, quant/mmproj dropdowns)
   - install.py     llama-server.exe installer (ggml-org releases)
@@ -23,7 +22,7 @@ from core.downloads import DownloadItem
 
 from . import catalog, session
 from .models import resolve_selection
-from .server import LLAMA_SERVER_EXE, get_loaded_model_name, is_healthy
+from .server import LLAMA_SERVER_EXE, is_healthy
 
 
 class LlamaBackend(Backend):
@@ -39,25 +38,17 @@ class LlamaBackend(Backend):
     models_help = catalog.MODELS_HELP
 
     def is_loaded(self, cfg: AppConfig) -> bool:
-        # Ownership only, not a health check - same test "Stop llama
-        # server" is gated on. A server we didn't start is never ours to
-        # stop/restart.
+        # Ownership only, not a health check - a server we didn't start
+        # is never ours to stop/restart.
         return session.is_server_managed_by_us(session.managed_base_url(cfg))
 
     def load(self, cfg: AppConfig) -> tuple[bool, str]:
+        """Managed: starts llama-server (or reuses one already answering
+        on the port). External: only checks the server answers."""
         return session.try_start_managed_llama(cfg)
 
     def unload(self, cfg: AppConfig) -> None:
         session.stop_managed()
-        session.refresh_reachability_cache(cfg)
-
-    def wants_autoload(self, cfg: AppConfig) -> bool:
-        # Reads the reachability cache the GUI's startup check has just
-        # refreshed - no extra network call.
-        if cfg.server_mode != "managed" or not cfg.autostart_managed_llama:
-            return False
-        status = session.cached_status()
-        return status.installed and not status.reachable
 
     def is_ready(self, cfg: AppConfig) -> bool:
         # Any answering server counts, ours or not (external mode).
@@ -111,16 +102,6 @@ class LlamaBackend(Backend):
         if result.resize_note:
             note += f", resized {result.resize_note}"
         return CaptionOutput(text=result.content, truncated=result.truncated, seconds=result.elapsed_s, note=note)
-
-    def status_bar_segments(self, cfg: AppConfig) -> list[tuple[str, str]]:
-        base_url = session.display_base_url(cfg)
-        healthy = is_healthy(base_url)
-        installed = LLAMA_SERVER_EXE.exists()  # cheap, local - no extra network call
-        # Always the server's own answer, never our config - our selection is
-        # just what we'd ask it to load next, not necessarily what's actually
-        # loaded right now (e.g. external mode, or a server someone else picked).
-        model = get_loaded_model_name(base_url) if healthy else None
-        return [("llama", session.status_label(cfg, healthy, installed)), ("Model", model or "n/a")]
 
     def shutdown(self, cfg: AppConfig) -> None:
         session.stop_managed()

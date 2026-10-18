@@ -2,9 +2,8 @@
 plus the in-memory image preprocessing applied before a request goes out.
 
 LlamaClient.caption() is the single place in the whole app that actually
-talks to llama-server - core/captioner.py, core/batch.py, and the
-Single-image tab (via captioner.caption_image, see core/captioner.py's
-own docstring for why that indirection exists) all funnel through it, so
+talks to llama-server for a caption - everything goes through the
+backend's caption() (backends.llama), called by core.pipeline - so
 request-shape changes (new sampling params, a different API path) only
 ever need to happen here.
 
@@ -33,12 +32,8 @@ dimensions.
 
 This module keeps no state between calls beyond what's set once at
 LlamaClient construction (base_url, timeout) - each caption() call is
-independent and safe to make from a different thread than the one that
-built the client, which is how the app already uses it: a batch run's
-worker thread (core/batch.py) makes its sequential run of caption() calls
-on the same LlamaClient instance the GUI thread obtained via
-ui/llama_session.py's get_client(), while the GUI thread itself is off polling a
-progress queue, not calling caption() at the same time.
+independent and safe to make from any thread (a batch run's worker
+thread, the Single tab's worker).
 """
 
 from __future__ import annotations

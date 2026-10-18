@@ -29,8 +29,10 @@ from core.config import AppConfig
 from core.downloads import DownloadItem, format_size
 
 from . import session
+from .server import get_loaded_model_name, is_healthy
 from .models import (
-    IGNORED_SUBSTRINGS, ModelGroup, cache_file_metadata, group_models, load_curated_models, merge_curated, scan_all,
+    IGNORED_SUBSTRINGS, ModelGroup, cache_file_metadata, group_models, load_curated_models, merge_curated,
+    resolve_selection, scan_all,
 )
 
 log = logging.getLogger(__name__)
@@ -204,15 +206,18 @@ def set_active(cfg: AppConfig, key: str, values: list) -> tuple[Optional[dict], 
     quant, mmproj = _selection(key, values)
     log.info("Set active model to %s (mmproj=%s)", quant, mmproj)
     if session.is_server_managed_by_us(session.managed_base_url(cfg)):
-        how = "Stop and start llama-server in Settings -> Llama to load it."
+        how = "Restart the pipeline (Settings -> Pipeline) to load it."
     else:
-        how = "llama-server loads it the next time this app starts it."
+        how = "The pipeline loads it on its next start."
     return dict(model_name=quant, mmproj_name=mmproj), f"Active model set to {quant} (mmproj: {mmproj}). {how}"
 
 
 def model_status(cfg: AppConfig) -> str:
+    """"Model: <file name>" or "Model: missing" (nothing selected, or the
+    selected file is gone). External: whatever that server has loaded."""
     if cfg.server_mode == "external":
-        return "Model: whatever the external server has loaded (see the status bar)."
-    if not cfg.model_name:
-        return "Model: none selected yet."
-    return f"Model: {cfg.model_name} (mmproj: {cfg.mmproj_name or 'largest in its folder'})."
+        base_url = session.display_base_url(cfg)
+        loaded = get_loaded_model_name(base_url) if is_healthy(base_url) else None
+        return f"Model: {loaded}" if loaded else "Model: missing"
+    model_path, _, _ = resolve_selection(cfg)
+    return f"Model: {model_path.name}" if model_path else "Model: missing"

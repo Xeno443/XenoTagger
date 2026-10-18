@@ -3,7 +3,7 @@ length. The only file in backends/furrence2/ that imports Gradio or ui/ -
 loaded by ui.tab_settings via Furrence2Backend.settings_ui_module.
 
 No Load/Unload buttons: starting and stopping the worker is the
-pipeline's job (start_pipeline/stop_pipeline, v0.9 step 3). The install
+pipeline's job (Settings -> Pipeline). The install
 runs in a background thread with the same one-shot announce idiom as
 Hydra's (backends/hydra/settings_ui.py); its pip output only goes to the
 debug log.
@@ -36,6 +36,10 @@ _install_announce: Optional[tuple[str, str]] = None  # (message, level), popped 
 def collect_settings(furrence2_length_min, furrence2_length_max) -> dict:
     lo, hi = int(furrence2_length_min), int(furrence2_length_max)
     return dict(furrence2_length_min=min(lo, hi), furrence2_length_max=max(lo, hi))
+
+
+def load_values(cfg) -> tuple:
+    return (cfg.furrence2_length_min, cfg.furrence2_length_max)
 
 
 def _status_text() -> str:

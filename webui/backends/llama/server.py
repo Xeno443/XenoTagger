@@ -10,16 +10,11 @@ Two modes, chosen via AppConfig.server_mode:
     (which may point at another machine entirely) - this app has no
     business touching anything there, ever.
 
-ManagedServer.stop()'s terminate()-then-kill() is not just cleanup - it's
-also the only reliable way anywhere in this app to interrupt a request
-that's already in flight. llama-server itself has open upstream bugs
-where it doesn't reliably notice an HTTP client disconnecting and keeps
-generating regardless, so closing our end of the connection alone can't
-be trusted to actually stop server-side work; killing the OS process is
-unconditional and doesn't depend on llama-server cooperating. See
-ui/operation.py (operation_interrupt_click,
-operation_force_abort) for where this gets invoked as an abort
-mechanism, not just at shutdown.
+Interrupting a caption doesn't need the process killed: the client
+streams, and llama-server cancels a streaming request within
+milliseconds of the connection closing (tested 2026-10-18 - a
+non-streaming request did run to the end). Stopping the pipeline (which
+stops this process) is only Interrupt's fallback - see ui/operation.py.
 
 Only ever manages a process we ourselves started (resolve_server returns
 managed_server=None whenever the server was already running, in either
@@ -34,8 +29,7 @@ too narrow to justify the added complexity: closing the app's console
 window already reliably kills everything attached to it, including
 llama-server.exe, so the only case that actually left an orphan behind
 was something surgically killing just the Python process without
-touching the window - not normal usage. See check_status() below, which
-stayed, for the separate reachability-gating concern.)
+touching the window - not normal usage.)
 """
 
 from __future__ import annotations
@@ -44,7 +38,6 @@ import logging
 import shlex
 import subprocess
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -66,29 +59,6 @@ log = logging.getLogger(__name__)
 
 class ServerError(RuntimeError):
     pass
-
-
-@dataclass
-class ServerStatus:
-    """Cheap, read-only categorization for UI gating - never starts or
-    stops anything, unlike resolve_server(). reachable: is something
-    actually answering a health check right now - the only thing that
-    gates Single/Batch/Recaption. There's no more "not running yet, but
-    installed, so count it as reachable anyway" case: starting a managed
-    server is now always an explicit action (a button, or autostart at
-    launch), never an implicit side effect of clicking Caption, so
-    "installed but idle" is just as unusable right now as "not installed
-    at all" - both are reachable=False.
-
-    installed: managed mode only - is llama-server.exe present on disk.
-    Not meaningful for external mode (always False there). Exists so a
-    caller can tell "not installed" apart from "installed but idle"
-    without another network call - both are reachable=False, but they
-    need different status text/button behavior (see app.py)."""
-
-    reachable: bool
-    installed: bool
-    reason: str = ""
 
 
 def is_healthy(base_url: str, timeout: float = 1.5) -> bool:
@@ -211,32 +181,3 @@ def resolve_server(
     process.terminate()
     raise ServerError(f"llama-server did not become ready within {ready_timeout}s")
 
-
-def check_status(cfg: AppConfig) -> ServerStatus:
-    """Cheap, read-only categorization - never starts or stops anything
-    (unlike resolve_server, which this deliberately doesn't call). Meant
-    for UI gating: polled periodically and at app startup to decide
-    whether Single/Batch/Recaption should be enabled, and whether the
-    Models tab's "Set as active model" means anything (session.
-    set_active_blocked)."""
-    if cfg.server_mode == "external":
-        base_url = cfg.external_url.rstrip("/")
-        if is_healthy(base_url):
-            return ServerStatus(reachable=True, installed=False)
-        return ServerStatus(
-            reachable=False, installed=False,
-            reason=f"No server responding at {base_url}.",
-        )
-
-    base_url = f"http://{MANAGED_HOST}:{cfg.server_port}"
-    if is_healthy(base_url):
-        return ServerStatus(reachable=True, installed=True)
-    if LLAMA_SERVER_EXE.exists():
-        return ServerStatus(
-            reachable=False, installed=True,
-            reason="llama-server isn't running yet.",
-        )
-    return ServerStatus(
-        reachable=False, installed=False,
-        reason="llama.cpp isn't installed yet.",
-    )

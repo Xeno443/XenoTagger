@@ -33,9 +33,11 @@ import gradio as gr
 
 from backends import BACKENDS
 from core import config as config_mod
+from core import pipeline
 from core.backend import Backend
 from ui import state
 from ui.context import BuildContext
+from ui.notify import notify
 from ui.downloads_queue import (
     download_abort_all, download_consume_needs_refresh, download_enqueue, download_status_ui,
 )
@@ -248,6 +250,9 @@ def models_action_ui(filter_id: str, selected, *option_values):
         if updates is None:
             return (*noop, message, *download_status_ui())
         log.info("Models tab: %s set active: %s", backend.id, updates)
+        # A started pipeline keeps the model it started with.
+        if pipeline.status().state == "started":
+            notify("Active model saved. Restart the pipeline to load it.", level="warning")
         # Star column and dropdowns follow the new config.
         refreshed = models_refresh_ui(filter_id, selected)
         return (*refreshed[:-1], message, *download_status_ui())

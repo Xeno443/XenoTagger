@@ -12,34 +12,28 @@ from typing import Optional
 
 import gradio as gr
 
-from backends.llama.session import stop_managed
+from core import pipeline
 
 log = logging.getLogger("app")  # fixed name, see app.py
 
 # ------------------------------------------------------ Operation tracking
 #
 # Single source of truth for "is something long-running active, and what".
-# The Single-image and Batch tabs' Run buttons double as Interrupt buttons
-# once running (same Generate/Interrupt pattern most Stable Diffusion
-# WebUIs use): first click while running asks for a graceful stop (batch:
-# finish the current image, then stop before the next one; single-image
-# has no queue to gracefully stop before, so this click is just a
-# deliberate one-click buffer against an accidental double-click), second
-# click hard-aborts by killing the managed llama-server outright - the
-# only actually reliable way to stop an in-flight request. (llama-server
-# itself has open upstream bugs where it doesn't reliably notice a
-# disconnected client and keeps generating regardless - closing our end of
-# the connection alone can't be trusted to stop it; see ManagedServer.stop
-# in core/server.py for the real kill.)
+# Each caption tab has a separate Interrupt button next to its Run button
+# (same Generate/Interrupt pattern most Stable Diffusion WebUIs use):
+#   - first click: a soft stop - the job's should_stop() turns True, so a
+#     llama caption stops mid-generation (its streaming request is closed,
+#     llama-server cancels it), a batch stops before the next step/image.
+#     Hydra and Furrence2 take about a second per image and just finish.
+#   - second click: the fallback - stop the whole pipeline, which fails
+#     whatever is still in flight.
 #
-# This also acts as the mutual-exclusion gate for the race discussed
-# above backends.llama.session's _session_lock: only one kind of operation ("single" or "batch")
-# may be active at a time, since both ultimately share the one
-# llama-server connection.
+# This is also the mutual-exclusion gate: only one operation may be active
+# at a time, since they all share the one started pipeline.
 
 @dataclass
 class _Operation:
-    kind: str  # "single" or "batch"
+    kind: str  # "single", "batch" or "review"
     label: str  # human-readable, shown in the status bar
     stop_requested: bool = False
     abort_requested: bool = False
@@ -82,22 +76,22 @@ def operation_end() -> None:
 
 
 def operation_interrupt_click(kind: str) -> str:
-    """Call when the Run/Interrupt button is clicked while `kind` is
-    already the active operation. Returns "stopping" on the first click
-    (graceful - just sets a flag the running loop checks), "aborting" on
-    the second (hard - kills the server, which is done outside the lock
-    since stop_managed() acquires its own _session_lock)."""
+    """Call when `kind`'s Interrupt button is clicked. Returns "stopping"
+    on the first click (soft - sets the flag should_stop reads),
+    "aborting" on the second (stops the pipeline - outside the lock, it
+    can take a few seconds)."""
     with operation_lock:
         op = _active_operation
         if op is None or op.kind != kind:
             return "idle"
         if not op.stop_requested:
             op.stop_requested = True
-            log.info("%s: stop requested (graceful)", op.label)
+            log.info("%s: stop requested", op.label)
             return "stopping"
         op.abort_requested = True
-        log.info("%s: abort requested (killing server)", op.label)
-    stop_managed()
+        log.info("%s: abort requested (stopping the pipeline)", op.label)
+    for _ in pipeline.stop_pipeline():
+        pass
     return "aborting"
 
 
@@ -129,17 +123,28 @@ def interrupt_label_state(op: Optional["_Operation"], kind: str) -> tuple[str, b
     if op is None or op.kind != kind:
         return "Interrupt", True
     if op.abort_requested:
-        return "Interrupting...", False
+        return "Pipeline stopped", False
     if op.stop_requested:
-        return "Interrupt (click again to abort now)", True
+        return INTERRUPT_AGAIN_LABEL, True
     return "Interrupt", True
 
 
-def run_controls_update(kind: str, op: Optional[_Operation], reachable: bool) -> tuple:
+INTERRUPT_AGAIN_LABEL = "Stopping... (click again to stop the pipeline)"
+
+
+def interrupt_button_ui(kind: str):
+    """Every caption tab's Interrupt click: the button's own update."""
+    if operation_interrupt_click(kind) == "aborting":
+        return gr.update(value="Pipeline stopped", interactive=False)
+    return gr.update(value=INTERRUPT_AGAIN_LABEL)
+
+
+def run_controls_update(kind: str, op: Optional[_Operation], ready: bool) -> tuple:
     """(run_btn, run_col, interrupt_col, interrupt_btn) updates for the tab
     whose operation kind is `kind` - one tab's share of app.py's
-    _update_ui_status (see its docstring). Caller holds operation_lock."""
-    blocked = (op is not None and op.kind != kind) or not reachable
+    _update_ui_status (see its docstring). ready: the pipeline is started
+    and usable. Caller holds operation_lock."""
+    blocked = (op is not None and op.kind != kind) or not ready
     running = op is not None and op.kind == kind
     label, ok = interrupt_label_state(op, kind)
     return (
@@ -151,9 +156,9 @@ def run_controls_update(kind: str, op: Optional[_Operation], reachable: bool) ->
 
 
 def settings_subtabs_disabled() -> bool:
-    """The one, sole question of whether the four operation-sensitive
-    Settings sub-tabs (Llama, Hydra, Image resizing, Captioning defaults)
-    are currently off-limits - today that's just "is a job running", but
+    """The one, sole question of whether the operation-sensitive Settings
+    sub-tabs (Pipeline and the backends') are currently off-limits -
+    today that's just "is a job running", but
     kept as its own function (not inlined into _settings_gating_ui or
     _settings_subtab_entry_ui, both of which call this rather than
     checking _active_operation themselves) so both of those callers can
@@ -165,9 +170,9 @@ def settings_subtabs_disabled() -> bool:
 
 
 def operation_force_abort() -> None:
-    """Immediately hard-aborts whatever's running, if anything - skips the
-    two-click grace period (for Restart, which needs the operation gone
-    now, not eventually). No-op if nothing is running."""
+    """Asks whatever's running to stop now, skipping the two-click grace
+    period (for Restart app, which shuts every backend down right after).
+    No-op if nothing is running."""
     with operation_lock:
         op = _active_operation
         if op is None:
@@ -175,14 +180,13 @@ def operation_force_abort() -> None:
         op.stop_requested = True
         op.abort_requested = True
         log.info("%s: force-aborted (restart requested)", op.label)
-    stop_managed()
 
 
 def wait_for_operation_to_end(timeout: float = 30.0) -> None:
-    """Blocks until the active operation's own thread notices the abort
-    and calls operation_end() - killing the server (above) should make
-    its in-flight request fail almost immediately, so this is normally
-    quick; the timeout is just a safety net against hanging forever."""
+    """Blocks until the active operation's own thread notices the stop
+    and calls operation_end() - a llama caption stops within
+    milliseconds, Hydra/Furrence2 finish their image in about a second;
+    the timeout is just a safety net against hanging forever."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         with operation_lock:

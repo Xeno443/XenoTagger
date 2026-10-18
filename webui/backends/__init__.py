@@ -1,6 +1,6 @@
 """Model backends - one self-contained package per model type, each a
-core.backend.Backend subclass instance. BACKENDS is the registry; its
-order is the Settings sub-tab order.
+core.backend.Backend subclass instance. BACKENDS is the registry - see
+its comment for what its order decides.
 
 Import rules - keep the graph acyclic and the CLI Gradio-free:
   - A backend imports core/ freely, and its own package's modules.
@@ -8,12 +8,11 @@ Import rules - keep the graph acyclic and the CLI Gradio-free:
     behavior (e.g. Hydra's load stopping/restarting llama-server) goes
     through core.lifecycle and this registry instead.
   - Only <backend>/settings_ui.py may import Gradio or ui/ (the shared
-    modules - state, notify, operation, context, dialogs, reachability,
+    modules - state, notify, operation, context, dialogs, pipeline_status,
     downloads_queue, model_status - never a tab_*). Nothing else imports settings_ui;
     the GUI loads it by Backend.settings_ui_module.
-  - core/ never imports backends/ - except core.captioner/core.batch,
-    which still call llama and Hydra directly until the v0.9 step-3
-    caption-pipeline rewrite moves them behind the Backend interface.
+  - core/ never imports backends/ - core.pipeline/core.lifecycle get the
+    registry passed in.
   - Loggers use __name__ ("backends.<id>.<module>"); the GUI and CLI
     raise "backends" to DEBUG alongside "core", never the root logger.
 """
@@ -26,7 +25,10 @@ from .furrence2 import BACKEND as FURRENCE2
 from .hydra import BACKEND as HYDRA
 from .llama import BACKEND as LLAMA
 
-BACKENDS: list[Backend] = [LLAMA, HYDRA, FURRENCE2]
+# Order = everywhere backends are listed: Settings sub-tabs, Pipeline
+# boxes, Models rows, caption lines in the .txt. Taggers first (they run
+# first). Load order is separate (core.lifecycle.load_order, by VRAM).
+BACKENDS: list[Backend] = [HYDRA, LLAMA, FURRENCE2]
 
 
 def get(backend_id: str) -> Backend:

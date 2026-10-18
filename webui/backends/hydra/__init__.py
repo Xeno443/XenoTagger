@@ -1,6 +1,6 @@
 """Hydra 3.5 (RedRocket) e621 tagger - in-process torch, all-or-nothing
-VRAM ("fixed"), so it loads before llama-server at launch and stops/
-restarts an owned llama-server when loaded later (core.lifecycle).
+VRAM ("fixed"), so the pipeline loads it before llama-server
+(core.lifecycle).
 
   - classifier.py  the loaded-model singleton: load/unload/classify/status
   - install.py     pip deps + weights download
@@ -31,8 +31,8 @@ class HydraBackend(Backend):
     has_models = True
     selectable_models = False  # one model, used as soon as it's downloaded
     models_help = (
-        "one model (~1GB), used as soon as it's downloaded. Load it in "
-        "Settings -> Hydra, which also installs its dependencies."
+        "one model (~1GB), used as soon as it's downloaded. Install its "
+        "dependencies in Settings -> Hydra; the pipeline loads it."
     )
 
     def is_loaded(self, cfg: AppConfig) -> bool:
@@ -51,14 +51,6 @@ class HydraBackend(Backend):
     def competes_for_vram(self, cfg: AppConfig) -> bool:
         return cfg.hydra_device == "cuda"
 
-    def wants_autoload(self, cfg: AppConfig) -> bool:
-        # Deliberately independent of hydra_enabled being what *uses* a
-        # loaded model - autoload only ever fires when both are on.
-        if not (cfg.hydra_enabled and cfg.hydra_autoload_model):
-            return False
-        st = classifier.status()
-        return st.deps_installed and st.model_downloaded and not st.loaded
-
     def setup_problem(self, cfg: AppConfig) -> Optional[str]:
         if not install.deps_installed():
             return "Hydra's dependencies aren't installed (Settings -> Hydra)."
@@ -75,20 +67,6 @@ class HydraBackend(Backend):
         # Hand-added names Hydra doesn't know count as general.
         categories = classifier.label_categories()
         return [Tag(name, categories.get(name, "general"), 1.0) for name in names]
-
-    def status_bar_segments(self, cfg: AppConfig) -> list[tuple[str, str]]:
-        """Compact one-word(ish) Hydra state - see settings_ui's
-        _hydra_status_text() for the fuller sentence-form version shown on
-        the Hydra sub-tab itself; this is deliberately terser, matching the
-        llama-server segment's own "running"/"idle"/etc. brevity."""
-        if not cfg.hydra_enabled:
-            return [("Hydra", "disabled")]
-        st = classifier.status()
-        if st.loaded:
-            return [("Hydra", f"loaded ({st.device})")]
-        if not st.deps_installed or not st.model_downloaded:
-            return [("Hydra", "not set up")]
-        return [("Hydra", "enabled, not loaded")]
 
     def shutdown(self, cfg: AppConfig) -> None:
         # Unlike llama-server (a separate OS process), Hydra lives in this
@@ -113,9 +91,7 @@ class HydraBackend(Backend):
         )]
 
     def model_status(self, cfg: AppConfig) -> str:
-        if install.model_downloaded():
-            return f"Model: {install.MODEL_FILENAME}, downloaded."
-        return f"Model: {install.MODEL_FILENAME}, not downloaded yet."
+        return f"Model: {install.MODEL_FILENAME}" if install.model_downloaded() else "Model: missing"
 
 
 BACKEND = HydraBackend()

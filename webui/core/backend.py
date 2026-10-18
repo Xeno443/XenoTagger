@@ -10,8 +10,7 @@ tag()/caption() are the per-image calls the caption pipeline (v0.9 step
 3) makes on whatever backends it started: a tagger returns structured
 Tags, a captioner returns one CaptionOutput per variant. Expected
 failures raise BackendError (each backend's own error class derives from
-it), so the pipeline can handle every backend alike. core.captioner
-still calls llama and Hydra directly until the pipeline replaces it.
+it), so the pipeline can handle every backend alike.
 
 The model methods (list_models() and friends) feed the GUI's combined
 Models tab (ui/tab_models.py), which shows every backend's rows in one
@@ -103,9 +102,9 @@ class Backend:
     variant_label: str = ""
     # "fixed": load() is all-or-nothing onto one device (Hydra).
     # "adaptive": sizes itself to whatever VRAM is free when it starts
-    # (llama-server's n_gpu_layers="auto"). Drives core.lifecycle: fixed
-    # backends load first at launch, and loading one stops/restarts any
-    # running adaptive one so it can resize around it.
+    # (llama-server's n_gpu_layers="auto"). Drives core.lifecycle: the
+    # pipeline loads fixed backends first, and loading one stops/restarts
+    # any running adaptive one so it can resize around it.
     vram: str = "fixed"
     # Dotted path of the backend's Settings sub-tab module, imported only
     # by the GUI (ui.tab_settings) - the only file in a backend allowed to
@@ -119,24 +118,19 @@ class Backend:
 
     def load(self, cfg: AppConfig) -> tuple[bool, str]:
         """Blocking. (ok, user-facing message) - never raises for an
-        expected failure (missing deps, OOM, bad model selection)."""
+        expected failure (missing deps, OOM, bad model selection). Only
+        core.pipeline calls it (start_pipeline) - loading is never a side
+        effect of anything else."""
         raise NotImplementedError
 
     def unload(self, cfg: AppConfig) -> None:
+        """No-op if not loaded."""
         raise NotImplementedError
 
     def competes_for_vram(self, cfg: AppConfig) -> bool:
         """Whether loading this right now needs GPU memory at all (e.g.
         False for Hydra on CPU) - no coexistence dance if not."""
         return True
-
-    def wants_autoload(self, cfg: AppConfig) -> bool:
-        """True if this backend's autoload/autostart setting is on AND
-        loading it right now would actually do something (installed, not
-        already loaded/running). The Settings sub-tab's autoload handler
-        asks this before acting; core.lifecycle.autoload_order decides
-        when that handler runs relative to the other backends'."""
-        return False
 
     def is_ready(self, cfg: AppConfig) -> bool:
         """Usable for tag()/caption() right now. Unlike is_loaded(), true
@@ -185,10 +179,6 @@ class Backend:
         can stop mid-caption (llama); a backend that's fast per image just
         finishes it. Raises BackendError (Interrupted when stopped)."""
         raise NotImplementedError
-
-    def status_bar_segments(self, cfg: AppConfig) -> list[tuple[str, str]]:
-        """(label, value) pairs for the global status bar, in order."""
-        return []
 
     def shutdown(self, cfg: AppConfig) -> None:
         """Before an in-place app restart (os.execv skips atexit and

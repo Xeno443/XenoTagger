@@ -1,12 +1,15 @@
 """Headless, unattended batch captioning - shares all its core logic
-(core/batch.py's run_batch, core/captioner.py) with the Gradio GUI; this
+(core/pipeline.py, core/batch.py's run_batch) with the Gradio GUI; this
 file only adds argparse plumbing and console/file logging on top, nothing
 here duplicates what's in core/.
 
 Settings come from the same webui/config/settings.json the GUI reads and
-writes (core/config.py) - most flags below (--overwrite, --model,
---mmproj) are optional per-run overrides layered on top of whatever's
-already saved there, not a separate configuration.
+writes (core/config.py), including the pipeline (what runs, variants,
+Output). Each run starts the pipeline, captions the folder, and stops it
+again - the CLI's own "lazy start", since there's nothing to click
+headless. Most flags below (--overwrite, --model, --mmproj) are optional
+per-run overrides layered on top of whatever's saved, not a separate
+configuration.
 
 Example:
     system\\python\\python.exe webui\\cli.py --dir D:\\dataset\\images --overwrite
@@ -17,12 +20,14 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import time
 from pathlib import Path
 
 from core import config as config_mod
+from core import pipeline
+from core.batch import run_batch
 from core.downloads import download_one
-from backends.hydra import classifier as hydra_classifier
-from backends.llama.client import LlamaClient
+from backends import BACKENDS as REGISTRY
 from backends.hydra.install import (
     MODEL_SIZE_BYTES as HYDRA_MODEL_SIZE_BYTES,
     download_model as hydra_download_model,
@@ -30,8 +35,7 @@ from backends.hydra.install import (
 )
 from backends.furrence2 import install as furrence2_install
 from backends.llama.install import BACKENDS, DEFAULT_BACKEND, install, plan_install
-from backends.llama.models import resolve_selection, scan_model_variants
-from backends.llama.server import ServerError, resolve_server
+from backends.llama.models import scan_model_variants
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -44,8 +48,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument(
         "--install-hydra", action="store_true",
         help="Install Hydra's Python dependencies (torch + friends) and download its "
-             "model weight (~1GB), then exit. Does not enable or load it - see "
-             "Settings -> Hydra (or hydra_enabled/hydra_autoload_model in settings.json) for that.",
+             "model weight (~1GB), then exit. Whether it runs is the pipeline's "
+             "setting (Settings -> Pipeline, or pipeline_run in settings.json).",
     )
     parser.add_argument(
         "--install-furrence2", action="store_true",
@@ -240,75 +244,54 @@ def main(argv=None) -> int:
         log.error("Not a directory: %s", directory)
         return 2
 
-    # core.captioner only ever USES an already-loaded Hydra model (see its
-    # own docstring) - unlike the GUI, cli.py has no interactive "Load
-    # Hydra model" button and is a fresh, one-shot process every run, so
-    # if nothing here loads it, hydra_enabled silently does nothing on
-    # every single caption. Loaded BEFORE resolve_server() below (not
-    # after) for the same VRAM-ordering reason the GUI's own autoload
-    # chain was reordered for: llama-server's own n_gpu_layers="auto" is
-    # the one piece here that gracefully adapts to reduced free VRAM
-    # (partial CPU offload) - Hydra's load() is all-or-nothing onto one
-    # device, so it gets first pick, and llama's "auto" sizes itself
-    # around whatever's left. A load failure (deps/model missing, OOM)
-    # degrades gracefully - logged, batch continues without Hydra tags -
-    # matching core.captioner's own "never fail a whole caption/batch"
-    # philosophy for Hydra specifically.
-    if cfg.hydra_enabled:
-        try:
-            hydra_classifier.load(cfg)
-            log.info("Hydra model loaded on %s.", hydra_classifier.status().device)
-        except hydra_classifier.HydraError as exc:
-            log.warning("Hydra tagging is enabled but the model couldn't be loaded - continuing without it: %s", exc)
-
-    model_path = mmproj_path = None
-    if cfg.server_mode != "external":
-        model_path, mmproj_path, sel_error = resolve_selection(cfg)
-        if sel_error:
+    plan = pipeline.make_plan(cfg, REGISTRY)
+    if plan.problems:
+        for problem in plan.problems:
+            log.error("%s", problem)
+        if any(b.id == "llama" for b in plan.backends) and cfg.server_mode != "external":
             available = ", ".join(m.name for m in scan_model_variants() if m.valid) or "(none found)"
-            log.error("%s Valid models: %s", sel_error, available)
-            return 2
+            log.error("Valid llama models (--model): %s", available)
+        return 2
 
-    try:
-        base_url, managed = resolve_server(cfg, model_path, mmproj_path)
-    except ServerError as exc:
-        log.error("Server error: %s", exc)
-        return 1
+    for progress in pipeline.start_pipeline(cfg, REGISTRY):
+        log.info("%s", progress.message)
+        if progress.done and not progress.ok:
+            return 1
 
-    log.info("Using llama-server at %s", base_url)
-    client = LlamaClient(base_url, timeout=cfg.request_timeout)
+    # should_stop reaches llama's per-token check, and not_ready() makes a
+    # health request - so it's only actually asked every few seconds.
+    crash_check = {"at": 0.0, "crashed": False}
 
-    from core.batch import run_batch
+    def crashed() -> bool:
+        now = time.monotonic()
+        if now - crash_check["at"] > 5:
+            crash_check.update(at=now, crashed=bool(pipeline.not_ready()))
+        return crash_check["crashed"]
 
-    def on_progress(i, total, path, status, caption, resize_note):
-        suffix = f" (resized {resize_note})" if resize_note else ""
-        if caption:
-            log.info("[%d/%d] %s: %s -> %s%s", i, total, status, path.name, caption, suffix)
-        else:
-            log.info("[%d/%d] %s: %s%s", i, total, status, path.name, suffix)
+    def on_progress(i, total, path, status, text, detail):
+        line = f"[{i}/{total}] {status}: {path.name}"
+        if text:
+            line += f" -> {text}"
+        if detail:
+            line += f" ({detail})"
+        log.info("%s", line)
 
     try:
         result = run_batch(
-            directory,
-            client,
-            cfg,
-            overwrite=cfg.overwrite_existing,
-            trigger_word=args.trigger_word,
-            progress_cb=on_progress,
+            pipeline.running_plan(), directory,
+            trigger_word=args.trigger_word, overwrite=cfg.overwrite_existing,
+            progress_cb=on_progress, should_stop=crashed,
         )
     finally:
-        if managed:
-            managed.stop()
+        for progress in pipeline.stop_pipeline():
+            log.info("%s", progress.message)
 
-    log.info(
-        "Done: %d captioned, %d truncated, %d skipped, %d failed",
-        result.processed, result.truncated, result.skipped, result.failed,
-    )
+    log.info("Done: %d captioned, %d skipped, %d failed", result.done, result.skipped, result.failed)
     for path, err in result.errors:
-        log.error("  %s: %s", path, err)
-
-    return 0 if result.failed == 0 else 1
-
+        log.error("  %s: %s", path.name, err)
+    if result.conflicts:
+        log.warning("Skipped (another image has the same name): %s", ", ".join(p.name for p in result.conflicts))
+    return 0 if result.failed == 0 and not result.aborted else 1
 
 if __name__ == "__main__":
     sys.exit(main())

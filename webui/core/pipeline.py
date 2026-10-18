@@ -44,7 +44,7 @@ from typing import Callable, Iterable, Iterator, Optional
 
 from .backend import Backend, BackendError, CaptionOutput, ImageInput, Interrupted, Tag
 from .config import AppConfig
-from .lifecycle import autoload_order, load_with_coexistence
+from .lifecycle import load_order, load_with_coexistence
 
 log = logging.getLogger(__name__)
 
@@ -82,7 +82,7 @@ class Plan:
         return [s.piece for s in steps] + [TRIGGER_PIECE]
 
 
-def _variants(cfg: AppConfig, backend: Backend) -> list[dict]:
+def variants_for(cfg: AppConfig, backend: Backend) -> list[dict]:
     """The backend's variants from the config, normalized - a hand-edited
     settings.json can hold anything. Missing = one "default" variant."""
     raw = cfg.pipeline_variants.get(backend.id) if isinstance(cfg.pipeline_variants, dict) else None
@@ -119,7 +119,7 @@ def make_plan(cfg: AppConfig, backends: Iterable[Backend]) -> Plan:
         if not b.variant_label:
             captioners.append(Step(b, b.id, b.label, uses_tags=b.variant_uses_tags(cfg, "")))
             continue
-        checked = [v for v in _variants(cfg, b) if v["on"]]
+        checked = [v for v in variants_for(cfg, b) if v["on"]]
         if not checked:
             problems.append(f"{b.label}: no variant is checked.")
         seen: set[str] = set()
@@ -154,7 +154,7 @@ def make_plan(cfg: AppConfig, backends: Iterable[Backend]) -> Plan:
     if cfg.pipeline_tag_style not in TAG_STYLES:
         problems.append(f"Unknown tag style \"{cfg.pipeline_tag_style}\".")
 
-    return Plan(cfg, tagger, captioners, autoload_order(selected), problems)
+    return Plan(cfg, tagger, captioners, load_order(selected), problems)
 
 
 # ------------------------------------------------------------------ start/stop
@@ -170,7 +170,7 @@ class Progress:
 class PipelineStatus:
     state: str  # "stopped", "starting", "started", "stopping"
     plan: Optional[Plan]  # what's running (also while starting/stopping)
-    message: str  # outcome of the last start/stop
+    message: str  # the latest start/stop progress line, then its outcome
 
 
 _lock = threading.Lock()  # guards the four below; never held while loading
@@ -206,10 +206,19 @@ def _set(state: str, plan: Optional[Plan], message: str) -> None:
         _state, _plan, _message = state, plan, message
 
 
+def _note(message: str) -> Progress:
+    """A progress line, also kept as status().message - so a UI polling
+    status() (another browser tab, the 2s timer) shows it live too."""
+    global _message
+    with _lock:
+        _message = message
+    return Progress(message)
+
+
 def _unload_all(plan: Plan) -> Iterator[Progress]:
     while _loaded:
         backend = _loaded.pop()
-        yield Progress(f"Stopping {backend.label}...")
+        yield _note(f"Stopping {backend.label}...")
         try:
             backend.unload(plan.cfg)
         except Exception:  # noqa: BLE001 - keep stopping the others
@@ -223,14 +232,20 @@ def start_pipeline(cfg: AppConfig, backends: Iterable[Backend]) -> Iterator[Prog
     global _state, _plan, _message
     backends = list(backends)
     plan = make_plan(cfg, backends)
+    # Decide under the lock, yield outside it: the caller may well read
+    # status() between two progress lines, which takes the same lock.
+    refusal: Optional[Progress] = None
     with _lock:
         if _state != "stopped":
-            yield Progress(f"The pipeline is already {_state}.", done=True, ok=_state == "started")
-            return
-        if plan.problems:
-            yield Progress("Can't start the pipeline: " + " ".join(plan.problems), done=True, ok=False)
-            return
-        _state, _plan, _message = "starting", plan, ""
+            refusal = Progress(f"The pipeline is already {_state}.", done=True, ok=_state == "started")
+        elif plan.problems:
+            refusal = Progress("Can't start the pipeline: " + " ".join(plan.problems), done=True, ok=False)
+            _message = refusal.message
+        else:
+            _state, _plan, _message = "starting", plan, ""
+    if refusal is not None:
+        yield refusal
+        return
     log.info("Starting pipeline: %s", ", ".join(b.label for b in plan.backends))
 
     try:
@@ -240,7 +255,7 @@ def start_pipeline(cfg: AppConfig, backends: Iterable[Backend]) -> Iterator[Prog
             _loaded.append(backend)
             message = ""
             for step in load_with_coexistence(backend, backends, cfg):
-                yield Progress(step.message)
+                yield _note(step.message)
                 message = step.message
             if not backend.is_ready(cfg):
                 log.warning("Pipeline start failed at %s: %s", backend.label, message)
@@ -267,15 +282,19 @@ def start_pipeline(cfg: AppConfig, backends: Iterable[Backend]) -> Iterator[Prog
 def stop_pipeline() -> Iterator[Progress]:
     """Unloads everything start_pipeline loaded, in reverse order."""
     global _state
-    with _lock:
+    refusal: Optional[Progress] = None
+    with _lock:  # decide under the lock, yield outside it - see start_pipeline
         if _state != "started":
-            yield Progress(
+            refusal = Progress(
                 "The pipeline isn't running." if _state == "stopped" else f"The pipeline is {_state}, wait for it.",
                 done=True, ok=_state == "stopped",
             )
-            return
-        _state = "stopping"
+        else:
+            _state = "stopping"
         plan = _plan
+    if refusal is not None:
+        yield refusal
+        return
     assert plan is not None
     log.info("Stopping pipeline")
     try:

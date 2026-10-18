@@ -64,16 +64,6 @@ class Furrence2Backend(Backend):
             return "Furrence2's model isn't downloaded (Models tab)."
         return None
 
-    def status_bar_segments(self, cfg: AppConfig) -> list[tuple[str, str]]:
-        st = worker_client.status()
-        if st.running:
-            return [("Furrence2", f"running ({st.device})")]
-        if st.crashed:
-            return [("Furrence2", "error")]
-        if not st.deps_installed or not st.model_downloaded:
-            return [("Furrence2", "not set up")]
-        return [("Furrence2", "not running")]
-
     def shutdown(self, cfg: AppConfig) -> None:
         worker_client.stop()
 
@@ -117,9 +107,8 @@ class Furrence2Backend(Backend):
         return install.download_items() if key == _MODEL_KEY else []
 
     def model_status(self, cfg: AppConfig) -> str:
-        if install.model_downloaded():
-            return "Model: furrence2-large (fp16), downloaded."
-        return "Model: furrence2-large, not downloaded yet."
+        # The file itself is just model.safetensors - the name says more.
+        return "Model: furrence2-large" if install.model_downloaded() else "Model: missing"
 
 
 BACKEND = Furrence2Backend()

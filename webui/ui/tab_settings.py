@@ -1,20 +1,29 @@
 """Settings tab: the sub-tab container, operation gating of the sub-tabs,
 and the shared Save settings / Restart app row.
 
-Sub-tabs come first from the backend registry (backends.BACKENDS - each
-backend's settings_ui module, loaded by Backend.settings_ui_module), then
-the non-backend ones in ui/settings/. Every sub-tab module provides:
+Sub-tabs: Pipeline (ui/settings/pipeline.py) first, then one per backend
+in registry order (backends.BACKENDS - each backend's settings_ui module,
+loaded by Backend.settings_ui_module), then Debug. Every sub-tab module
+provides:
   - build(ctx) -> handle with tab, tab_label, tab_id, gated (disabled
     while a caption job runs) and save_inputs (its fields Save reads);
     a backend's may add models_btn (ui.model_status' "Show in Models",
     wired by app.py)
   - collect_settings(*values) -> dict of AppConfig updates, taking
     save_inputs' values in the same order
+  - load_values(cfg) -> save_inputs' values from cfg, applied on page load:
+    Gradio otherwise shows the values from when the app started, so a
+    browser reload after a Save would show (and a second Save would write
+    back) the old ones. A handle's load_outputs, if set, replaces
+    save_inputs as the target (Pipeline adds its re-render triggers).
 and optionally:
-  - after_save(old_cfg, new_cfg) -> text to append to "Settings saved."
-    (or None) - reacting to a saved change, e.g. llama's server restart
   - abort_background() - stop background work before Restart app, e.g.
     llama's install worker
+
+Save never touches a started pipeline - it keeps the settings it started
+with (core.pipeline) - but says "restart to apply" when something changed.
+Pipeline's Start/Restart buttons save first, wired here because this
+module owns Save.
 """
 
 from __future__ import annotations
@@ -30,13 +39,14 @@ import gradio as gr
 
 from backends import BACKENDS
 from core import config as config_mod
+from core import pipeline
 from ui import state
 from ui.context import BuildContext
 from ui.downloads_queue import download_abort_all
+from ui.notify import notify
 from ui.operation import operation_force_abort, settings_subtabs_disabled, wait_for_operation_to_end
-from ui.settings import captioning_defaults as settings_captioning_defaults
 from ui.settings import debug as settings_debug
-from ui.settings import image_resizing as settings_image_resizing
+from ui.settings import pipeline as settings_pipeline
 
 log = logging.getLogger("app")  # fixed name, see app.py
 
@@ -159,16 +169,12 @@ def restart_app_ui() -> None:
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
-def save_settings_ui(*values) -> str:
-    """Save settings' click target. values are every sub-tab's
-    save_inputs, concatenated in sub-tab order (see build()); each
-    sub-tab's collect_settings() gets its own slice and returns its
-    AppConfig updates, applied on top of the current config - so fields
-    no form covers (model_name/mmproj_name, set from the Models tab)
-    carry over unchanged. Then each sub-tab module's optional
-    after_save(old, new) reacts to what changed (llama: stop/restart the
-    managed server on a mode or process-arg change) and can append to the
-    returned message."""
+def _save(values) -> bool:
+    """Applies and saves every sub-tab's values (each collect_settings()
+    gets its own slice of `values`, in sub-tab order) on top of the
+    current config - so fields no form covers (model_name/mmproj_name,
+    set from the Models tab) carry over unchanged. Returns whether
+    anything changed."""
     updates: dict = {}
     i = 0
     for module, handle in _subtabs:
@@ -176,29 +182,37 @@ def save_settings_ui(*values) -> str:
         updates.update(module.collect_settings(*values[i:i + n]))
         i += n
 
-    old_cfg = state.current_cfg
     with state.config_lock:
-        state.current_cfg = replace(state.current_cfg, **updates)
-        new_cfg = state.current_cfg
-        config_mod.save(new_cfg)
-    log.info(
-        "Settings saved: server_mode=%s model=%s ngl=%s",
-        new_cfg.server_mode, new_cfg.model_name or "(none)", new_cfg.n_gpu_layers,
-    )
+        old_cfg = state.current_cfg
+        state.current_cfg = replace(old_cfg, **updates)
+        config_mod.save(state.current_cfg)
+    log.info("Settings saved (%s)", "changed" if state.current_cfg != old_cfg else "unchanged")
+    return state.current_cfg != old_cfg
 
-    notes = []
-    for module, _ in _subtabs:
-        after_save = getattr(module, "after_save", None)
-        if after_save is not None and (note := after_save(old_cfg, new_cfg)):
-            notes.append(note)
-    return " ".join(["Settings saved.", *notes])
+
+RESTART_TO_APPLY = "Settings saved. Restart the pipeline to apply them."
+
+
+def save_settings_ui(*values) -> str:
+    """Save settings' click target. A started pipeline keeps running with
+    the settings it started with - if this changed anything, say so."""
+    if _save(values) and pipeline.status().state == "started":
+        notify(RESTART_TO_APPLY, level="warning")
+        return RESTART_TO_APPLY
+    return "Settings saved."
+
+
+def save_quietly_ui(*values) -> str:
+    """Save before Pipeline's Start/Restart - no "restart to apply"."""
+    _save(values)
+    return "Settings saved."
 
 
 def build(ctx: BuildContext):
     _subtabs.clear()
     _SETTINGS_SUBTAB_ID_BY_LABEL.clear()
-    modules = [importlib.import_module(b.settings_ui_module) for b in BACKENDS] + [
-        settings_image_resizing, settings_captioning_defaults, settings_debug,
+    modules = [settings_pipeline] + [importlib.import_module(b.settings_ui_module) for b in BACKENDS] + [
+        settings_debug,
     ]
 
     with gr.Tab("Settings", id="settings") as settings_tab:
@@ -207,7 +221,7 @@ def build(ctx: BuildContext):
         # tab_label_state's own comment in app.py for why a gr.State
         # directly inside a Tabs block was confirmed live to
         # corrupt the rendered tab strip. Defaults to the first sub-tab.
-        current_settings_subtab_state = gr.State(f"{BACKENDS[0].id}-settings")
+        current_settings_subtab_state = gr.State("pipeline-settings")
         with gr.Tabs() as settings_tabs:
             for module in modules:
                 _subtabs.append((module, module.build(ctx)))
@@ -217,20 +231,29 @@ def build(ctx: BuildContext):
             restart_app_btn = gr.Button("Restart app")
         settings_infotext = gr.Textbox(show_label=False, container=False, interactive=False)
 
-        # save_settings_ui slices these back apart per sub-tab, in this order.
+        # _save slices these back apart per sub-tab, in this order.
         settings_inputs = [component for _, handle in _subtabs for component in handle.save_inputs]
-        # Saving can change server_mode (or anything else
-        # check_status/cached_reachable read), and the
-        # Single-image/Batch-processing tabs' interactive state
-        # would otherwise be stale for
-        # up to 8s until reachability_timer's next tick -
-        # refresh it immediately instead. current_tab_label_
-        # state is "Settings" here (this click can only happen
-        # from the Settings tab), so the push-to-Settings
-        # branch in _refresh_reachability_ui is always a no-op
-        # in this context, not a real redirect.
-        ctx.after_server_change(save_settings_btn.click(save_settings_ui, settings_inputs, [settings_infotext]))
+        # The pipeline refresh after Save puts "restart to apply" into
+        # the status bar right away instead of on the next 8s tick.
+        ctx.after_pipeline_change(save_settings_btn.click(save_settings_ui, settings_inputs, [settings_infotext]))
         restart_app_btn.click(restart_app_ui, [], [])
+
+        # Pipeline's Start/Restart: save pending changes first.
+        pipeline_handle = _subtabs[0][1]
+        for button, run in ((pipeline_handle.start_btn, settings_pipeline.start_ui),
+                            (pipeline_handle.restart_btn, settings_pipeline.restart_ui)):
+            ctx.after_pipeline_change(
+                button.click(save_quietly_ui, settings_inputs, [settings_infotext])
+                .then(run, [], pipeline_handle.status_outputs)
+            )
+
+    # Every sub-tab's fields from the saved config on page load - see the
+    # module docstring.
+    for module, handle in _subtabs:
+        ctx.on_load(
+            lambda module=module: module.load_values(state.current_cfg), [],
+            getattr(handle, "load_outputs", handle.save_inputs),
+        )
 
     _SETTINGS_SUBTAB_ID_BY_LABEL.update({handle.tab_label: handle.tab_id for _, handle in _subtabs})
 
@@ -251,6 +274,7 @@ def build(ctx: BuildContext):
         tab=settings_tab,
         settings_tabs=settings_tabs,
         current_subtab_state=current_settings_subtab_state,
+        pipeline=pipeline_handle,
         # Backend sub-tab handles by backend id.
-        backends={backend.id: handle for backend, (_, handle) in zip(BACKENDS, _subtabs)},
+        backends={backend.id: handle for backend, (_, handle) in zip(BACKENDS, _subtabs[1:])},
     )

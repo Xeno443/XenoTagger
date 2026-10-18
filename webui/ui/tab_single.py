@@ -1,4 +1,6 @@
-"""Single image tab."""
+"""Single image tab - one uploaded image through the started pipeline
+(core.pipeline.caption_pieces), shown as the rendered caption. Nothing is
+written next to the image; Save caption writes the rendered text."""
 
 from __future__ import annotations
 
@@ -6,131 +8,92 @@ import logging
 import os
 import queue
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
 import gradio as gr
 
 from core import config as config_mod
-from core.captioner import caption_image
-from backends.llama.client import ClientError
-from backends.llama.server import ServerError, is_healthy
-from ui import state
+from core import pipeline
+from ui import pipeline_status, state
 from ui.context import BuildContext
-from backends.llama.session import display_base_url, get_client
 from ui.operation import (
-    COL_HIDDEN, COL_SHOWN, INTERRUPT_RESET, RUN_BUSY, RUN_IDLE, operation_blocked_by, operation_end,
-    operation_interrupt_click, operation_start,
+    COL_HIDDEN, COL_SHOWN, INTERRUPT_RESET, RUN_BUSY, RUN_IDLE, interrupt_button_ui, operation_blocked_by,
+    operation_end, operation_should_stop, operation_start,
 )
 from ui.operation import run_controls_update as run_controls_update_for
 
 log = logging.getLogger("app")  # fixed name, see app.py
 
 
-def run_single_ui(image_path, trigger_word_override: str):
+def run_single_ui(image_path, trigger_word: str):
     blocked = operation_blocked_by()
     if blocked:
         yield gr.update(), blocked, RUN_BUSY, gr.update(), gr.update(), gr.update()
         return
-
     if not image_path:
         yield "", "Please choose an image first.", gr.update(), gr.update(), gr.update(), gr.update()
+        return
+    plan = pipeline.running_plan()
+    if plan is None:
+        yield "", "Start the pipeline first (Settings -> Pipeline).", gr.update(), gr.update(), gr.update(), gr.update()
         return
 
     operation_start("single", "Single-image captioning")
     try:
         log.info("Single-image caption requested: %s", image_path)
-        cfg = state.current_cfg
-        base_url = display_base_url(cfg)
-        already_up = is_healthy(base_url)
         running_state = (RUN_IDLE, COL_HIDDEN, COL_SHOWN, INTERRUPT_RESET)
-        if cfg.server_mode == "external":
-            yield "", ("Processing..." if already_up else "Connecting to external server..."), *running_state
-        else:
-            yield "", ("Processing..." if already_up else "Starting server (loading model)..."), *running_state
-
         idle_state = (RUN_IDLE, COL_SHOWN, COL_HIDDEN, INTERRUPT_RESET)
-        try:
-            client = get_client(cfg)
-        except ServerError as exc:
-            log.warning("Single-image caption: server error: %s", exc)
-            yield "", f"Server error: {exc}", *idle_state
-            return
+        yield "", "Processing...", *running_state
 
-        if not already_up:
-            yield "", "Processing...", gr.update(), gr.update(), gr.update(), gr.update()
-
-        # A plain blocking caption_image() call can't yield mid-call, so
-        # showing a live stage change ("captioning" -> "tagging (Hydra)")
-        # in single_infotext needs the same background-thread + queue
-        # shape run_batch_ui already uses - the queue is what lets on_stage
-        # (called synchronously inside caption_image(), from this worker
-        # thread) reach a yield in this generator without blocking on it.
+        # caption_pieces blocks, so it runs in a worker thread; on_stage
+        # reaches this generator through the queue, so the infotext can
+        # show which step is running.
         q: "queue.Queue" = queue.Queue()
         result_holder = {}
 
-        def on_stage_cb(stage: str) -> None:
-            q.put(stage)
-
         def worker():
             try:
-                result_holder["caption"], result_holder["result"], _, _ = caption_image(
-                    image_path, client, cfg, trigger_word=trigger_word_override,
-                    on_stage=on_stage_cb,
+                result_holder["result"] = pipeline.caption_pieces(
+                    plan, image_path, {pipeline.TRIGGER_PIECE: (trigger_word or "").strip()},
+                    should_stop=lambda: operation_should_stop("single") or bool(pipeline_status.snapshot().not_ready),
+                    on_stage=q.put,
                 )
-            except ClientError as exc:
+            except Exception as exc:  # noqa: BLE001 - surface to UI, don't crash app
+                log.exception("Single-image caption failed")
                 result_holder["error"] = str(exc)
             q.put(None)
 
+        start = time.monotonic()
         thread = threading.Thread(target=worker, daemon=True)
         thread.start()
-        while True:
-            stage = q.get()
-            if stage is None:
-                break
+        while (stage := q.get()) is not None:
             yield gr.update(), f"{stage}...", gr.update(), gr.update(), gr.update(), gr.update()
         thread.join()
 
         if "error" in result_holder:
-            log.warning("Single-image caption failed for %s: %s", image_path, result_holder["error"])
             yield "", f"Captioning failed: {result_holder['error']}", *idle_state
             return
-
-        caption = result_holder["caption"]
         result = result_holder["result"]
-        speed = f", {result.tokens_per_second:.1f} tok/s" if result.tokens_per_second else ""
-
-        if result.truncated:
-            # llama-server clamps actual generation to whatever fits in
-            # (context_size - prompt_tokens), even if that's below the
-            # requested max_tokens. If it stopped short of max_tokens, raising
-            # max_tokens further won't help - context_size is the real ceiling.
-            if result.completion_tokens < cfg.max_tokens:
-                advice = (
-                    f"prompt used {result.prompt_tokens} tokens, leaving no room "
-                    f"in the {cfg.context_size}-token context for the requested "
-                    f"{cfg.max_tokens} - raise Context size in Settings"
-                )
-            else:
-                advice = "raise Max tokens in Settings for a full caption"
-            status = (
-                f"Finished in {result.elapsed_s:.1f}s, but CUT OFF at {result.completion_tokens} "
-                f"tokens{speed} ({advice})"
-            )
+        caption = pipeline.render_pieces(plan, result.pieces)
+        elapsed = f"{time.monotonic() - start:.1f}s"
+        # Interrupt clicked: a second click stops the pipeline, which shows
+        # up as a broken connection - still just "interrupted" to the user.
+        if result.interrupted or operation_should_stop("single"):
+            status = f"Interrupted after {elapsed}."
+        elif result.errors:
+            status = f"Finished in {elapsed} with problems: " + " ".join(result.errors)
         else:
-            status = f"Finished in {result.elapsed_s:.1f}s ({result.completion_tokens} tokens{speed})"
-        if result.resize_note:
-            status = f"Resized {result.resize_note}. {status}"
+            notes = "; ".join(f"{piece}: {out.note}" for piece, out in result.outputs.items() if out.note)
+            status = f"Finished in {elapsed}" + (f" ({notes})" if notes else "") + "."
         yield caption, status, *idle_state
     finally:
         operation_end()
 
 
 def interrupt_single_ui():
-    action = operation_interrupt_click("single")
-    if action == "aborting":
-        return gr.update(value="Interrupting...", interactive=False)
-    return gr.update(value="Interrupt (click again to abort now)")
+    return interrupt_button_ui("single")
 
 
 PROJECT_ROOT = config_mod.ROOT_DIR  # one level above webui/
@@ -199,15 +162,11 @@ def save_single_ui(image_path, caption_text: str) -> str:
 
 def build(ctx: BuildContext):
     cfg = state.current_cfg
-    # interactive=False at construction (option B from the design
-    # discussion - the simpler fallback, not a dedicated splash
-    # overlay): the very first paint, before demo.load's chain has
-    # had a chance to run even once, would otherwise show every
-    # tab clickable regardless of real server state. Corrected
-    # within the first real check (_startup_reachability_ui,
-    # wired at the bottom of app.py's build_app) - this same gap applied to
-    # Models and Batch too (see their own Tab() calls below), not
-    # just Single-image.
+    # interactive=False at construction: the very first paint, before
+    # demo.load's chain has run even once, would otherwise show the tab
+    # clickable regardless of whether the pipeline is started. Corrected
+    # by the frame's startup check (app.py's _startup_ui); Batch does the
+    # same.
     with gr.Tab("Single image", id="single", interactive=False) as single_tab:
         with gr.Row(equal_height=True):
             with gr.Column():
@@ -269,6 +228,6 @@ def build(ctx: BuildContext):
     )
 
 
-def run_controls_update(op, reachable: bool) -> tuple:
+def run_controls_update(op, ready: bool) -> tuple:
     """Updates for build()'s run_controls - see operation.run_controls_update."""
-    return run_controls_update_for("single", op, reachable)
+    return run_controls_update_for("single", op, ready)

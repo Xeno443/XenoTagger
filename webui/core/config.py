@@ -101,10 +101,11 @@ MODELS_TAB_INTRO = (
 # per-user state, kept here so it's editable without hunting through the
 # Gradio layout code.
 LLAMA_TAB_INTRO = (
-    "Choose how this app talks to llama-server: **Managed** starts and "
-    "owns a local llama-server process for you (install it below if "
+    "Choose how this app talks to llama-server: **Managed** - the pipeline "
+    "starts and stops a local llama-server for you (install it below if "
     "it isn't yet, then pick a model on the Models tab); **External** "
-    "just connects to a llama-server you're running yourself, anywhere."
+    "just connects to a llama-server you're running yourself, anywhere. "
+    "Prompts are set per variant in Settings -> Pipeline."
 )
 
 
@@ -117,12 +118,6 @@ class AppConfig:
     server_mode: str = "managed"
     server_port: int = 8901
     external_url: str = "http://127.0.0.1:8080"
-    # Whether to start the managed server automatically on app launch, if
-    # it's installed but not already running - see app.py's autostart
-    # wiring. Ignored right after switching mode to managed (the user must
-    # start it explicitly at least once, so a stale/wrong model doesn't
-    # silently start loading the moment they flip the radio).
-    autostart_managed_llama: bool = False
 
     # Model selection: "<folder>/<file stem>" of a ModelVariant/MmprojVariant
     # from core.models. Empty mmproj_name means auto-pick the largest mmproj
@@ -156,7 +151,9 @@ class AppConfig:
     snap_enabled: bool = True
     snap_multiple: int = 64
 
-    # Generation settings.
+    # Generation settings. prompt_template is no longer edited anywhere:
+    # it's only the prompt of llama's "default" variant when
+    # pipeline_variants has none for llama yet (core.pipeline).
     prompt_template: str = DEFAULT_PROMPT
     # Low but not 0.0 - greedy (temp=0.0) decoding deterministically locks
     # in a bad top token every time (a repetition loop, a borderline
@@ -176,7 +173,10 @@ class AppConfig:
     # push real generation time well past a short default.
     request_timeout: int = 300
 
-    # Captioning output.
+    # Captioning output. trigger_word is edited in Settings -> Pipeline's
+    # Output box and prefills the Single/Batch trigger fields;
+    # overwrite_existing only prefills Batch's Overwrite checkbox (and is
+    # the CLI's default without --overwrite).
     trigger_word: str = ""
     overwrite_existing: bool = False
 
@@ -187,17 +187,11 @@ class AppConfig:
     # or process startup.
     debug_tab_enabled: bool = False
 
-    # Hydra 3.5 (RedRocket) second-stage e621 tag classifier - see
-    # core.hydra_classifier. Gates *using* an already-loaded model in
-    # captioner.py; it does not itself load one (see hydra_autoload_model
-    # and Settings -> Hydra's explicit Load/Unload buttons - loading is
-    # always an explicit action, same reasoning as managed llama-server,
-    # since it competes for the same VRAM llama-server may have already
-    # claimed).
-    hydra_enabled: bool = False
+    # Hydra 3.5 (RedRocket) e621 tagger - backends.hydra. Whether it runs
+    # is pipeline_run; loading it is start_pipeline's job.
     # "cuda" or "cpu" - falls back to cpu with a logged warning if CUDA
     # isn't actually available. Baked into the loaded model's tensors, so
-    # changing this only takes effect after an explicit Unload + Load.
+    # it takes effect on the next pipeline start.
     hydra_device: str = "cuda"
     # Calibration metric string, upstream's own CLI default (see
     # hydra/classification.py's parse_metric). Cheap to recompute, so this
@@ -208,11 +202,6 @@ class AppConfig:
     hydra_exclude_categories: str = "artist copyright meta rating lore"  # space-separated - irrelevant for LoRA tagging
     hydra_exclude_tags: str = ""  # space-separated
     hydra_max_tags: int = 0  # 0 = no cap, else keep only the top-N by probability
-    # Mirrors autostart_managed_llama exactly: only fires once, on app
-    # launch, never mid-session - see app.py's demo.load chain. Deliberately
-    # independent of hydra_enabled (using an already-loaded model vs.
-    # loading one automatically at launch are separate questions).
-    hydra_autoload_model: bool = False
 
     # Tag vocabulary for Review's tag editor (core.tag_vocab) - deliberately
     # the full e621 tag space, not limited to Hydra's own (much smaller)
@@ -268,6 +257,15 @@ def load() -> AppConfig:
         # rather than relying on the generic unknown-key filter below, so
         # it's clear this one's gone on purpose, not just unrecognized.
         on_disk.pop("server_host", None)
+        # v0.9 replaced per-backend loading with the pipeline. A settings
+        # file from before that has no pipeline_* keys yet: carry over what
+        # its old switches meant (Hydra was in use; something loaded at
+        # launch). Nothing is written until the next Save.
+        if "pipeline_run" not in on_disk:
+            on_disk["pipeline_run"] = ["llama"] + (["hydra"] if on_disk.get("hydra_enabled") else [])
+            on_disk.setdefault("pipeline_start_at_launch", bool(
+                on_disk.get("autostart_managed_llama") or on_disk.get("hydra_autoload_model")
+            ))
         defaults.update({k: v for k, v in on_disk.items() if k in defaults})
     else:
         log.debug("No settings.json yet at %s - using built-in defaults", SETTINGS_PATH)

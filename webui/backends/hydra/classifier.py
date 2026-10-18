@@ -1,29 +1,24 @@
-"""In-process Hydra 3.5 (RedRocket) e621 tag classifier - core.captioner's
-second-stage hook (see captioner.py's own docstring for why that single
-hook point exists). Pure Python + torch, imported and run in the same
-interpreter as the GUI/CLI (this repo's "no venv, everything in
-system\\python" house rule applies to Hydra's deps too - see
-backends.hydra.install), so unlike llama-server there's no separate
+"""In-process Hydra 3.5 (RedRocket) e621 tag classifier, behind the
+Backend interface's tag() (backends.hydra). Pure Python + torch, imported
+and run in the same interpreter as the GUI/CLI (this repo's "no venv,
+everything in system\\python" house rule applies to Hydra's deps too -
+see backends.hydra.install), so unlike llama-server there's no separate
 process/port/health-check to manage here - just a lazily-populated
 module-level singleton.
 
 load()/unload() are the only things that touch the (heavy, ~1GB, VRAM-
-competing-with-llama-server) model itself, and are always explicit calls
-driven by Settings -> Hydra's Load/Unload buttons (or autoload at
-launch) - see AppConfig.hydra_enabled's own docstring for why loading is
-never implicit here, same reasoning as managed llama-server. classify()
-never loads anything itself; it raises HydraError immediately if nothing
-is loaded, and captioner.py treats that (like any other HydraError) as a
-soft failure - skip the tag-append, keep the VLM-only caption - not a
-hard error that fails the whole caption.
+competing-with-llama-server) model itself, and only the pipeline calls
+them (core.pipeline's start/stop). classify() never loads anything
+itself; it raises HydraError immediately if nothing is loaded, which the
+pipeline records as that image's tagging failure.
 
 Calibration (model.calibrate(cfg.hydra_metric)) is recomputed on every
 classify() call rather than cached - cheap, a single reduction per label
 over an already-in-memory validation tensor - so hydra_metric/
 hydra_implications/hydra_exclude_categories/hydra_exclude_tags/
-hydra_max_tags all take effect on the very next caption with no reload
-needed. Only hydra_device is baked into the loaded model's tensors and
-needs an explicit Unload + Load to actually change.
+hydra_max_tags apply per call. (The pipeline passes the config it was
+started with, so in practice they change with the next pipeline start,
+like hydra_device, which is baked into the loaded model's tensors.)
 
 torch and the vendored rr_hydra package are imported lazily inside
 functions, not at module top level, so importing this module never
@@ -102,7 +97,7 @@ def load(cfg: AppConfig) -> None:
             )
         if not model_downloaded():
             raise HydraError(
-                f"{MODEL_PATH} not found - use \"Download Hydra model\" in Settings -> Hydra."
+                f"{MODEL_PATH} not found - download it on the Models tab."
             )
 
         try:
@@ -177,12 +172,11 @@ def label_categories() -> dict[str, str]:
 
 def classify(image: Union[str, Path, bytes], cfg: AppConfig) -> HydraResult:
     """Raises HydraError if nothing is currently loaded (see load()) or
-    if classification itself fails for any reason - callers such as
-    core.captioner.caption_image() are expected to catch this and skip
-    the tag-append, not fail the whole caption."""
+    if classification itself fails for any reason - the pipeline records
+    that as this image's tagging failure."""
     model = _model
     if model is None:
-        raise HydraError("Hydra model is not loaded - use \"Load Hydra model\" in Settings -> Hydra.")
+        raise HydraError("Hydra isn't loaded - start the pipeline (Settings -> Pipeline).")
 
     try:
         import torch

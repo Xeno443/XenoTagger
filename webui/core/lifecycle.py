@@ -1,16 +1,15 @@
 """Backend load ordering and VRAM coexistence, generic over core.backend's
 Backend interface - core/ never imports backends/, so callers pass in
-the backend list (backends.BACKENDS).
-
-Loading is always explicit (a button, or a backend's own autoload
-checkbox at launch) - nothing here ever loads implicitly.
+the backend list (backends.BACKENDS). Used by core.pipeline's
+start_pipeline, the only thing that loads backends.
 
 The one rule both functions encode: "adaptive" backends (llama-server's
 n_gpu_layers="auto") size themselves to whatever VRAM is free when they
-start, "fixed" ones (Hydra) are all-or-nothing. So fixed backends get
-first pick - at launch by running first, and when loaded later by
-temporarily stopping any running adaptive backend this app owns, loading,
-then restarting it so it resizes around what the fixed one claimed.
+start, "fixed" ones (Hydra, Furrence2) are all-or-nothing. So fixed
+backends get first pick - by loading first, and if one is loaded while an
+adaptive backend this app owns is already running, by temporarily
+stopping it, loading, then restarting it so it resizes around what the
+fixed one claimed.
 """
 
 from __future__ import annotations
@@ -22,9 +21,8 @@ from .backend import Backend
 from .config import AppConfig
 
 
-def autoload_order(backends: Iterable[Backend]) -> list[Backend]:
-    """Fixed backends first, adaptive last, otherwise registry order - the
-    order the GUI runs each backend's launch-time autoload in."""
+def load_order(backends: Iterable[Backend]) -> list[Backend]:
+    """Fixed backends first, adaptive last, otherwise registry order."""
     backends = list(backends)
     return [b for b in backends if b.vram != "adaptive"] + [b for b in backends if b.vram == "adaptive"]
 
@@ -44,8 +42,8 @@ def load_with_coexistence(target: Backend, backends: Iterable[Backend], cfg: App
     final message and level. Never touches a backend that isn't
     is_loaded() - an external or foreign server is left alone.
 
-    Callers check "already loaded" and "is a caption job running" first -
-    stopping a server out from under an in-flight request would break it."""
+    Callers make sure no caption job is running - stopping a server out
+    from under an in-flight request would break it."""
     paused: list[Backend] = []
     if target.vram == "fixed" and target.competes_for_vram(cfg):
         paused = [b for b in backends if b is not target and b.vram == "adaptive" and b.is_loaded(cfg)]

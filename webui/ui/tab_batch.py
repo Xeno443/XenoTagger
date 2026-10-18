@@ -1,4 +1,5 @@
-"""Batch processing tab."""
+"""Batch processing tab - a folder through the started pipeline
+(core.batch.run_batch, shared with the CLI)."""
 
 from __future__ import annotations
 
@@ -13,16 +14,15 @@ from typing import Optional
 import gradio as gr
 from PIL import Image as PILImage
 
+from core import pipeline
 from core.batch import find_images, run_batch
-from backends.llama.server import ServerError, is_healthy
-from ui import state
+from ui import pipeline_status, state
 from ui.context import BuildContext
 from ui.dialogs import browse_directory_ui
-from backends.llama.session import display_base_url, get_client
 from ui.notify import notify
 from ui.operation import (
-    COL_HIDDEN, COL_SHOWN, INTERRUPT_RESET, RUN_BUSY, RUN_IDLE, operation_blocked_by, operation_end,
-    operation_interrupt_click, operation_should_stop, operation_start,
+    COL_HIDDEN, COL_SHOWN, INTERRUPT_RESET, RUN_BUSY, RUN_IDLE, interrupt_button_ui, operation_blocked_by,
+    operation_end, operation_should_stop, operation_start,
 )
 from ui.operation import run_controls_update as run_controls_update_for
 
@@ -40,7 +40,7 @@ def _format_duration(seconds: float) -> str:
     return f"{hours}h {minutes}m"
 
 
-def run_batch_ui(directory_str, overwrite, trigger_word_override):
+def run_batch_ui(directory_str, overwrite, trigger_word):
     blocked = operation_blocked_by()
     if blocked:
         yield blocked, "", None, "", RUN_BUSY, gr.update(), gr.update(), gr.update()
@@ -52,56 +52,45 @@ def run_batch_ui(directory_str, overwrite, trigger_word_override):
         log.warning("Batch: not a directory: %s", directory_str)
         yield f"Not a directory: {directory_str}", "", None, "", gr.update(), gr.update(), gr.update(), gr.update()
         return
+    plan = pipeline.running_plan()
+    if plan is None:
+        yield "Start the pipeline first (Settings -> Pipeline).", "", None, "", *(gr.update(),) * 4
+        return
+    images = find_images(directory)
+    if not images:
+        log.warning("Batch: no images found in %s", directory)
+        yield "No images found in that directory.", "", None, "", *(gr.update(),) * 4
+        return
 
     operation_start("batch", "Batch captioning")
     try:
-        cfg = state.current_cfg
-        base_url = display_base_url(cfg)
-        already_up = is_healthy(base_url)
         running_state = (RUN_IDLE, COL_HIDDEN, COL_SHOWN, INTERRUPT_RESET)
-        if cfg.server_mode == "external":
-            yield ("Processing..." if already_up else "Connecting to external server..."), "", None, "", *running_state
-        else:
-            yield ("Processing..." if already_up else "Starting server (loading model)..."), "", None, "", *running_state
-
         idle_state = (RUN_IDLE, COL_SHOWN, COL_HIDDEN, INTERRUPT_RESET)
-        try:
-            client = get_client(cfg)
-        except ServerError as exc:
-            log.warning("Batch: server error: %s", exc)
-            yield f"Server error: {exc}", "", None, "", *idle_state
-            return
-
-        if not already_up:
-            yield "Processing...", "", None, "", gr.update(), gr.update(), gr.update(), gr.update()
-
-        images = find_images(directory)
-        if not images:
-            log.warning("Batch: no images found in %s", directory)
-            yield "No images found in that directory.", "", None, "", *idle_state
-            return
+        yield "Processing...", "", None, "", *running_state
         total = len(images)
 
         q: "queue.Queue" = queue.Queue()
         result_holder = {}
 
-        def progress_cb(i, total_, path, status, caption, resize_note):
-            q.put(("progress", i, path, status, caption, resize_note))
+        def progress_cb(i, total_, path, status, text, detail):
+            q.put(("progress", i, path, status, text, detail))
 
         def on_stage_cb(path: Path, stage: str) -> None:
             q.put(("stage", path, stage))
 
+        def should_stop() -> bool:
+            # Also stops when a pipeline backend crashed - otherwise every
+            # remaining image would just collect the same error.
+            return operation_should_stop("batch") or bool(pipeline_status.snapshot().not_ready)
+
         def worker():
             try:
                 result_holder["result"] = run_batch(
-                    directory, client, state.current_cfg,
-                    overwrite=overwrite,
-                    trigger_word=trigger_word_override,
-                    progress_cb=progress_cb,
-                    should_stop=lambda: operation_should_stop("batch"),
-                    on_stage=on_stage_cb,
+                    plan, directory, trigger_word=(trigger_word or "").strip(), overwrite=overwrite,
+                    progress_cb=progress_cb, should_stop=should_stop, on_stage=on_stage_cb,
                 )
             except Exception as exc:  # noqa: BLE001 - surface to UI, don't crash app
+                log.exception("Batch failed")
                 result_holder["error"] = str(exc)
             q.put(None)
 
@@ -109,109 +98,82 @@ def run_batch_ui(directory_str, overwrite, trigger_word_override):
         start_time = time.monotonic()
         thread.start()
 
-        # processed/current_file/current_stage/resize_suffix all feed one
-        # combined infotext line, rebuilt on every queue item (stage or
-        # progress) - a stage-only line was tried first and reverted: the
-        # progress line that follows it lands a moment later and replaces
-        # it outright, so the "N/total processed · avg · ETA" context was
-        # only ever visible for a blink between two images. One line that
-        # always carries the fullest currently-known context avoids that.
+        # One infotext line that always carries the fullest currently
+        # known context (file, step, N/total, avg, ETA) - a separate
+        # stage-only line would be replaced by the next progress line
+        # before anyone could read it.
         last_file = ""
         last_image = None
         last_caption = ""
         processed = 0
         current_file = ""
         current_stage: Optional[str] = None
-        resize_suffix = ""
 
         def infotext_text() -> str:
             elapsed = time.monotonic() - start_time
             avg = elapsed / processed if processed else 0.0
             eta = avg * (total - processed)
             text = current_file or f"{total} image(s)"
-            if resize_suffix:
-                text += f" · resized {resize_suffix}"
             text += f" · {processed}/{total} processed · avg {avg:.1f}s/image · ETA {_format_duration(eta)}"
             if current_stage:
                 text += f" - {current_stage}"
             return text
 
-        while True:
-            item = q.get()
-            if item is None:
-                break
+        while (item := q.get()) is not None:
             if item[0] == "stage":
                 _, path, stage = item
-                if path.name != current_file:
-                    # A new image started - the previous one's resize
-                    # note (if any) no longer applies to what's showing.
-                    resize_suffix = ""
-                current_file = path.name
-                current_stage = stage
-                yield infotext_text(), last_file, last_image, last_caption, gr.update(), gr.update(), gr.update(), gr.update()
+                current_file, current_stage = path.name, stage
+                yield infotext_text(), last_file, last_image, last_caption, *(gr.update(),) * 4
                 continue
 
-            _, i, path, status, caption, resize_note = item
-            processed = i
-            current_file = path.name
-            current_stage = None  # between images - no stage in flight until the next on_stage
-            resize_suffix = resize_note or ""
-
-            # Skipped images were never sent to the model at all (already
-            # captioned) - nothing to preview, so leave the preview
-            # fields showing whatever the last actually-processed image
-            # was instead of decoding and flashing up an unrelated,
-            # untouched file.
-            if status != "skipped":
+            _, i, path, status, text, detail = item
+            processed, current_file, current_stage = i, path.name, None
+            # Skipped images were never sent to a model - nothing new to
+            # preview, keep showing the last one that was.
+            if status not in ("skipped", "conflict"):
                 last_file = path.name
                 try:
-                    # Gradio refuses to serve a raw path outside its CWD/
-                    # temp dir (InvalidPathError) - batch directories can
-                    # be anywhere on disk, so hand it decoded image data
-                    # instead of a path at all.
+                    # Gradio won't serve a path outside its CWD/temp dir -
+                    # batch folders can be anywhere, so hand it image data.
                     with PILImage.open(path) as img:
                         last_image = img.copy()
                 except OSError as exc:
                     log.warning("Could not load preview for %s: %s", path, exc)
                     last_image = None
-                if status == "ok":
-                    last_caption = caption or ""
-                elif status == "truncated":
-                    last_caption = "(truncated - not saved, see .txt.issue)"
+                if status == "done":
+                    last_caption = text or ""
+                elif status == "failed":
+                    last_caption = f"(not captioned - {detail}; see .txt.issue)"
                 else:
-                    last_caption = "(failed - see .txt.issue)"
-            yield infotext_text(), last_file, last_image, last_caption, gr.update(), gr.update(), gr.update(), gr.update()
+                    last_caption = "(interrupted)"
+            yield infotext_text(), last_file, last_image, last_caption, *(gr.update(),) * 4
 
         thread.join()
         if "error" in result_holder:
             message = f"Unexpected error: {result_holder['error']}"
             notify(f"Batch captioning: {message}", level="error")
             yield message, last_file, last_image, last_caption, *idle_state
-        else:
-            r = result_holder["result"]
-            total_elapsed = time.monotonic() - start_time
-            verb = "Aborted" if r.aborted else "Done"
-            summary = (
-                f"{verb}: {r.processed} captioned, {r.truncated} truncated, "
-                f"{r.skipped} skipped, {r.failed} failed "
-                f"in {_format_duration(total_elapsed)}"
-            )
-            # Fires even if the user's still watching the Batch tab - a
-            # long batch is exactly the kind of thing this was asked for
-            # (start it, go do something else, still find out when it's
-            # done or hit trouble without having to stay on this tab).
-            notify(f"Batch captioning {summary}", level="warning" if r.failed else "info")
-            yield summary, last_file, last_image, last_caption, *idle_state
+            return
+        r = result_holder["result"]
+        crashed = pipeline_status.snapshot().not_ready
+        verb = f"Stopped ({', '.join(crashed)} stopped unexpectedly)" if crashed else ("Stopped" if r.aborted else "Done")
+        summary = (
+            f"{verb}: {r.done} captioned, {r.skipped} skipped, {r.failed} failed "
+            f"in {_format_duration(time.monotonic() - start_time)}"
+        )
+        if r.conflicts:
+            summary += (f". {len(r.conflicts)} image(s) skipped because another image has the same "
+                        f"name: {', '.join(p.name for p in r.conflicts[:6])}{'...' if len(r.conflicts) > 6 else ''}")
+        # Fires even if the user's still on the Batch tab - start a long
+        # batch, go do something else, still find out when it's done.
+        notify(f"Batch captioning {summary}", level="warning" if (r.failed or r.conflicts or crashed) else "info")
+        yield summary, last_file, last_image, last_caption, *idle_state
     finally:
         operation_end()
 
 
 def interrupt_batch_ui():
-    action = operation_interrupt_click("batch")
-    if action == "aborting":
-        return gr.update(value="Interrupting...", interactive=False)
-    return gr.update(value="Interrupt (click again to abort now)")
-
+    return interrupt_button_ui("batch")
 
 def build(ctx: BuildContext):
     cfg = state.current_cfg
@@ -283,6 +245,6 @@ def build(ctx: BuildContext):
     )
 
 
-def run_controls_update(op, reachable: bool) -> tuple:
+def run_controls_update(op, ready: bool) -> tuple:
     """Updates for build()'s run_controls - see operation.run_controls_update."""
-    return run_controls_update_for("batch", op, reachable)
+    return run_controls_update_for("batch", op, ready)

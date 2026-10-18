@@ -15,17 +15,9 @@ from PIL import Image as PILImage
 from core.batch import (
     ISSUE_SUFFIX, NLP_SUFFIX, TAGS_SUFFIX, ReviewItem, review_item_status, scan_review_status,
 )
-from core.captioner import caption_image
-from backends.llama.client import ClientError
-from backends.llama.server import ServerError, is_healthy
-from ui import state
 from ui.context import BuildContext
 from ui.dialogs import browse_directory_ui
-from backends.llama.session import display_base_url, get_client
-from ui.operation import (
-    COL_HIDDEN, COL_SHOWN, INTERRUPT_RESET, current_operation, operation_blocked_by, operation_end,
-    operation_interrupt_click, operation_lock, operation_start,
-)
+from ui.operation import current_operation, interrupt_button_ui, operation_lock
 from ui.operation import run_controls_update as run_controls_update_for
 
 log = logging.getLogger("app")  # fixed name, see app.py
@@ -45,15 +37,10 @@ log = logging.getLogger("app")  # fixed name, see app.py
 # against a fresh read of each file's current on-disk content instead,
 # same statelessness as the rest of this module.
 #
-# Recaption is its own "review" operation kind (not reusing "single",
-# even though it's literally the same caption_image() call the
-# Single-image tab makes) - see app.py's _update_ui_status' docstring for
-# why a third kind, rather than sharing "single", is actually necessary
-# here. It still mutually-excludes against Single-image/Batch the same
-# way they already exclude each other, for free (all three ultimately
-# share the one llama-server connection). It gets its own Run/Interrupt
-# Column pair (review_recaption_col/review_interrupt_col) built with the
-# exact same proven two-Column-swap pattern used elsewhere.
+# Recaption is its own "review" operation kind, so the Single tab's own
+# Interrupt doesn't light up while Review is the one running, and it
+# still mutually excludes against Single/Batch. It's parked until Review
+# moves onto the pipeline's piece files - see RECAPTION_PARKED.
 
 
 def _review_status_table(items: list[ReviewItem], current_index: int = -1):
@@ -325,112 +312,18 @@ _REVIEW_NAV_IDLE = (
 _REVIEW_STATE_NOOP = tuple(gr.update() for _ in range(10))
 
 
+# Recaption is parked until Review moves onto the pipeline's piece files
+# (v0.9 step 3, part 6): it ran the old llama+Hydra caption path, which the
+# pipeline replaced. The button stays (disabled, see run_controls_update).
+RECAPTION_PARKED = "Recaption comes back with the Review update (it moves onto the pipeline's files)."
+
+
 def review_recaption_ui(items: list[ReviewItem], index: int, current_caption: str):
-    if not items or not (0 <= index < len(items)):
-        yield gr.update(), gr.update(), "No image loaded.", *_REVIEW_STATE_NOOP
-        return
-
-    blocked = operation_blocked_by()
-    if blocked:
-        yield gr.update(), gr.update(), blocked, *_REVIEW_STATE_NOOP
-        return
-
-    item = items[index]
-    operation_start("review", "Review recaptioning")
-    try:
-        log.info("Review recaption requested: %s", item.path)
-        cfg = state.current_cfg
-        base_url = display_base_url(cfg)
-        already_up = is_healthy(base_url)
-        running_state = (COL_HIDDEN, COL_SHOWN, INTERRUPT_RESET, *_REVIEW_NAV_BUSY)
-        msg = "Processing..." if already_up else "Starting server (loading model)..."
-        yield current_caption, gr.update(), msg, *running_state
-
-        idle_state = (COL_SHOWN, COL_HIDDEN, INTERRUPT_RESET, *_REVIEW_NAV_IDLE)
-        try:
-            client = get_client(cfg)
-        except ServerError as exc:
-            log.warning("Review recaption: server error: %s", exc)
-            yield current_caption, gr.update(), f"Server error: {exc}", *idle_state
-            return
-
-        if not already_up:
-            yield current_caption, gr.update(), "Processing...", *_REVIEW_STATE_NOOP
-
-        # Same background-thread + queue shape as run_single_ui/
-        # run_batch_ui - see run_single_ui's comment for why a plain
-        # blocking caption_image() call can't yield a live stage change
-        # on its own.
-        q: "queue.Queue" = queue.Queue()
-        result_holder = {}
-
-        def on_stage_cb(stage: str) -> None:
-            q.put(stage)
-
-        def worker():
-            try:
-                (
-                    result_holder["caption"], result_holder["result"],
-                    result_holder["vlm_caption"], result_holder["hydra_tags"],
-                ) = caption_image(
-                    item.path, client, cfg, trigger_word=None,
-                    on_stage=on_stage_cb,
-                )
-            except ClientError as exc:
-                result_holder["error"] = str(exc)
-            q.put(None)
-
-        thread = threading.Thread(target=worker, daemon=True)
-        thread.start()
-        while True:
-            stage = q.get()
-            if stage is None:
-                break
-            yield current_caption, gr.update(), f"{stage}...", *_REVIEW_STATE_NOOP
-        thread.join()
-
-        if "error" in result_holder:
-            log.warning("Review recaption failed for %s: %s", item.path, result_holder["error"])
-            yield current_caption, gr.update(), f"Recaptioning failed: {result_holder['error']}", *idle_state
-            return
-
-        result = result_holder["result"]
-        speed = f", {result.tokens_per_second:.1f} tok/s" if result.tokens_per_second else ""
-        note = f"CUT OFF at {result.completion_tokens} tokens{speed}" if result.truncated else f"{result.completion_tokens} tokens{speed}"
-        status = f"Recaptioned in {result.elapsed_s:.1f}s ({note}) - not saved yet, navigate away or edit to keep it"
-        if result.resize_note:
-            status = f"Resized {result.resize_note}. {status}"
-
-        # Items with Tags enabled get the VLM-only caption and Hydra's own
-        # tags in their separate fields; a flat legacy caption (Tags
-        # disabled) gets the full combined string in the one Caption box
-        # instead, same as before this split existed. A run where Hydra
-        # didn't produce anything this time (e.g. temporarily disabled)
-        # leaves the Tags field untouched rather than wiping out whatever
-        # was already loaded there.
-        if _review_tags_enabled(item):
-            caption_out = result_holder["vlm_caption"]
-            hydra_tags = result_holder["hydra_tags"]
-            tags_out = gr.update(value=hydra_tags) if hydra_tags else gr.update()
-        else:
-            caption_out = result_holder["caption"]
-            tags_out = gr.update()
-
-        # Deliberately NOT auto-saved here - populates the box(es) like a
-        # manual edit would, so the usual navigate-away auto-save (and
-        # the "never save an emptied box" rule) applies uniformly whether
-        # the text came from typing or from a fresh model result.
-        yield caption_out, tags_out, status, *idle_state
-    finally:
-        operation_end()
+    yield gr.update(), gr.update(), RECAPTION_PARKED, *_REVIEW_STATE_NOOP
 
 
 def interrupt_review_ui():
-    action = operation_interrupt_click("review")
-    if action == "aborting":
-        return gr.update(value="Interrupting...", interactive=False)
-    return gr.update(value="Interrupt (click again to abort now)")
-
+    return interrupt_button_ui("review")
 
 def build(ctx: BuildContext):
     with gr.Tab("Review", id="review") as review_tab:
@@ -540,10 +433,11 @@ def build(ctx: BuildContext):
     )
 
 
-def run_controls_update(op, reachable: bool) -> tuple:
+def run_controls_update(op, ready: bool) -> tuple:
     """Updates for build()'s run_controls - the shared Recaption/Interrupt
     four (see operation.run_controls_update), plus the nav controls, which
-    are disabled only while Review itself is recaptioning."""
+    are disabled only while Review itself is recaptioning. Recaption is
+    parked (always disabled) - see RECAPTION_PARKED."""
     review_running = op is not None and op.kind == "review"
     review_nav = _REVIEW_NAV_BUSY if review_running else _REVIEW_NAV_IDLE
-    return (*run_controls_update_for("review", op, reachable), *review_nav)
+    return (*run_controls_update_for("review", op, False), *review_nav)
