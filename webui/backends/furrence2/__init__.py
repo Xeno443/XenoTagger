@@ -57,6 +57,13 @@ class Furrence2Backend(Backend):
     def unload(self, cfg: AppConfig) -> None:
         worker_client.stop()
 
+    def setup_problem(self, cfg: AppConfig) -> Optional[str]:
+        if not install.deps_installed():
+            return "Furrence2's dependencies aren't installed (Settings -> Furrence2)."
+        if not install.model_downloaded():
+            return "Furrence2's model isn't downloaded (Models tab)."
+        return None
+
     def status_bar_segments(self, cfg: AppConfig) -> list[tuple[str, str]]:
         st = worker_client.status()
         if st.running:

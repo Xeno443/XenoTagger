@@ -22,6 +22,7 @@ from core.config import AppConfig
 from core.downloads import DownloadItem
 
 from . import catalog, session
+from .models import resolve_selection
 from .server import LLAMA_SERVER_EXE, get_loaded_model_name, is_healthy
 
 
@@ -30,6 +31,7 @@ class LlamaBackend(Backend):
     label = "llama-server"
     role = "captioner"
     takes_tags = "optional"
+    variant_label = "Prompt"
     vram = "adaptive"
     settings_ui_module = "backends.llama.settings_ui"
     has_models = True
@@ -56,6 +58,24 @@ class LlamaBackend(Backend):
             return False
         status = session.cached_status()
         return status.installed and not status.reachable
+
+    def is_ready(self, cfg: AppConfig) -> bool:
+        # Any answering server counts, ours or not (external mode).
+        return is_healthy(session.display_base_url(cfg))
+
+    def setup_problem(self, cfg: AppConfig) -> Optional[str]:
+        if cfg.server_mode == "external":
+            return None  # nothing local to set up; reachability is checked on start
+        if not LLAMA_SERVER_EXE.exists():
+            return "llama-server isn't installed (Settings -> Llama)."
+        _, _, error = resolve_selection(cfg)
+        return error
+
+    def default_variant_value(self, cfg: AppConfig) -> str:
+        return cfg.prompt_template
+
+    def variant_uses_tags(self, cfg: AppConfig, value: str) -> bool:
+        return "{tags}" in (value or cfg.prompt_template)
 
     def caption(
         self,

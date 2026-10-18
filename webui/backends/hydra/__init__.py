@@ -10,6 +10,8 @@ restarts an owned llama-server when loaded later (core.lifecycle).
 
 from __future__ import annotations
 
+from typing import Optional
+
 from core.backend import Backend, ImageInput, ModelRow, Tag
 from core.config import AppConfig
 from core.downloads import DownloadItem
@@ -57,10 +59,22 @@ class HydraBackend(Backend):
         st = classifier.status()
         return st.deps_installed and st.model_downloaded and not st.loaded
 
+    def setup_problem(self, cfg: AppConfig) -> Optional[str]:
+        if not install.deps_installed():
+            return "Hydra's dependencies aren't installed (Settings -> Hydra)."
+        if not install.model_downloaded():
+            return "Hydra's model isn't downloaded (Models tab)."
+        return None
+
     def tag(self, cfg: AppConfig, image: ImageInput) -> list[Tag]:
         result = classifier.classify(image, cfg)
         categories = classifier.label_categories()
         return [Tag(name, categories.get(name, "general"), float(conf)) for name, conf in result.tags.items()]
+
+    def tags_from_names(self, cfg: AppConfig, names: list[str]) -> list[Tag]:
+        # Hand-added names Hydra doesn't know count as general.
+        categories = classifier.label_categories()
+        return [Tag(name, categories.get(name, "general"), 1.0) for name in names]
 
     def status_bar_segments(self, cfg: AppConfig) -> list[tuple[str, str]]:
         """Compact one-word(ish) Hydra state - see settings_ui's

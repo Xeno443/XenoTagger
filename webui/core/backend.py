@@ -97,6 +97,10 @@ class Backend:
     # "optional" (llama: only a prompt containing {tags}) or "required"
     # (Furrence2 can't caption without them).
     takes_tags: str = "no"
+    # Captioners only: the label of a pipeline variant's backend-specific
+    # setting (llama: "Prompt"). Empty = no variants, the backend writes
+    # one caption (Furrence2 - nothing to vary).
+    variant_label: str = ""
     # "fixed": load() is all-or-nothing onto one device (Hydra).
     # "adaptive": sizes itself to whatever VRAM is free when it starts
     # (llama-server's n_gpu_layers="auto"). Drives core.lifecycle: fixed
@@ -133,6 +137,34 @@ class Backend:
         asks this before acting; core.lifecycle.autoload_order decides
         when that handler runs relative to the other backends'."""
         return False
+
+    def is_ready(self, cfg: AppConfig) -> bool:
+        """Usable for tag()/caption() right now. Unlike is_loaded(), true
+        for a server this app didn't start (external llama-server) - the
+        pipeline's "is everything still up" check."""
+        return self.is_loaded(cfg)
+
+    def setup_problem(self, cfg: AppConfig) -> Optional[str]:
+        """Why this backend can't be loaded at all right now (dependencies
+        or model missing), or None. Cheap and local - no network calls."""
+        return None
+
+    def default_variant_value(self, cfg: AppConfig) -> str:
+        """The setting of the variant a captioner with variant_label gets
+        when the pipeline config has none for it yet (llama: the configured
+        prompt template)."""
+        return ""
+
+    def variant_uses_tags(self, cfg: AppConfig, value: str) -> bool:
+        """Whether a caption with this variant setting needs the tagger's
+        tags. Default: only a backend that always requires them."""
+        return self.takes_tags == "required"
+
+    def tags_from_names(self, cfg: AppConfig, names: list[str]) -> list[Tag]:
+        """Taggers only: rebuilds Tags from names read back from a tags
+        file (underscored e621 names, best first), so a captioner gets the
+        categories it may need. Confidence is unknown there - 1.0."""
+        return [Tag(name, "general", 1.0) for name in names]
 
     def tag(self, cfg: AppConfig, image: ImageInput) -> list[Tag]:
         """Taggers only. Best first, already filtered by this tagger's own

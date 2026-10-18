@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -230,6 +230,24 @@ class AppConfig:
     # ~200 it pads. min == max gives a fixed length.
     furrence2_length_min: int = 150
     furrence2_length_max: int = 200
+
+    # Caption pipeline (core.pipeline, Settings -> Pipeline). Which
+    # backends run, by id - at most one tagger. Every captioner listed
+    # writes one caption line per checked variant.
+    pipeline_run: list = field(default_factory=lambda: ["llama"])
+    # {backend id: [{"name": str, "on": bool, "value": str}, ...]} for
+    # captioners with variants (Backend.variant_label; llama: value is the
+    # prompt). A backend missing here gets one "default" variant from
+    # Backend.default_variant_value (llama: prompt_template).
+    pipeline_variants: dict = field(default_factory=dict)
+    # Output: the trigger word at the start of every line; tags "own"
+    # (their own line), "append" (after every caption, same line) or
+    # "none" (only fed to captioners); how tags are written.
+    pipeline_trigger_on: bool = True
+    pipeline_tags_mode: str = "own"
+    pipeline_tag_separator: str = ", "
+    pipeline_tag_style: str = "spaces"  # or "underscores"
+    pipeline_start_at_launch: bool = False
 
 
 def load() -> AppConfig:
